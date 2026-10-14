@@ -7,12 +7,12 @@ import { ChartColumnIncreasing } from 'lucide-react'
 import type { RequestLog, RequestLogsCatalog, RequestLogsListPage } from '../api'
 import AdminShell, { type AdminNavItem } from '../admin/AdminShell'
 import { Icon } from '../lib/icons'
-import type { TokenLogRequestKindOption } from '../tokenLogRequestKinds'
+import { mergeRequestKindCatalog, type TokenLogRequestKindOption } from '../tokenLogRequestKinds'
 import TokenDetail from './TokenDetail'
 
 const tokenId = 'a1b2'
 type StoryMode = 'default' | 'initial_loading' | 'switch_loading' | 'refreshing'
-type StoryDataset = 'default' | 'dense'
+type StoryDataset = 'default' | 'dense' | 'mixed_provider'
 
 interface StoryTokenDetail {
   id: string;
@@ -72,6 +72,14 @@ const tokenDetailDenseMock: StoryTokenDetail = {
   quota_monthly_used: 4_812,
 };
 
+const tokenDetailMixedProviderMock: StoryTokenDetail = {
+  ...tokenDetailMock,
+  id: "mp7q",
+  note: "multi-provider routing token",
+  total_requests: 4218,
+  last_used_at: 1_762_390_180,
+};
+
 const metricsMock = {
   total_requests: 9241,
   success_count: 9003,
@@ -126,7 +134,28 @@ const requestKindOptionsMock: TokenLogRequestKindOption[] = [
 const storyKeyIds = ["MZli", "Qn8R", "U2vK"] as const;
 const TOKEN_LOG_RETENTION_DAYS = 90;
 
-const logTemplates = [
+interface StoryLogTemplate {
+  readonly method: string;
+  readonly path: string;
+  readonly query: string | null;
+  readonly http_status: number | null;
+  readonly mcp_status: number | null;
+  readonly business_credits: number | null;
+  readonly provider: string;
+  readonly request_kind_key: string;
+  readonly request_kind_label: string;
+  readonly request_kind_detail: string | null;
+  readonly result_status: string;
+  readonly key_effect_code?: string;
+  readonly key_effect_summary?: string | null;
+  readonly binding_effect_code?: string;
+  readonly binding_effect_summary?: string | null;
+  readonly selection_effect_code?: string;
+  readonly selection_effect_summary?: string | null;
+  readonly error_message: string | null;
+}
+
+const logTemplates: StoryLogTemplate[] = [
   {
     method: "POST",
     path: "/api/tavily/crawl",
@@ -135,6 +164,7 @@ const logTemplates = [
     mcp_status: 200,
     business_credits: 4,
     request_kind_key: "api:crawl",
+    provider: "tavily",
     request_kind_label: "API | crawl",
     request_kind_detail: null,
     result_status: "success",
@@ -154,6 +184,7 @@ const logTemplates = [
     mcp_status: 200,
     business_credits: 3,
     request_kind_key: "api:extract",
+    provider: "tavily",
     request_kind_label: "API | extract",
     request_kind_detail: null,
     result_status: "success",
@@ -173,6 +204,7 @@ const logTemplates = [
     mcp_status: 200,
     business_credits: 2,
     request_kind_key: "api:map",
+    provider: "tavily",
     request_kind_label: "API | map",
     request_kind_detail: null,
     result_status: "success",
@@ -192,6 +224,7 @@ const logTemplates = [
     mcp_status: 200,
     business_credits: 5,
     request_kind_key: "api:research",
+    provider: "tavily",
     request_kind_label: "API | research",
     request_kind_detail: null,
     result_status: "success",
@@ -207,6 +240,7 @@ const logTemplates = [
     mcp_status: 404,
     business_credits: null,
     request_kind_key: "api:research-result",
+    provider: "tavily",
     request_kind_label: "API | research result",
     request_kind_detail: null,
     result_status: "error",
@@ -222,6 +256,7 @@ const logTemplates = [
     mcp_status: 200,
     business_credits: 2,
     request_kind_key: "api:search",
+    provider: "tavily",
     request_kind_label: "API | search",
     request_kind_detail: null,
     result_status: "success",
@@ -237,6 +272,7 @@ const logTemplates = [
     mcp_status: -1,
     business_credits: null,
     request_kind_key: "mcp:crawl",
+    provider: "tavily",
     request_kind_label: "MCP | crawl",
     request_kind_detail: null,
     result_status: "quota_exhausted",
@@ -252,6 +288,7 @@ const logTemplates = [
     mcp_status: 200,
     business_credits: 2,
     request_kind_key: "mcp:extract",
+    provider: "tavily",
     request_kind_label: "MCP | extract",
     request_kind_detail: null,
     result_status: "success",
@@ -267,6 +304,7 @@ const logTemplates = [
     mcp_status: 200,
     business_credits: null,
     request_kind_key: "mcp:initialize",
+    provider: "tavily",
     request_kind_label: "MCP | initialize",
     request_kind_detail: null,
     result_status: "success",
@@ -282,6 +320,7 @@ const logTemplates = [
     mcp_status: null,
     business_credits: null,
     request_kind_key: "mcp:notifications/initialized",
+    provider: "tavily",
     request_kind_label: "MCP | notifications/initialized",
     request_kind_detail: null,
     result_status: "unknown",
@@ -297,6 +336,7 @@ const logTemplates = [
     mcp_status: 200,
     business_credits: null,
     request_kind_key: "mcp:ping",
+    provider: "tavily",
     request_kind_label: "MCP | ping",
     request_kind_detail: null,
     result_status: "success",
@@ -312,6 +352,7 @@ const logTemplates = [
     mcp_status: 200,
     business_credits: null,
     request_kind_key: "mcp:resources/list",
+    provider: "tavily",
     request_kind_label: "MCP | resources/list",
     request_kind_detail: null,
     result_status: "success",
@@ -327,6 +368,7 @@ const logTemplates = [
     mcp_status: 200,
     business_credits: null,
     request_kind_key: "mcp:resources/templates/list",
+    provider: "tavily",
     request_kind_label: "MCP | resources/templates/list",
     request_kind_detail: null,
     result_status: "success",
@@ -342,6 +384,7 @@ const logTemplates = [
     mcp_status: 200,
     business_credits: 2,
     request_kind_key: "mcp:search",
+    provider: "tavily",
     request_kind_label: "MCP | search",
     request_kind_detail: null,
     result_status: "success",
@@ -357,6 +400,7 @@ const logTemplates = [
     mcp_status: 200,
     business_credits: null,
     request_kind_key: "mcp:tools/list",
+    provider: "tavily",
     request_kind_label: "MCP | tools/list",
     request_kind_detail: null,
     result_status: "success",
@@ -364,7 +408,147 @@ const logTemplates = [
     key_effect_summary: null,
     error_message: null,
   },
-] as const;
+];
+
+// Plan todo 8 / matrix L7: provider-mixed rows. Every row carries the provider
+// stamp plus a request kind from the committed provider taxonomy
+// (web/src/tokenLogRequestKinds.ts, backend PROVIDER_REQUEST_KINDS in
+// src/analysis.rs) and the real facade route that produces it
+// (src/server/provider_facade.rs).
+const mixedProviderLogTemplates: StoryLogTemplate[] = [
+  {
+    method: "POST",
+    path: "/api/tavily/search",
+    query: null,
+    http_status: 200,
+    mcp_status: 200,
+    business_credits: 2,
+    provider: "tavily",
+    request_kind_key: "api:search",
+    request_kind_label: "API | search",
+    request_kind_detail: null,
+    result_status: "success",
+    key_effect_code: "none",
+    key_effect_summary: null,
+    error_message: null,
+  },
+  {
+    method: "POST",
+    path: "/api/serpapi/search",
+    query: null,
+    http_status: 200,
+    mcp_status: 200,
+    business_credits: 3,
+    provider: "serpapi",
+    request_kind_key: "api:serpapi/search",
+    request_kind_label: "API | serpapi/search",
+    request_kind_detail: null,
+    result_status: "success",
+    key_effect_code: "none",
+    key_effect_summary: null,
+    binding_effect_code: "http_project_affinity_reused",
+    binding_effect_summary: "The system reused the current upstream key binding for this project",
+    error_message: null,
+  },
+  {
+    method: "POST",
+    path: "/mcp",
+    query: null,
+    http_status: 200,
+    mcp_status: 200,
+    business_credits: 3,
+    provider: "serpapi",
+    request_kind_key: "mcp:serpapi/search",
+    request_kind_label: "MCP | serpapi/search",
+    request_kind_detail: null,
+    result_status: "success",
+    key_effect_code: "none",
+    key_effect_summary: null,
+    error_message: null,
+  },
+  {
+    method: "POST",
+    path: "/api/exa/search",
+    query: null,
+    http_status: 200,
+    mcp_status: 200,
+    business_credits: 2,
+    provider: "exa",
+    request_kind_key: "api:exa/search",
+    request_kind_label: "API | exa/search",
+    request_kind_detail: null,
+    result_status: "success",
+    key_effect_code: "none",
+    key_effect_summary: null,
+    selection_effect_code: "http_project_affinity_pressure_avoided",
+    selection_effect_summary: "Project affinity routing avoided a key under higher recent pressure",
+    error_message: null,
+  },
+  {
+    method: "POST",
+    path: "/mcp",
+    query: null,
+    http_status: 200,
+    mcp_status: 200,
+    business_credits: 2,
+    provider: "exa",
+    request_kind_key: "mcp:exa/web_fetch",
+    request_kind_label: "MCP | exa/web_fetch",
+    request_kind_detail: null,
+    result_status: "success",
+    key_effect_code: "restored_active",
+    key_effect_summary: "The system automatically restored this key to active",
+    error_message: null,
+  },
+  {
+    method: "POST",
+    path: "/api/exa/answer",
+    query: null,
+    http_status: 502,
+    mcp_status: -1,
+    business_credits: null,
+    provider: "exa",
+    request_kind_key: "api:exa/answer",
+    request_kind_label: "API | exa/answer",
+    request_kind_detail: null,
+    result_status: "error",
+    key_effect_code: "quarantined",
+    key_effect_summary: "The system automatically quarantined this key",
+    error_message: "upstream exa answer failed",
+  },
+  {
+    method: "POST",
+    path: "/api/brave/res/v1/web/search",
+    query: null,
+    http_status: 200,
+    mcp_status: 200,
+    business_credits: 2,
+    provider: "brave",
+    request_kind_key: "api:brave/web",
+    request_kind_label: "API | brave/web",
+    request_kind_detail: null,
+    result_status: "success",
+    key_effect_code: "none",
+    key_effect_summary: null,
+    error_message: null,
+  },
+  {
+    method: "POST",
+    path: "/mcp",
+    query: null,
+    http_status: 429,
+    mcp_status: -1,
+    business_credits: null,
+    provider: "brave",
+    request_kind_key: "mcp:brave/news_search",
+    request_kind_label: "MCP | brave/news_search",
+    request_kind_detail: null,
+    result_status: "quota_exhausted",
+    key_effect_code: "marked_exhausted",
+    key_effect_summary: "Automatically marked this key as exhausted",
+    error_message: "quota exhausted",
+  },
+];
 
 function requestKindProtocolGroup(key: string): 'api' | 'mcp' {
   return key.startsWith('mcp:') ? 'mcp' : 'api'
@@ -405,21 +589,24 @@ function requestOperationalClass(
   return 'success'
 }
 
-function buildLogsMock(
-  count: number,
-  startId: number,
-  createdAtStart: number,
-  createdAtStep: number,
-): RequestLog[] {
+interface LogsMockSpec {
+  count: number;
+  startId: number;
+  createdAtStart: number;
+  createdAtStep: number;
+}
+
+function buildLogsMock(templates: StoryLogTemplate[], spec: LogsMockSpec): RequestLog[] {
+  const { count, startId, createdAtStart, createdAtStep } = spec;
   return Array.from({ length: count }, (_, idx) => {
-    const template = logTemplates[idx % logTemplates.length];
+    const template = templates[idx % templates.length];
     return {
       id: startId + idx,
       key_id: storyKeyIds[idx % storyKeyIds.length],
       auth_token_id: tokenId,
       ...template,
       business_credits:
-        template.business_credits == null ? null : template.business_credits + Math.floor(idx / logTemplates.length),
+        template.business_credits == null ? null : template.business_credits + Math.floor(idx / templates.length),
       created_at: createdAtStart - idx * createdAtStep,
       request_body:
         template.path === '/mcp'
@@ -440,13 +627,47 @@ function buildLogsMock(
   });
 }
 
-const logsMock = buildLogsMock(24, 3000, 1_762_390_010, 420);
+const logsMock = buildLogsMock(logTemplates, {
+  count: 24,
+  startId: 3000,
+  createdAtStart: 1_762_390_010,
+  createdAtStep: 420,
+});
 
-const logsPageTwoMock = buildLogsMock(24, 4000, 1_762_380_010, 420);
+const logsPageTwoMock = buildLogsMock(logTemplates, {
+  count: 24,
+  startId: 4000,
+  createdAtStart: 1_762_380_010,
+  createdAtStep: 420,
+});
 
-const denseLogsMock = buildLogsMock(96, 5000, 1_762_390_250, 75);
+const denseLogsMock = buildLogsMock(logTemplates, {
+  count: 96,
+  startId: 5000,
+  createdAtStart: 1_762_390_250,
+  createdAtStep: 75,
+});
 
-const denseLogsPageTwoMock = buildLogsMock(96, 6000, 1_762_383_050, 75);
+const denseLogsPageTwoMock = buildLogsMock(logTemplates, {
+  count: 96,
+  startId: 6000,
+  createdAtStart: 1_762_383_050,
+  createdAtStep: 75,
+});
+
+const mixedProviderLogsMock = buildLogsMock(mixedProviderLogTemplates, {
+  count: 32,
+  startId: 7000,
+  createdAtStart: 1_762_390_010,
+  createdAtStep: 300,
+});
+
+const mixedProviderLogsPageTwoMock = buildLogsMock(mixedProviderLogTemplates, {
+  count: 32,
+  startId: 8000,
+  createdAtStart: 1_762_380_410,
+  createdAtStep: 300,
+});
 
 const usageSeriesMock = Array.from({ length: 16 }, (_, idx) => ({
   bucket_start: 1_762_360_000 + idx * 3600,
@@ -467,6 +688,7 @@ interface StoryDatasetConfig {
   logs: typeof logsMock;
   logsPageTwo: typeof logsMock;
   usageSeries: typeof usageSeriesMock;
+  requestKindOptions: TokenLogRequestKindOption[];
   initialPerPage?: number;
 }
 
@@ -476,13 +698,22 @@ const storyDatasets: Record<StoryDataset, StoryDatasetConfig> = {
     logs: logsMock,
     logsPageTwo: logsPageTwoMock,
     usageSeries: usageSeriesMock,
+    requestKindOptions: requestKindOptionsMock,
   },
   dense: {
     metrics: denseMetricsMock,
     logs: denseLogsMock,
     logsPageTwo: denseLogsPageTwoMock,
     usageSeries: denseUsageSeriesMock,
+    requestKindOptions: requestKindOptionsMock,
     initialPerPage: 50,
+  },
+  mixed_provider: {
+    metrics: metricsMock,
+    logs: mixedProviderLogsMock,
+    logsPageTwo: mixedProviderLogsPageTwoMock,
+    usageSeries: usageSeriesMock,
+    requestKindOptions: mergeRequestKindCatalog(requestKindOptionsMock),
   },
 };
 
@@ -516,10 +747,13 @@ function parseStoryCursor(cursor: string | null | undefined): number | null {
   return Number.isFinite(page) && page > 0 ? page : null;
 }
 
-function buildLogsCatalog(source: RequestLog[]): RequestLogsCatalog {
+function buildLogsCatalog(
+  source: RequestLog[],
+  requestKindOptions: TokenLogRequestKindOption[],
+): RequestLogsCatalog {
   return {
     retentionDays: TOKEN_LOG_RETENTION_DAYS,
-    requestKindOptions: requestKindOptionsMock.map((option) => ({
+    requestKindOptions: requestKindOptions.map((option) => ({
       ...option,
       count: source.filter((log) => log.request_kind_key === option.key).length,
     })),
@@ -586,6 +820,7 @@ function installFetchMock(
       ...log,
       auth_token_id: activeTokenId,
     })),
+    storyData.requestKindOptions,
   );
 
   window.fetch = async (
@@ -936,5 +1171,24 @@ export const DenseRequestRecords: Story = {
   args: { detail: tokenDetailDenseMock, mode: "default", dataset: "dense" },
   parameters: {
     viewport: { defaultViewport: "1440-device-desktop" },
+  },
+};
+
+export const MixedProviderLogs: Story = {
+  args: { detail: tokenDetailMixedProviderMock, mode: "default", dataset: "mixed_provider" },
+  parameters: {
+    viewport: { defaultViewport: "1440-device-desktop" },
+  },
+  play: async ({ canvasElement }) => {
+    await new Promise((resolve) => window.setTimeout(resolve, 200))
+    const root = canvasElement.ownerDocument
+    const renderedProviders = Array.from(
+      root.querySelectorAll<HTMLElement>('.recent-requests-provider-badge'),
+    ).map((badge) => badge.textContent?.trim() ?? '')
+    for (const expected of ['Tavily', 'SerpApi', 'Exa', 'Brave']) {
+      if (!renderedProviders.includes(expected)) {
+        throw new Error(`Expected the mixed provider story to render a ${expected} log row.`)
+      }
+    }
   },
 };
