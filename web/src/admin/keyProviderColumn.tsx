@@ -55,17 +55,28 @@ export function KeyProviderBadge({ provider }: { provider?: unknown }): JSX.Elem
 
 const selectClassName = 'h-11 rounded-xl border border-base-300 bg-base-100 px-3 text-sm'
 
+const providerCountFormatter = new Intl.NumberFormat('en-US')
+
 /** Table filter row provider select (all providers + the stable provider order). */
 export function KeyProviderFilter({
   value,
   onChange,
   disabled,
+  counts,
 }: {
   value: ProviderFilterValue
   onChange: (value: ProviderFilterValue) => void
   disabled?: boolean
+  /** Plan todo 10 (matrix M12): `/api/keys` `facets.providers` key counts per provider. */
+  counts?: ReadonlyArray<{ value: string; count: number }>
 }): JSX.Element {
   const providers = useTranslate().admin.providers.shared
+  const optionLabel = (id: ProviderId): string => {
+    const count = counts?.find((row) => row.value === id)?.count
+    return count === undefined
+      ? providerLabel(id)
+      : `${providerLabel(id)} (${providerCountFormatter.format(count)})`
+  }
   return (
     <select
       className={selectClassName}
@@ -78,7 +89,7 @@ export function KeyProviderFilter({
       <option value={PROVIDER_FILTER_ALL}>{providers.filterAll}</option>
       {PROVIDER_IDS.map((id) => (
         <option key={id} value={id}>
-          {providerLabel(id)}
+          {optionLabel(id)}
         </option>
       ))}
     </select>

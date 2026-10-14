@@ -1,12 +1,16 @@
 import '../../test/happydom'
 
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { StrictMode, act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 
 import { installDemoRuntime } from '../api/demo'
 import { LanguageProvider } from '../i18n'
+import { operationalClassGuidance } from '../lib/logOperationalClass'
 import { ThemeProvider } from '../theme'
+import { TooltipProvider } from '../components/ui/tooltip'
 import AdminDashboard from './AdminDashboardRuntime'
 
 /**
@@ -147,7 +151,9 @@ async function mountRequestsRoute(search: string): Promise<HTMLElement> {
       <StrictMode>
         <LanguageProvider initialLanguage="en">
           <ThemeProvider>
-            <AdminDashboard />
+            <TooltipProvider delayDuration={0} skipDelayDuration={0}>
+              <AdminDashboard />
+            </TooltipProvider>
           </ThemeProvider>
         </LanguageProvider>
       </StrictMode>,
@@ -155,6 +161,81 @@ async function mountRequestsRoute(search: string): Promise<HTMLElement> {
   })
   await flushUi(200)
   return container
+}
+
+/** Recursively drops every `providers` key so a payload can be pinned facet-free. */
+function withoutProviders(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutProviders)
+  if (typeof value !== 'object' || value === null) return value
+  const next: Record<string, unknown> = {}
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (key === 'providers') continue
+    next[key] = withoutProviders(entry)
+  }
+  return next
+}
+
+/** The live `/api/summary` provider breakdown shape (orchestrator live-API evidence). */
+const SUMMARY_PROVIDERS = [
+  { provider: 'serpapi', total_requests: 1, success_count: 1, error_count: 0, quota_exhausted_count: 0 },
+  { provider: 'tavily', total_requests: 1607, success_count: 1500, error_count: 100, quota_exhausted_count: 7 },
+]
+
+/**
+ * Dashboard route reproducing the LIVE payload split: `/api/dashboard/overview`
+ * carries `summary` and `summaryWindows` WITHOUT any `providers` array, while
+ * `/api/summary` does carry it. The demo runtime alone hides this, because
+ * `demoSummary()` is reused for both endpoints — so the overview payload is
+ * stripped here and the summary payload is pinned to the live shape. The
+ * Provider-activity card can therefore only render if the runtime reads
+ * `fetchSummary()` rather than the overview's embedded summary (matrix M3).
+ */
+async function mountDashboardRoute(): Promise<void> {
+  window.localStorage.setItem(DEMO_STORAGE_KEY, 'true')
+  window.history.replaceState(null, '', '/admin')
+  installDemoRuntime()
+
+  const demoFetch = window.fetch.bind(window)
+  window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url =
+      typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+    const response = await demoFetch(input, init)
+    const parsed = new URL(url, 'http://localhost')
+    if (parsed.pathname === '/api/dashboard/overview') {
+      const data = (await response.clone().json()) as Record<string, unknown>
+      return jsonResponse({
+        ...data,
+        summary: withoutProviders(data['summary']),
+        summaryWindows: withoutProviders(data['summaryWindows']),
+      })
+    }
+    if (parsed.pathname === '/api/summary') {
+      const data = (await response.clone().json()) as Record<string, unknown>
+      return jsonResponse({ ...data, providers: SUMMARY_PROVIDERS })
+    }
+    return response
+  }
+
+  const container = document.createElement('div')
+  container.style.width = '1440px'
+  container.style.minHeight = '1200px'
+  document.body.appendChild(container)
+  root = createRoot(container)
+
+  await act(async () => {
+    root!.render(
+      <StrictMode>
+        <LanguageProvider initialLanguage="en">
+          <ThemeProvider>
+            <TooltipProvider delayDuration={0} skipDelayDuration={0}>
+              <AdminDashboard />
+            </TooltipProvider>
+          </ThemeProvider>
+        </LanguageProvider>
+      </StrictMode>,
+    )
+  })
+  await flushUi(300)
 }
 
 beforeEach(() => {
@@ -212,4 +293,68 @@ describe('AdminDashboardRuntime provider caller wiring (plan todo 23b)', () => {
     expect(filteredUrl).toBeDefined()
     expect(new URLSearchParams(filteredUrl!.split('?')[1] ?? '').get('provider')).toBe('exa')
   }, 20_000)
+})
+
+describe('AdminDashboardRuntime summary provider wiring (plan todo 10 / matrix M3)', () => {
+  it('renders the provider activity card from /api/summary, not the overview summary', async () => {
+    await mountDashboardRoute()
+
+    // Given the overview payload carries no provider breakdown at all, the card
+    // can only appear if the runtime fed DashboardOverview from fetchSummary().
+    await waitFor(() => document.querySelector('.dashboard-provider-panel') !== null)
+    const rows = Array.from(
+      document.querySelectorAll<HTMLElement>('.dashboard-provider-panel tbody tr[data-provider]'),
+    )
+    expect(rows.map((row) => row.dataset.provider)).toEqual(['serpapi', 'tavily'])
+
+    // And the rendered counts are the /api/summary values, label included.
+    const serpapi = rows.find((row) => row.dataset.provider === 'serpapi')
+    if (serpapi === undefined) {
+      throw new Error('The provider activity card rendered no serpapi row')
+    }
+    const cells = Array.from(serpapi.querySelectorAll('td')).map((cell) => (cell.textContent ?? '').trim())
+    expect(cells).toEqual(['SerpApi', '1', '1', '0', '0'])
+  }, 20_000)
+})
+
+describe('AdminDashboardRuntime failure-guidance provider wiring (plan todo 10 / matrix M6)', () => {
+  const runtimeSourcePath = fileURLToPath(new URL('./AdminDashboardRuntime.tsx', import.meta.url))
+
+  /**
+   * `LogRow`/`LogDetails` — this module's only `operationalClassGuidance`
+   * consumer — are referenced by no route: the live admin requests surface is
+   * `AdminRecentRequestsPanel`, which renders no failure guidance at all. There
+   * is therefore no mounted surface to assert on, and the wiring is pinned
+   * structurally instead. The resolver's 4th parameter is OPTIONAL, so a
+   * dropped argument still compiles and silently degrades to generic upstream
+   * copy — precisely the regression this guard catches.
+   */
+  function guidanceCallArgumentLists(): string[][] {
+    const source = readFileSync(runtimeSourcePath, 'utf8')
+    return [...source.matchAll(/operationalClassGuidance\(([^)]*)\)/g)].map((match) =>
+      (match[1] ?? '').split(',').map((argument) => argument.trim()),
+    )
+  }
+
+  it('passes the log row provider as the 4th guidance argument at every call site', () => {
+    const callSites = guidanceCallArgumentLists()
+    expect(callSites.length).toBeGreaterThan(0)
+    for (const args of callSites) {
+      expect(args).toHaveLength(4)
+      expect(args[3]).toBe('log.provider')
+    }
+  })
+
+  it('resolves provider-named guidance for a SerpApi 429 row and degrades without the argument', () => {
+    // Given the argument list the call site passes for a serpapi row
+    const serpapi = operationalClassGuidance('upstream_error', 'upstream_rate_limited_429', 'en', 'serpapi')
+    // Then the copy names SerpApi and never Tavily
+    expect(serpapi).toContain('SerpApi')
+    expect(serpapi).not.toContain('Tavily')
+
+    // And the 4th argument is load-bearing: omitting it yields generic copy.
+    const generic = operationalClassGuidance('upstream_error', 'upstream_rate_limited_429', 'en')
+    expect(generic).not.toContain('SerpApi')
+    expect(generic).not.toBe(serpapi)
+  })
 })

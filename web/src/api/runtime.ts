@@ -1140,6 +1140,8 @@ export interface ApiKeyListFacets {
   groups: ApiKeyFacetOption[]
   statuses: ApiKeyFacetOption[]
   regions: ApiKeyFacetOption[]
+  /** Plan todo 1/10 (matrix M12): per-provider key counts, `{ value, count }`. */
+  providers?: ApiKeyFacetOption[]
 }
 
 export interface TokenOwnerSummary {

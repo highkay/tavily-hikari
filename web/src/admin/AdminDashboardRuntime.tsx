@@ -1801,6 +1801,7 @@ function AdminDashboard(): JSX.Element {
   const footerStrings = adminStrings.footer
   const errorStrings = adminStrings.errors
   const [summary, setSummary] = useState<Summary | null>(null)
+  const [summaryProviders, setSummaryProviders] = useState<Summary['providers']>(undefined)
   const [dashboardSummaryWindows, setDashboardSummaryWindows] = useState<SummaryWindowsResponse | null>(null)
   const [rankingsSnapshot, setRankingsSnapshot] = useState<AdminUserRankingsSnapshot | null>(null)
   const [rankingsLoading, setRankingsLoading] = useState(false)
@@ -1823,6 +1824,7 @@ function AdminDashboard(): JSX.Element {
   const [keyGroupFacets, setKeyGroupFacets] = useState<Array<{ value: string; count: number }>>([])
   const [keyStatusFacets, setKeyStatusFacets] = useState<Array<{ value: string; count: number }>>([])
   const [keyRegionFacets, setKeyRegionFacets] = useState<Array<{ value: string; count: number }>>([])
+  const [keyProviderFacets, setKeyProviderFacets] = useState<Array<{ value: string; count: number }>>([])
   const [tokens, setTokens] = useState<AuthToken[]>([])
   const tokenPanelRef = useRef<HTMLElement | null>(null)
   const [tokenBulkPanelLeft, setTokenBulkPanelLeft] = useState('50%')
@@ -2841,6 +2843,11 @@ function AdminDashboard(): JSX.Element {
   const loadDashboardOverview = useCallback(
     async (signal?: AbortSignal) => {
       const requestVersion = ++dashboardOverviewVersionRef.current
+      // M3: neither /api/dashboard/overview nor the SSE snapshot carries Summary.providers,
+      // so the card reads /api/summary on the same cycle; a failure only hides the card.
+      void fetchSummary(signal).then((snapshot) => {
+        if (!signal?.aborted) setSummaryProviders(snapshot.providers)
+      }).catch(() => undefined)
       try {
         const overview = await fetchDashboardOverview(signal)
 
@@ -4124,6 +4131,7 @@ function AdminDashboard(): JSX.Element {
         setKeyGroupFacets(result.facets.groups)
         setKeyStatusFacets(result.facets.statuses)
         setKeyRegionFacets(result.facets.regions)
+        setKeyProviderFacets(result.facets.providers ?? [])
         setKeysLoadState('ready')
         keysLoadedRef.current = true
         keysQueryKeyRef.current = nextQueryKey
@@ -4148,6 +4156,7 @@ function AdminDashboard(): JSX.Element {
         setKeyGroupFacets([])
         setKeyStatusFacets([])
         setKeyRegionFacets([])
+        setKeyProviderFacets([])
         setKeysError(err instanceof Error ? err.message : loadingStateStrings.error)
         setKeysLoadState('error')
       })
@@ -5390,6 +5399,7 @@ function AdminDashboard(): JSX.Element {
             setKeyGroupFacets(result.facets.groups)
             setKeyStatusFacets(result.facets.statuses)
             setKeyRegionFacets(result.facets.regions)
+            setKeyProviderFacets(result.facets.providers ?? [])
             setKeysLoadState('ready')
             keysLoadedRef.current = true
             keysQueryKeyRef.current = nextQueryKey
@@ -5803,8 +5813,8 @@ function AdminDashboard(): JSX.Element {
   )
 
   const keysBatchParsed = useMemo(() => {
-    return extractApiKeyImportEntriesFromText(newKeysText)
-  }, [newKeysText])
+    return extractApiKeyImportEntriesFromText(newKeysText, newKeysProvider)
+  }, [newKeysProvider, newKeysText])
 
   const keyRegionFilterSummary = useMemo(
     () =>
@@ -6292,7 +6302,7 @@ function AdminDashboard(): JSX.Element {
 
   const handleAddKey = async () => {
     const rawLines = newKeysText.split(/\r?\n/)
-    const parsedEntries = extractApiKeyImportEntriesFromText(newKeysText)
+    const parsedEntries = extractApiKeyImportEntriesFromText(newKeysText, newKeysProvider)
     if (parsedEntries.length === 0) return
 
     const group = newKeysGroup.trim()
@@ -6812,6 +6822,7 @@ function AdminDashboard(): JSX.Element {
     setKeyGroupFacets(pagedKeys.facets.groups)
     setKeyStatusFacets(pagedKeys.facets.statuses)
     setKeyRegionFacets(pagedKeys.facets.regions)
+    setKeyProviderFacets(pagedKeys.facets.providers ?? [])
     return pagedKeys
   }
   const toggleAllowRegistration = async () => {
@@ -10679,6 +10690,7 @@ function AdminDashboard(): JSX.Element {
       {showDashboard && (
         <DashboardOverview
           strings={adminStrings.dashboard}
+          providerCounts={summaryProviders}
           overviewReady={dashboardOverviewLoaded}
           statusLoading={dashboardStatusLoading}
           todayMetrics={todayMetrics}
@@ -11329,6 +11341,7 @@ function AdminDashboard(): JSX.Element {
               </DropdownMenu>
               <KeyProviderFilter
                 value={selectedKeyProvider}
+                counts={keyProviderFacets}
                 onChange={(value) => {
                   setSelectedKeyProvider(value)
                   setKeysPage(1)
@@ -12892,7 +12905,7 @@ function LogDetails({
   const requestBody = log.request_body ?? cleanedBodySummary('request')
   const responseBody = log.response_body ?? cleanedBodySummary('response')
   const keyEffect = formatKeyEffectSummary(log, strings, language)
-  const guidance = operationalClassGuidance(log.operationalClass, log.failure_kind, language)
+  const guidance = operationalClassGuidance(log.operationalClass, log.failure_kind, language, log.provider)
 
   return (
     <div className="log-details-panel">
