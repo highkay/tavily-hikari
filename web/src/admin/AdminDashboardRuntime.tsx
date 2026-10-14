@@ -2027,6 +2027,7 @@ function AdminDashboard(): JSX.Element {
   const lastRankingsPathRef = useRef<string | null>(null)
   const baseDataLoadedRef = useRef(false)
   const dashboardOverviewVersionRef = useRef(0)
+  const summaryProvidersVersionRef = useRef(0)
   const unboundTokenUsageQueryKeyRef = useRef<string | null>(null)
   const requestsLoadedRef = useRef(false)
   const jobsLoadedRef = useRef(false)
@@ -2843,11 +2844,14 @@ function AdminDashboard(): JSX.Element {
   const loadDashboardOverview = useCallback(
     async (signal?: AbortSignal) => {
       const requestVersion = ++dashboardOverviewVersionRef.current
-      // M3: neither /api/dashboard/overview nor the SSE snapshot carries Summary.providers,
-      // so the card reads /api/summary on the same cycle; a failure only hides the card.
+      const providersVersion = ++summaryProvidersVersionRef.current
+      // M3: neither /api/dashboard/overview nor the SSE snapshot carries Summary.providers, so the
+      // card reads /api/summary on a counter the snapshot cannot bump; failure only hides the card.
       void fetchSummary(signal).then((snapshot) => {
-        if (!signal?.aborted) setSummaryProviders(snapshot.providers)
-      }).catch(() => undefined)
+        if (!signal?.aborted && providersVersion === summaryProvidersVersionRef.current) setSummaryProviders(snapshot.providers)
+      }).catch(() => {
+        if (!signal?.aborted && providersVersion === summaryProvidersVersionRef.current) setSummaryProviders(undefined)
+      })
       try {
         const overview = await fetchDashboardOverview(signal)
 

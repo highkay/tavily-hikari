@@ -15,6 +15,7 @@ import { demoExaAnswerFixture, demoExaContentsFixture, demoExaMcpToolFixture, de
 import { BRAVE_MCP_TOOLS, BRAVE_RATE_LIMIT_HEADERS, demoBraveLlmContextFixture, demoBraveMcpToolFixture, demoBraveNewsFixture, demoBraveWebFixture } from './demoBrave'
 import { demoSerpapiMcpToolResult, demoSerpapiMcpTools, demoSerpapiSearchFixture } from './demoSerpapi'
 import { normalizePayloadProvider, PROVIDER_IDS, type ProviderId, type SummaryProviderCount } from './providers'
+import type { SummaryQuotaCharge } from './runtime'
 
 type JsonObject = Record<string, unknown>
 
@@ -470,4 +471,27 @@ export function createDemoProviderBreakdown(
       quota_exhausted_count: Math.round(row.quota_exhausted_count * scale),
     }
   })
+}
+
+/** The `demo.ts` fixture slice `withProviderBreakdown` groups by provider. */
+export interface DemoProviderFixtureSource {
+  keys: ReadonlyArray<Record<string, unknown>>
+  logs: ReadonlyArray<Record<string, unknown>>
+}
+
+/**
+ * Assembles the two additive per-window summary keys — `quota_charge` plus the
+ * rescaled `providers` breakdown — for spreading into a
+ * `/api/summary/windows` bucket. Keeping the pair here lets `demo.ts` hold one
+ * property per line inside its line budget.
+ */
+export function withProviderBreakdown(
+  source: DemoProviderFixtureSource,
+  quotaCharge: SummaryQuotaCharge,
+  windowTotalRequests: number,
+): { quota_charge: SummaryQuotaCharge; providers: SummaryProviderCount[] } {
+  return {
+    quota_charge: quotaCharge,
+    providers: createDemoProviderBreakdown(source.keys, source.logs, windowTotalRequests),
+  }
 }

@@ -7,7 +7,7 @@ import {
 import { demoUserEntitlements } from './demoAccountEntitlements'
 import { createDemoRechargeOrders, demoAdminUserRechargeAudit, handleDemoAdminRechargeAction, handleDemoAdminRecharges, type DemoRechargeOrder } from './demoAdminRecharge'
 import { createDemoHaStatus, handleDemoHaRoute } from './demoHa'
-import { createDemoProviderBreakdown, createDemoProviderKeys, createDemoProviderLogs, createDemoProviderRequestKindOptions, handleProviderDemoRoute, isProviderMcpPath } from './demoProviders'
+import { createDemoProviderBreakdown, createDemoProviderKeys, createDemoProviderLogs, createDemoProviderRequestKindOptions, handleProviderDemoRoute, isProviderMcpPath, withProviderBreakdown } from './demoProviders'
 import { createDemoUpstreamPrivacyStatus } from './upstreamPrivacyStatusFixtures'
 import { rankingsStorySnapshot } from '../admin/rankingsStoryData'
 import { buildDemoAnalysisPressureSnapshot } from './demoAnalysisPressure'
@@ -1077,7 +1077,7 @@ function demoSummaryWindows(
       upstream_exhausted_key_count: 1 + (todayDrift % 3 === 0 ? 1 : 0),
       new_keys: 1 + (todayDrift % 4 === 0 ? 1 : 0),
       new_quarantines: 1 + (todayDrift % 5 === 0 ? 1 : 0),
-      quota_charge: quotaCharge, providers: createDemoProviderBreakdown(demoState.keys, demoState.logs, 760 + todayDrift * 4),
+      ...withProviderBreakdown(demoState, quotaCharge, 760 + todayDrift * 4),
     },
     yesterday: {
       total_requests: 690,
@@ -1092,7 +1092,7 @@ function demoSummaryWindows(
       upstream_exhausted_key_count: 1,
       new_keys: 0,
       new_quarantines: 0,
-      quota_charge: quotaCharge, providers: createDemoProviderBreakdown(demoState.keys, demoState.logs, 690),
+      ...withProviderBreakdown(demoState, quotaCharge, 690),
     },
     month: {
       total_requests: 24882 + monthDrift * 60,
@@ -1107,7 +1107,7 @@ function demoSummaryWindows(
       upstream_exhausted_key_count: 1 + (monthDrift % 6 === 0 ? 1 : 0),
       new_keys: 4 + (monthDrift % 4 === 0 ? 1 : 0),
       new_quarantines: 2 + (monthDrift % 5 === 0 ? 1 : 0),
-      quota_charge: quotaCharge, providers: createDemoProviderBreakdown(demoState.keys, demoState.logs, 24882 + monthDrift * 60),
+      ...withProviderBreakdown(demoState, quotaCharge, 24882 + monthDrift * 60),
     },
     today_start: todayStart,
     today_end: currentHourStart + 1,
