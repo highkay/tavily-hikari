@@ -1,6 +1,7 @@
 import { adminRechargeTranslations, adminTotpTranslations, adminTrustedClientIpTranslations } from '../adminRechargeTranslations'
 import { adminPressureTranslations } from '../adminPressureTranslations'
 import { adminProviderTranslations } from '../adminProviderTranslations'
+import { adminDashboardProvidersTranslations, adminTokenDetailTranslations } from './tokenDetail'
 import type { TranslationShape } from '../types'
 
 export const EN: TranslationShape = {
@@ -13,13 +14,13 @@ export const EN: TranslationShape = {
         readyFallback: 'The updated app shell is ready. Reload when you want to start using it.', description: (current, latest) => `Current ${current} → Ready ${latest}`, refresh: 'Reload now', refreshing: 'Applying update…', retry: 'Retry update', dismiss: 'Remind me later',
       },
       heroTitle: 'Tavily Hikari Proxy',
-      heroTagline: 'Transparent request visibility for your Tavily integration.',
+      heroTagline: 'Transparent request visibility for your search integrations.',
       heroDescription:
-        'Tavily Hikari pools multiple Tavily API Keys into a single endpoint, balances usage across them, and ships with request routing, rate monitoring, and shareable access tokens.',
+        'Tavily Hikari pools multiple search-provider API keys (Tavily, SerpApi, Exa, Brave) behind a single endpoint, balances usage across them, and ships with request routing, rate monitoring, and shareable access tokens.',
       metrics: {
         monthly: {
           title: 'Monthly Success (UTC)',
-          subtitle: 'Tavily quotas reset at the start of every UTC month',
+          subtitle: 'Quota windows reset per provider policy',
         },
         daily: {
           title: 'Today',
@@ -27,7 +28,7 @@ export const EN: TranslationShape = {
         },
         pool: {
           title: 'Key Pool Status',
-          subtitle: 'Active Tavily keys / total keys (including exhausted)',
+          subtitle: 'Active keys / total keys across providers (including exhausted)',
         },
       },
       adminButton: 'Open Admin Dashboard',
@@ -55,7 +56,7 @@ export const EN: TranslationShape = {
         description: 'Existing users can still sign in with Linux DO. New accounts are temporarily blocked.',
       },
       adminLogin: {
-        title: 'Admin Login', description: 'Sign in to manage Tavily keys and access tokens.',
+        title: 'Admin Login', description: 'Sign in to manage search-provider keys and access tokens.',
         credentialsTitle: 'Login credentials',
         password: {
           label: 'Admin Password',
@@ -181,7 +182,8 @@ export const EN: TranslationShape = {
         table: {
           time: 'Time',
           httpStatus: 'HTTP',
-          mcpStatus: 'Tavily',
+          mcpStatus: 'Upstream',
+          provider: 'Provider',
           result: 'Result',
         },
         toggles: {
@@ -391,6 +393,7 @@ export const EN: TranslationShape = {
         statusConnecting: 'Connecting live updates',
         statusDegraded: 'Live updates degraded',
         staleHint: 'Showing the latest successful snapshot. Fresh data will resume automatically after reconnect.',
+        providers: adminDashboardProvidersTranslations.en,
       },
       pressure: adminPressureTranslations.en,
       modules: {
@@ -1105,6 +1108,7 @@ export const EN: TranslationShape = {
         },
         back: 'Back to tokens',
       },
+      tokenDetail: adminTokenDetailTranslations.en,
       metrics: {
         labels: {
           total: 'Total Requests',
@@ -1133,14 +1137,14 @@ export const EN: TranslationShape = {
       },
       keys: {
         title: 'API Keys',
-        description: 'Status, usage, and recent success rates per Tavily API key.',
-        placeholder: 'New Tavily API Key',
+        description: 'Status, usage, and recent success rates per API key across providers.',
+        placeholder: 'New API key',
         addButton: 'Add Key',
         adding: 'Adding…',
         batch: {
-          placeholder: 'Paste text (extract first tvly-dev-* key and public IP per line)',
+          placeholder: 'Paste keys one per line (optionally followed by registration IP)',
           groupPlaceholder: 'Group (optional)',
-          hint: 'Each line extracts the first tvly-dev-* key and first public IP; geo lookup uses the configured country.is-compatible service.',
+          hint: 'Tavily keys look like tvly-…; other providers: paste the native key string. Each line extracts the first key and first public IP; geo lookup uses the configured country.is-compatible service.',
           count: 'Extracted keys {count}',
           report: {
             title: 'Batch Import Report',
@@ -1167,7 +1171,7 @@ export const EN: TranslationShape = {
         },
         validation: {
           title: 'Verify API Keys',
-          hint: 'Support text paste: extract the first tvly-dev-* key and first public IP from each line; geo lookup uses the configured country.is-compatible service.',
+          hint: 'Support text paste: Tavily keys look like tvly-…; other providers: paste the native key string. Each line extracts the first key and first public IP; geo lookup uses the configured country.is-compatible service.',
           registrationIpBadge: 'IP',
           registrationIpTooltip: 'Registration IP: {ip}',
           actions: {
@@ -1378,7 +1382,7 @@ export const EN: TranslationShape = {
           status: 'Status',
           chargedCredits: 'Credits',
           httpStatus: 'HTTP Status',
-          mcpStatus: 'Tavily Status',
+          mcpStatus: 'Upstream Status',
           result: 'Result',
           keyEffect: 'Key Effect',
           effects: 'Effects',
@@ -1397,9 +1401,9 @@ export const EN: TranslationShape = {
         errors: {
           quotaExhausted: 'Quota exhausted',
           quotaExhaustedHttp: 'Quota exhausted (HTTP {http})',
-          requestFailedHttpMcp: 'Request failed (HTTP {http}, Tavily {mcp})',
+          requestFailedHttpMcp: 'Request failed (HTTP {http}, upstream {mcp})',
           requestFailedHttp: 'Request failed (HTTP {http})',
-          requestFailedMcp: 'Request failed (Tavily {mcp})',
+          requestFailedMcp: 'Request failed (upstream {mcp})',
           requestFailedGeneric: 'Request failed',
           httpStatus: 'HTTP {http}',
           none: '—',

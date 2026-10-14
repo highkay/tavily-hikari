@@ -1,6 +1,7 @@
 import { adminRechargeTranslations, adminTotpTranslations, adminTrustedClientIpTranslations } from '../adminRechargeTranslations'
 import { adminPressureTranslations } from '../adminPressureTranslations'
 import { adminProviderTranslations } from '../adminProviderTranslations'
+import { adminDashboardProvidersTranslations, adminTokenDetailTranslations } from './tokenDetail'
 import type { TranslationShape } from '../types'
 
 export const ZH: TranslationShape = {
@@ -13,13 +14,13 @@ export const ZH: TranslationShape = {
         readyFallback: '新版应用已准备完成，刷新后即可进入新版本。', description: (current, latest) => `当前 ${current} → 已准备 ${latest}`, refresh: '立即刷新', refreshing: '正在应用更新…', retry: '重试更新', dismiss: '暂不提醒',
       },
       heroTitle: 'Tavily Hikari Proxy',
-      heroTagline: 'Transparent request visibility for your Tavily integration.',
+      heroTagline: '为你的多搜索平台集成提供透明的请求可见性。',
       heroDescription:
-        'Tavily Hikari 将多组 Tavily API Key 聚合为统一入口，自动均衡密钥用量，并提供请求转发、速率监控与访问令牌管理。',
+        'Tavily Hikari 将多个搜索平台的 API Key（Tavily、SerpApi、Exa、Brave）汇入单一端点，均衡用量，并提供请求路由、频率监控与可共享的访问令牌。',
       metrics: {
         monthly: {
           title: '本月成功请求（UTC）',
-          subtitle: 'Tavily 月额度按 UTC 月初自动重置',
+          subtitle: '各提供方配额按其策略重置',
         },
         daily: {
           title: '今日',
@@ -27,7 +28,7 @@ export const ZH: TranslationShape = {
         },
         pool: {
           title: '号池可用数',
-          subtitle: '活跃 Tavily API Key / 总密钥（含本月耗尽）',
+          subtitle: '活跃 Key / 总 Key（跨提供方，含已耗尽）',
         },
       },
       adminButton: '打开管理员面板',
@@ -54,7 +55,7 @@ export const ZH: TranslationShape = {
         description: '已注册用户仍可继续使用 Linux DO 登录；新的账户暂时无法创建。',
       },
       adminLogin: {
-        title: '管理员登录', description: '登录后可管理 Tavily key 与访问令牌。',
+        title: '管理员登录', description: '登录后可管理搜索提供方 key 与访问令牌。',
         credentialsTitle: '登录凭据',
         password: {
           label: '管理员口令',
@@ -180,7 +181,8 @@ export const ZH: TranslationShape = {
         table: {
           time: '时间',
           httpStatus: 'HTTP',
-          mcpStatus: 'Tavily',
+          mcpStatus: '上游',
+          provider: '提供方',
           result: '结果',
         },
         toggles: {
@@ -390,6 +392,7 @@ export const ZH: TranslationShape = {
         statusConnecting: '正在连接实时更新',
         statusDegraded: '实时更新异常',
         staleHint: '当前展示最近一次成功快照，连接恢复后会自动刷新。',
+        providers: adminDashboardProvidersTranslations.zh,
       },
       pressure: adminPressureTranslations.zh,
       modules: {
@@ -1104,6 +1107,7 @@ export const ZH: TranslationShape = {
         },
         back: '返回令牌列表',
       },
+      tokenDetail: adminTokenDetailTranslations.zh,
       metrics: {
         labels: {
           total: '总请求数',
@@ -1132,14 +1136,14 @@ export const ZH: TranslationShape = {
       },
       keys: {
         title: 'API Keys',
-        description: '查看每个 Tavily API Key 的状态、用量和成功率。',
-        placeholder: '输入新的 Tavily API Key',
+        description: '查看每个 API Key 的状态、用量和成功率（跨提供方）。',
+        placeholder: '输入新的 API Key',
         addButton: '添加密钥',
         adding: '添加中…',
         batch: {
-          placeholder: '粘贴文本（每行提取首个 tvly-dev-* key 和公网 IP）',
+          placeholder: '每行粘贴一个 key（可在其后附带注册 IP）',
           groupPlaceholder: '分组名（可选）',
-          hint: '每行提取首个 tvly-dev-* key 和首个公网 IP；地区解析会访问已配置的兼容 country.is 服务。',
+          hint: 'Tavily key 形如 tvly-…；其他提供方请直接粘贴原生 key 字符串。每行提取首个 key 和首个公网 IP；地区解析会访问已配置的兼容 country.is 服务。',
           count: '可提取 key {count}',
           report: {
             title: '批量导入结果',
@@ -1166,7 +1170,7 @@ export const ZH: TranslationShape = {
         },
         validation: {
           title: '检测 API Keys',
-          hint: '支持粘贴文本：每行先提取首个 tvly-dev-* key 和首个公网 IP，再检测并入库；地区解析会访问已配置的兼容 country.is 服务。',
+          hint: '支持粘贴文本：Tavily key 形如 tvly-…；其他提供方请直接粘贴原生 key 字符串。每行提取首个 key 和首个公网 IP，检测后入库；地区解析会访问已配置的兼容 country.is 服务。',
           registrationIpBadge: 'IP',
           registrationIpTooltip: '注册 IP：{ip}',
           actions: {
@@ -1377,7 +1381,7 @@ export const ZH: TranslationShape = {
           status: '状态',
           chargedCredits: 'Credits',
           httpStatus: 'HTTP 状态码',
-          mcpStatus: 'Tavily 状态',
+          mcpStatus: '上游状态',
           result: '结果',
           keyEffect: 'Key 影响',
           effects: '效果',
@@ -1396,9 +1400,9 @@ export const ZH: TranslationShape = {
         errors: {
           quotaExhausted: '限额',
           quotaExhaustedHttp: '限额（HTTP {http}）',
-          requestFailedHttpMcp: '请求失败（HTTP {http}，Tavily {mcp}）',
+          requestFailedHttpMcp: '请求失败（HTTP {http}，上游 {mcp}）',
           requestFailedHttp: '请求失败（HTTP {http}）',
-          requestFailedMcp: '请求失败（Tavily {mcp}）',
+          requestFailedMcp: '请求失败（上游 {mcp}）',
           requestFailedGeneric: '请求失败',
           httpStatus: 'HTTP {http}',
           none: '—',

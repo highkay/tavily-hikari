@@ -3,6 +3,7 @@ export type Language = 'en' | 'zh'
 import type { AdminRechargeTranslations, SystemSettingsTotpTranslationKey, SystemSettingsTrustedClientIpTranslationKey } from './adminRechargeTranslationTypes'
 import type { AdminPressureTranslations } from './adminPressureTranslationTypes'
 import type { AdminProvidersTranslations } from './adminProviderTranslationTypes'
+import type { AdminDashboardProvidersTranslations, AdminTokenDetailTranslations } from './translations/tokenDetail'
 
 export interface LanguageContextValue {
   language: Language
@@ -166,6 +167,7 @@ export interface PublicTranslations {
       time: string
       httpStatus: string
       mcpStatus: string
+      provider: string
       result: string
     }
     toggles: {
@@ -376,6 +378,7 @@ export interface AdminTranslationsShape {
     statusConnecting: string
     statusDegraded: string
     staleHint: string
+    providers: AdminDashboardProvidersTranslations
   }
   pressure: AdminPressureTranslations
   modules: {
@@ -1436,6 +1439,7 @@ export interface AdminTranslationsShape {
     }
     back: string
   }
+  tokenDetail: AdminTokenDetailTranslations
     metrics: {
       labels: {
         total: string
