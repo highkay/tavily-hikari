@@ -269,6 +269,7 @@ export const ZH: TranslationShape = {
         monthTitle: '本月',
         monthDescription: '用紧凑视图查看本月累计请求表现。',
         monthComparisonEmpty: '上月暂无可用对比数据。',
+        providers: adminDashboardProvidersTranslations.zh,
         currentStatusTitle: '站点当前状态',
         currentStatusDescription: '查看此刻的额度、活跃密钥与池状态。',
         deltaFromYesterday: '较昨日同刻',

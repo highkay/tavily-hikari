@@ -255,6 +255,7 @@ export interface AdminTranslationsShape {
     monthTitle: string
     monthDescription: string
     monthComparisonEmpty: string
+    providers: AdminDashboardProvidersTranslations
     currentStatusTitle: string
     currentStatusDescription: string
     deltaFromYesterday: string

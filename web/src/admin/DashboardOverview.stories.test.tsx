@@ -7,12 +7,37 @@ import { createRoot } from 'react-dom/client'
 import { renderToStaticMarkup } from 'react-dom/server'
 
 import type { SummaryProviderCount } from '../api'
+import { translations } from '../i18n/translations'
+import type { DashboardOverviewStrings } from './DashboardOverview'
 import meta, * as dashboardStories from './DashboardOverview.stories'
 import { buildRollingHourlyWindow } from './dashboardHourlyCharts'
 
 afterEach(() => {
   document.body.innerHTML = ''
 })
+
+async function renderProviderCardText(strings: DashboardOverviewStrings): Promise<string> {
+  const container = document.createElement('div')
+  document.body.appendChild(container)
+  const root = createRoot(container)
+  await act(async () => {
+    root.render(
+      createElement(meta.component, {
+        ...dashboardStories.ProviderActivity.args,
+        strings,
+        initialVisibleResultSeries: [],
+        initialVisibleTypeSeries: [],
+        initialVisibleCreditSeries: [],
+      } as never),
+    )
+  })
+  const text = container.querySelector('.dashboard-provider-panel')?.textContent ?? ''
+  await act(async () => {
+    root.unmount()
+  })
+  container.remove()
+  return text
+}
 
 describe('DashboardOverview Storybook coverage', () => {
   it('keeps all six chart modes and the empty-selection story available', () => {
@@ -241,6 +266,35 @@ describe('DashboardOverview Storybook coverage', () => {
     await act(async () => {
       root.unmount()
     })
+  })
+
+  it('localizes the provider activity columns from the zh dictionary', async () => {
+    const text = await renderProviderCardText(translations.zh.admin.dashboard)
+    expect(text).toContain('提供方活动')
+    expect(text).toContain('请求数')
+    expect(text).toContain('已耗尽')
+    expect(text).not.toContain('Provider activity')
+    expect(text).not.toContain('Requests')
+    expect(text).not.toContain('Exhausted')
+  })
+
+  it('localizes the provider activity columns from the en dictionary', async () => {
+    const text = await renderProviderCardText(translations.en.admin.dashboard)
+    expect(text).toContain('Provider activity')
+    expect(text).toContain('Requests')
+    expect(text).toContain('Exhausted')
+    expect(text).not.toContain('提供方活动')
+    expect(text).not.toContain('请求数')
+    expect(text).not.toContain('已耗尽')
+  })
+
+  it('keeps the committed English provider labels when the strings omit them', async () => {
+    const strings: DashboardOverviewStrings = { ...translations.en.admin.dashboard }
+    delete strings.providers
+    const text = await renderProviderCardText(strings)
+    expect(text).toContain('Provider activity')
+    expect(text).toContain('Requests')
+    expect(text).toContain('Exhausted')
   })
 
   it('hides the provider activity card when provider counts are absent or empty', () => {

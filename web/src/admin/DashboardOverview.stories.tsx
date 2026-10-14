@@ -530,6 +530,7 @@ const zhStrings = {
   monthTitle: '本月',
   monthDescription: '把本月累计的请求价值分类与生命周期指标压缩到同一组卡片里。',
   monthComparisonEmpty: '上月暂无可用对比数据。',
+  providers: adminDashboardProvidersTranslations.zh,
   currentStatusTitle: '站点当前状态',
   currentStatusDescription: '当前额度、活跃密钥和代理池健康度快照。',
   deltaFromYesterday: '较昨日同刻',
