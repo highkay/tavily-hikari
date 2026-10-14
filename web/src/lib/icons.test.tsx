@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
 
-import { Icon, getGuideClientIconName } from './icons'
+import { Icon, GUIDE_CLIENT_ICON_NAMES, getGuideClientIconName } from './icons'
+import { BUNDLED_ICONS } from './icon-data'
 
 const REQUIRED_RUNTIME_ICON_NAMES = [
   'circle-flags:cn',
@@ -44,6 +45,7 @@ const REQUIRED_RUNTIME_ICON_NAMES = [
   'mdi:key-chain-variant',
   'mdi:key-change',
   'mdi:key-outline',
+  'mdi:lightning-bolt',
   'mdi:lock-outline',
   'mdi:loading',
   'mdi:logout-variant',
@@ -57,6 +59,7 @@ const REQUIRED_RUNTIME_ICON_NAMES = [
   'mdi:play-circle-outline',
   'mdi:progress-helper',
   'mdi:refresh',
+  'mdi:search-web',
   'mdi:share-variant',
   'mdi:shield-check-outline',
   'mdi:trash-can-outline',
@@ -68,6 +71,7 @@ const REQUIRED_RUNTIME_ICON_NAMES = [
   'mdi:view-dashboard-outline',
   'mdi:web-off',
   'simple-icons:anthropic',
+  'simple-icons:brave',
   'simple-icons:codeium',
   'simple-icons:cursor',
   'simple-icons:openai',
@@ -84,7 +88,22 @@ describe('local icon registry', () => {
     expect(getGuideClientIconName('cursor')).toBe('simple-icons:cursor')
     expect(getGuideClientIconName('windsurf')).toBe('simple-icons:codeium')
     expect(getGuideClientIconName('cherryStudio')).toBe('mdi:fruit-cherries')
+    expect(getGuideClientIconName('serpapi')).toBe('mdi:search-web')
+    expect(getGuideClientIconName('exa')).toBe('mdi:lightning-bolt')
+    expect(getGuideClientIconName('brave')).toBe('simple-icons:brave')
     expect(getGuideClientIconName('unknown-client')).toBe('mdi:dots-horizontal')
+  })
+
+  it('maps the three provider guide tabs to distinct non-fallback icons', () => {
+    const providerIcons = ['serpapi', 'exa', 'brave'].map((id) => getGuideClientIconName(id))
+    expect(new Set(providerIcons).size).toBe(3)
+    expect(providerIcons).not.toContain(getGuideClientIconName('other'))
+  })
+
+  it('resolves every guide client icon name inside the bundled icon data', () => {
+    for (const iconName of Object.values(GUIDE_CLIENT_ICON_NAMES)) {
+      expect(BUNDLED_ICONS[iconName]).toBeDefined()
+    }
   })
 
   it('renders every required runtime icon locally without remote Iconify URLs', () => {

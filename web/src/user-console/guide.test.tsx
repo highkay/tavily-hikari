@@ -9,6 +9,7 @@ import {
   resolveGuideSamples,
 } from './guide'
 import type { GuideContent, GuideKey } from './runtime'
+import { getGuideClientIconName } from '../lib/icons'
 
 describe('Hikari CLI guide content', () => {
   it('renders configured installer and optional skills commands', () => {
@@ -159,5 +160,15 @@ describe('provider setup guides', () => {
     expect(tavilyText).not.toContain('/serpapi/mcp')
     expect(tavilyText).not.toContain('/exa/mcp')
     expect(tavilyText).not.toContain('/brave/mcp')
+  })
+})
+
+describe('provider guide tab icons', () => {
+  it('resolves the three provider tabs to three distinct icons that are not the generic fallback', () => {
+    const providerIcons = PROVIDER_EXPECTATIONS.map((provider) => getGuideClientIconName(provider.key))
+
+    expect(providerIcons).toHaveLength(3)
+    expect(new Set(providerIcons).size).toBe(3)
+    expect(providerIcons).not.toContain(getGuideClientIconName('other'))
   })
 })

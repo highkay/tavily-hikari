@@ -11,9 +11,12 @@ type GuideClientIconId =
   | 'cursor'
   | 'windsurf'
   | 'cherryStudio'
+  | 'serpapi'
+  | 'exa'
+  | 'brave'
   | 'other'
 
-const GUIDE_CLIENT_ICON_NAMES: Record<GuideClientIconId, string> = {
+export const GUIDE_CLIENT_ICON_NAMES: Record<GuideClientIconId, string> = {
   codex: 'simple-icons:openai',
   hikariCli: 'mdi:github',
   claude: 'simple-icons:anthropic',
@@ -22,6 +25,9 @@ const GUIDE_CLIENT_ICON_NAMES: Record<GuideClientIconId, string> = {
   cursor: 'simple-icons:cursor',
   windsurf: 'simple-icons:codeium',
   cherryStudio: 'mdi:fruit-cherries',
+  serpapi: 'mdi:search-web',
+  exa: 'mdi:lightning-bolt',
+  brave: 'simple-icons:brave',
   other: 'mdi:dots-horizontal',
 }
 

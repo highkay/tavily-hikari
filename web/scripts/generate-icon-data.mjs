@@ -46,6 +46,7 @@ const ICON_SOURCES = [
     ['mdi:key-change', 'key-change'],
     ['mdi:lock-outline', 'lock-outline'],
     ['mdi:loading', 'loading'],
+    ['mdi:lightning-bolt', 'lightning-bolt'],
     ['mdi:account-arrow-right-outline', 'account-arrow-right-outline'],
     ['mdi:logout-variant', 'logout-variant'],
     ['mdi:map-marker-radius-outline', 'map-marker-radius-outline'],
@@ -59,6 +60,7 @@ const ICON_SOURCES = [
     ['mdi:progress-clock', 'progress-clock'],
     ['mdi:progress-helper', 'progress-helper'],
     ['mdi:refresh', 'refresh'],
+    ['mdi:search-web', 'search-web'],
     ['mdi:server-network-off', 'server-network-off'],
     ['mdi:share-variant', 'share-variant'],
     ['mdi:shape-outline', 'shape-outline'],
@@ -75,6 +77,7 @@ const ICON_SOURCES = [
     ['mdi:web-off', 'web-off'],
   ]],
   [simpleIcons, [
+    ['simple-icons:brave', 'brave'],
     ['simple-icons:openai', 'openai'],
     ['simple-icons:anthropic', 'anthropic'],
     ['simple-icons:visualstudiocode', 'visualstudiocode'],
