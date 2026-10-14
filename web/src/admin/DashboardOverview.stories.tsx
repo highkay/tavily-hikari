@@ -1,6 +1,7 @@
 import type { Meta, StoryObj } from '@storybook/react-vite'
 
-import type { DashboardMonthSeries, RecentAlertsSummary, SummaryWindowsResponse } from '../api'
+import type { DashboardMonthSeries, RecentAlertsSummary, SummaryProviderCount, SummaryWindowsResponse } from '../api'
+import { adminDashboardProvidersTranslations } from '../i18n/translations/tokenDetail'
 import DashboardOverview, { type DashboardMetricCard, type DashboardQuotaChargeCardData } from './DashboardOverview'
 import {
   createDashboardMonthMetrics,
@@ -52,6 +53,7 @@ const strings = {
   monthTitle: 'This Month',
   monthDescription: 'Month-to-date request taxonomy and lifecycle totals in one compact view.',
   monthComparisonEmpty: 'No retained previous-month comparison data.',
+  providers: adminDashboardProvidersTranslations.en,
   currentStatusTitle: 'Current Site Status',
   currentStatusDescription: 'Live quota, active keys, and pool health right now.',
   deltaFromYesterday: 'vs same time yesterday',
@@ -828,6 +830,28 @@ export const NoPreviousMonthComparison: Story = {
     if (!text.includes(strings.monthComparisonEmpty)) {
       throw new Error(`Expected missing previous-month story to contain: ${strings.monthComparisonEmpty}`)
     }
+  },
+}
+
+const providerActivityCounts: SummaryProviderCount[] = [
+  { provider: 'tavily', total_requests: 1607, success_count: 1521, error_count: 61, quota_exhausted_count: 25 },
+  { provider: 'serpapi', total_requests: 413, success_count: 398, error_count: 12, quota_exhausted_count: 3 },
+  { provider: 'exa', total_requests: 128, success_count: 121, error_count: 7, quota_exhausted_count: 0 },
+  { provider: 'brave', total_requests: 96, success_count: 88, error_count: 6, quota_exhausted_count: 2 },
+]
+
+export const ProviderActivity: Story = {
+  args: {
+    ...Default.args,
+    providerCounts: providerActivityCounts,
+  },
+  parameters: {
+    docs: {
+      description: {
+        story:
+          'Provider activity card with a mixed-provider summary breakdown (todo 6, matrix M3): one row per provider with requests/success/errors/exhausted counts. The card stays hidden when the backend omits the breakdown.',
+      },
+    },
   },
 }
 

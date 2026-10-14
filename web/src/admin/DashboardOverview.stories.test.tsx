@@ -6,6 +6,7 @@ import { createElement } from 'react'
 import { createRoot } from 'react-dom/client'
 import { renderToStaticMarkup } from 'react-dom/server'
 
+import type { SummaryProviderCount } from '../api'
 import meta, * as dashboardStories from './DashboardOverview.stories'
 import { buildRollingHourlyWindow } from './dashboardHourlyCharts'
 
@@ -31,6 +32,7 @@ describe('DashboardOverview Storybook coverage', () => {
     expect(dashboardStories.RecentAlertsDesktopEvidence).toMatchObject({})
     expect(dashboardStories.RecentAlertsBusinessHourWindow).toMatchObject({})
     expect(dashboardStories.NoPreviousMonthComparison).toMatchObject({})
+    expect(dashboardStories.ProviderActivity).toMatchObject({})
   })
 
   it('renders a repair state and leaves the affected chart interval unverified', () => {
@@ -168,5 +170,88 @@ describe('DashboardOverview Storybook coverage', () => {
       'apiNonBillable',
       'apiBillable',
     ])
+  })
+
+  it('renders the provider activity card with exact per-provider counts from the fixture', async () => {
+    const container = document.createElement('div')
+    document.body.appendChild(container)
+    const root = createRoot(container)
+    await act(async () => {
+      root.render(
+        createElement(meta.component, {
+          ...dashboardStories.ProviderActivity.args,
+          initialVisibleResultSeries: [],
+          initialVisibleTypeSeries: [],
+          initialVisibleCreditSeries: [],
+        } as never),
+      )
+    })
+
+    const card = container.querySelector('.dashboard-provider-panel')
+    expect(card).not.toBeNull()
+    expect(card?.querySelector('h2')?.textContent).toBe('Provider activity')
+    const expected: Record<string, string[]> = {
+      tavily: ['Tavily', '1,607', '1,521', '61', '25'],
+      serpapi: ['SerpApi', '413', '398', '12', '3'],
+      exa: ['Exa', '128', '121', '7', '0'],
+      brave: ['Brave', '96', '88', '6', '2'],
+    }
+    for (const [provider, cells] of Object.entries(expected)) {
+      const row = card?.querySelector(`tr[data-provider="${provider}"]`)
+      expect(row).not.toBeNull()
+      const text = Array.from(row?.querySelectorAll('td') ?? []).map((cell) => cell.textContent)
+      expect(text).toEqual(cells)
+    }
+
+    await act(async () => {
+      root.unmount()
+    })
+  })
+
+  it('re-renders provider counts when the fixture changes', async () => {
+    const container = document.createElement('div')
+    document.body.appendChild(container)
+    const root = createRoot(container)
+    const baseArgs = {
+      ...dashboardStories.ProviderActivity.args,
+      initialVisibleResultSeries: [],
+      initialVisibleTypeSeries: [],
+      initialVisibleCreditSeries: [],
+    }
+    const readCells = () =>
+      Array.from(container.querySelectorAll('.dashboard-provider-panel tbody td')).map((cell) => cell.textContent)
+    const first: SummaryProviderCount[] = [
+      { provider: 'tavily', total_requests: 1607, success_count: 1521, error_count: 61, quota_exhausted_count: 25 },
+      { provider: 'serpapi', total_requests: 413, success_count: 398, error_count: 12, quota_exhausted_count: 3 },
+    ]
+    await act(async () => {
+      root.render(createElement(meta.component, { ...baseArgs, providerCounts: first } as never))
+    })
+    expect(readCells()).toEqual(['Tavily', '1,607', '1,521', '61', '25', 'SerpApi', '413', '398', '12', '3'])
+
+    const second: SummaryProviderCount[] = [
+      { provider: 'tavily', total_requests: 1607, success_count: 1521, error_count: 61, quota_exhausted_count: 25 },
+      { provider: 'serpapi', total_requests: 509, success_count: 490, error_count: 16, quota_exhausted_count: 3 },
+    ]
+    await act(async () => {
+      root.render(createElement(meta.component, { ...baseArgs, providerCounts: second } as never))
+    })
+    expect(readCells()).toEqual(['Tavily', '1,607', '1,521', '61', '25', 'SerpApi', '509', '490', '16', '3'])
+
+    await act(async () => {
+      root.unmount()
+    })
+  })
+
+  it('hides the provider activity card when provider counts are absent or empty', () => {
+    const withoutCounts = renderToStaticMarkup(createElement(meta.component, dashboardStories.Default.args as never))
+    expect(withoutCounts).not.toContain('dashboard-provider-panel')
+    expect(withoutCounts).not.toContain('Provider activity')
+
+    const withEmpty = renderToStaticMarkup(
+      createElement(meta.component, { ...dashboardStories.Default.args, providerCounts: [] } as never),
+    )
+    expect(withEmpty).not.toContain('dashboard-provider-panel')
+    expect(withEmpty).not.toContain('Provider activity')
   })
 })

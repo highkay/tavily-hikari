@@ -8,6 +8,7 @@ import type {
   JobLogView,
   RecentAlertsSummary,
   RequestLog,
+  SummaryProviderCount,
   SummaryWindowsResponse,
 } from '../api'
 import RollingNumber from '../components/RollingNumber'
@@ -40,6 +41,11 @@ import {
   type DashboardCardBackdropMap,
   type DashboardCardBackdropSeries,
 } from './dashboardCardBackdrops'
+import {
+  adminDashboardProvidersTranslations,
+  type AdminDashboardProvidersTranslations,
+} from '../i18n/translations/tokenDetail'
+import { logProviderDisplayLabel } from '../lib/logProvider'
 
 ChartJS.register(CategoryScale, LinearScale, LineElement, PointElement, Filler, Tooltip, Legend)
 
@@ -86,6 +92,12 @@ export interface DashboardOverviewStrings {
   monthTitle: string
   monthDescription: string
   monthComparisonEmpty: string
+  /**
+   * `admin.dashboard.providers.*` card copy (todo 3, matrix M3-labels).
+   * Optional so existing callers compile unchanged; when omitted the card
+   * falls back to the committed `adminDashboardProvidersTranslations` record.
+   */
+  providers?: AdminDashboardProvidersTranslations
   currentStatusTitle: string
   currentStatusDescription: string
   trendsTitle: string
@@ -172,6 +184,11 @@ interface DashboardOverviewProps {
   hourlyRequestWindow: DashboardHourlyRequestWindow
   rollupIntegrity: DashboardRollupIntegrityStatus
   monthSeries?: DashboardMonthSeries | null
+  /**
+   * Per-provider request breakdown from `Summary.providers` (todo 20 wire).
+   * Undefined or empty hides the Provider activity card entirely (M3).
+   */
+  providerCounts?: SummaryProviderCount[]
   logs: RequestLog[]
   jobs: JobLogView[]
   recentAlerts: RecentAlertsSummary
@@ -196,6 +213,12 @@ function withOpacity(color: string, opacity: number): string {
   return color.startsWith('hsl(') && color.endsWith(')')
     ? `${color.slice(0, -1)} / ${opacity})`
     : color
+}
+
+const providerCountFormatter = new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 })
+
+function formatProviderCount(value: number): string {
+  return Number.isFinite(value) ? providerCountFormatter.format(value) : '—'
 }
 
 function buildCumulativeNullableSeries(
@@ -556,6 +579,7 @@ export default function DashboardOverview({
   hourlyRequestWindow,
   rollupIntegrity,
   monthSeries,
+  providerCounts,
   logs,
   jobs,
   recentAlerts,
@@ -888,6 +912,8 @@ export default function DashboardOverview({
     monthSeriesValue,
   ])
   const monthComparisonNotice = monthBackdrop.hasVisibleComparison ? null : strings.monthComparisonEmpty
+  const providerRows = providerCounts ?? []
+  const providerStrings = strings.providers ?? adminDashboardProvidersTranslations.en
 
   return (
     <div className="dashboard-overview-stack">
@@ -995,6 +1021,42 @@ export default function DashboardOverview({
           </div>
         )}
       </section>
+
+      {providerRows.length > 0 ? (
+        <section className="surface panel dashboard-provider-panel">
+          <div className="panel-header">
+            <div>
+              <h2>{providerStrings.title}</h2>
+            </div>
+          </div>
+          <div className="table-wrapper jobs-table-wrapper">
+            <table className="jobs-table admin-users-table" data-table-density="compact">
+              <thead>
+                <tr>
+                  <th scope="col">
+                    <span className="sr-only">{providerStrings.title}</span>
+                  </th>
+                  <th scope="col">{providerStrings.requests}</th>
+                  <th scope="col">{providerStrings.success}</th>
+                  <th scope="col">{providerStrings.errors}</th>
+                  <th scope="col">{providerStrings.exhausted}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {providerRows.map((row) => (
+                  <tr key={row.provider} data-provider={row.provider}>
+                    <td><strong>{logProviderDisplayLabel(row.provider)}</strong></td>
+                    <td>{formatProviderCount(row.total_requests)}</td>
+                    <td>{formatProviderCount(row.success_count)}</td>
+                    <td>{formatProviderCount(row.error_count)}</td>
+                    <td>{formatProviderCount(row.quota_exhausted_count)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      ) : null}
 
       <DashboardTrendPanel
         strings={strings}

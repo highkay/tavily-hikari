@@ -14,6 +14,7 @@
 import { demoExaAnswerFixture, demoExaContentsFixture, demoExaMcpToolFixture, demoExaSearchFixture, EXA_MCP_TOOLS, EXA_STREAM_REJECT_MESSAGE, isDemoExaStreamTruthy } from './demoExa'
 import { BRAVE_MCP_TOOLS, BRAVE_RATE_LIMIT_HEADERS, demoBraveLlmContextFixture, demoBraveMcpToolFixture, demoBraveNewsFixture, demoBraveWebFixture } from './demoBrave'
 import { demoSerpapiMcpToolResult, demoSerpapiMcpTools, demoSerpapiSearchFixture } from './demoSerpapi'
+import { normalizePayloadProvider, PROVIDER_IDS, type ProviderId, type SummaryProviderCount } from './providers'
 
 type JsonObject = Record<string, unknown>
 
@@ -401,4 +402,72 @@ export function createDemoProviderKeys(): Array<Record<string, unknown>> {
       transient_backoff: null,
     },
   ]
+}
+
+/**
+ * Demo parity for the todo-20 per-provider summary breakdown (plan todo 6,
+ * matrix M3/L8). Groups the demo keys (lifetime counters) and request logs by
+ * provider — legacy provider-less rows coalesce to `tavily`, matching the
+ * backend key-join merge rule (docs/multi-provider-search-proxy.md:328).
+ * `windowTotalRequests` rescales the same rows proportionally so each
+ * `/api/summary/windows` bucket carries a consistent per-window split of its
+ * own total; without it the full-history `/api/summary` rows are returned.
+ */
+export function createDemoProviderBreakdown(
+  keys: ReadonlyArray<Record<string, unknown>>,
+  logs: ReadonlyArray<Record<string, unknown>>,
+  windowTotalRequests?: number,
+): SummaryProviderCount[] {
+  const rows = new Map<ProviderId, SummaryProviderCount>()
+  const rowFor = (provider: ProviderId): SummaryProviderCount => {
+    const existing = rows.get(provider)
+    if (existing) return existing
+    const created: SummaryProviderCount = {
+      provider,
+      total_requests: 0,
+      success_count: 0,
+      error_count: 0,
+      quota_exhausted_count: 0,
+    }
+    rows.set(provider, created)
+    return created
+  }
+  for (const key of keys) {
+    const row = rowFor(normalizePayloadProvider(key))
+    row.total_requests += Number(key.total_requests) || 0
+    row.success_count += Number(key.success_count) || 0
+    row.error_count += Number(key.error_count) || 0
+    row.quota_exhausted_count += Number(key.quota_exhausted_count) || 0
+  }
+  for (const log of logs) {
+    const row = rowFor(normalizePayloadProvider(log))
+    row.total_requests += 1
+    if (log.result_status === 'success') {
+      row.success_count += 1
+    } else if (log.result_status === 'quota_exhausted') {
+      row.quota_exhausted_count += 1
+    } else {
+      row.error_count += 1
+    }
+  }
+  const ordered = PROVIDER_IDS.flatMap((id) => {
+    const row = rows.get(id)
+    return row ? [row] : []
+  })
+  if (typeof windowTotalRequests !== 'number' || !Number.isFinite(windowTotalRequests)) {
+    return ordered
+  }
+  const baseTotal = ordered.reduce((sum, row) => sum + row.total_requests, 0)
+  if (baseTotal <= 0) return ordered
+  return ordered.map((row) => {
+    const total = Math.round((row.total_requests / baseTotal) * windowTotalRequests)
+    const scale = row.total_requests > 0 ? total / row.total_requests : 0
+    return {
+      provider: row.provider,
+      total_requests: total,
+      success_count: Math.round(row.success_count * scale),
+      error_count: Math.round(row.error_count * scale),
+      quota_exhausted_count: Math.round(row.quota_exhausted_count * scale),
+    }
+  })
 }
