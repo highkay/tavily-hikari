@@ -1,5 +1,14 @@
-const TVLY_DEV_API_KEY_PATTERN = /tvly-dev-[A-Za-z0-9_-]+/
+import type { ProviderId } from '../api/providers'
+
+/**
+ * Tavily keys carry a stable `tvly-` prefix; the harvested dev keys
+ * (`tvly-dev-…`) are a subset of it. Native providers get no format pattern -
+ * see {@link firstNativeKeyToken}.
+ */
+const TVLY_API_KEY_PATTERN = /tvly-[A-Za-z0-9_-]+/
 const TOKEN_SPLIT_PATTERN = /[\s|;,]+/
+/** Length floor for a native key token: shorter tokens are prose or addresses. */
+const MIN_NATIVE_KEY_LENGTH = 8
 
 export interface ApiKeyImportEntry {
   api_key: string
@@ -110,22 +119,60 @@ export function extractRegistrationIpFromLine(line: string): string | null {
   return null
 }
 
-export function extractApiKeyImportEntryFromLine(line: string): ApiKeyImportEntry | null {
-  const match = line.match(TVLY_DEV_API_KEY_PATTERN)
-  if (!match) return null
+/**
+ * Native (non-Tavily) provider key: the first token on the line that clears the
+ * length floor and is not the line's registration ip. Deliberately
+ * format-agnostic - upstream key shapes drift, the backend accepts any
+ * non-empty string, and real validation is the zero-cost probe endpoint.
+ */
+function firstNativeKeyToken(line: string): string | null {
+  const registrationIp = extractRegistrationIpFromLine(line)
+  for (const rawToken of line.split(TOKEN_SPLIT_PATTERN)) {
+    const token = cleanToken(rawToken)
+    if (token.length < MIN_NATIVE_KEY_LENGTH || token === registrationIp) continue
+    return token
+  }
+  return null
+}
+
+/**
+ * Provider dispatch, exhaustive over `ProviderId`: a fifth provider is a compile
+ * error here until its parse rule is chosen.
+ */
+function findApiKeyInLine(line: string, provider: ProviderId): string | null {
+  switch (provider) {
+    case 'tavily':
+      return line.match(TVLY_API_KEY_PATTERN)?.[0] ?? null
+    case 'serpapi':
+    case 'exa':
+    case 'brave':
+      return firstNativeKeyToken(line)
+  }
+}
+
+export function extractApiKeyImportEntryFromLine(
+  line: string,
+  provider: ProviderId = 'tavily',
+): ApiKeyImportEntry | null {
+  const apiKey = findApiKeyInLine(line, provider)
+  if (apiKey === null) return null
   return {
-    api_key: match[0],
+    api_key: apiKey,
     registration_ip: extractRegistrationIpFromLine(line),
   }
 }
 
-export function extractApiKeyImportEntriesFromText(text: string): ApiKeyImportEntry[] {
+export function extractApiKeyImportEntriesFromText(
+  text: string,
+  provider: ProviderId = 'tavily',
+): ApiKeyImportEntry[] {
   return text
     .split(/\r?\n/)
-    .map((line) => extractApiKeyImportEntryFromLine(line))
+    .map((line) => extractApiKeyImportEntryFromLine(line, provider))
     .filter((entry): entry is ApiKeyImportEntry => entry != null)
 }
 
+/** Legacy Tavily-only surface: both wrappers keep the tavily default. */
 export function extractTvlyDevApiKeyFromLine(line: string): string | null {
   return extractApiKeyImportEntryFromLine(line)?.api_key ?? null
 }
