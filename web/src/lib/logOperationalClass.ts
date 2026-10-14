@@ -1,7 +1,21 @@
 import type { LogOperationalClass } from '../api'
 import type { StatusTone } from '../components/StatusBadge'
+import { logProviderDisplayLabel } from './logProvider'
 
 export type SupportedLanguage = 'en' | 'zh'
+
+/**
+ * Plan todo 5 / M6: resolve a provider display name for failure guidance.
+ * Reuses the presentation-layer brand resolver (`lib/logProvider`) so the
+ * copy never re-implements the provider label map. Absent/empty values yield
+ * `null` — the guidance falls back to generic upstream wording rather than
+ * mislabeling a legacy row as Tavily.
+ */
+function guidanceProviderName(provider: string | null | undefined): string | null {
+  const raw = typeof provider === 'string' ? provider.trim() : ''
+  if (!raw) return null
+  return logProviderDisplayLabel(raw)
+}
 
 /**
  * Plan todo 23 / M9: provider request-kind classification shim.
@@ -116,20 +130,35 @@ export function operationalClassLabel(
 export function failureKindGuidance(
   kind: string | null | undefined,
   language: SupportedLanguage,
+  provider?: string | null,
 ): string | null {
   switch ((kind ?? '').trim()) {
     case 'upstream_gateway_5xx':
       return language === 'zh'
         ? '这是上游网关临时故障，建议稍后重试，并检查上游连通性或代理节点健康。'
         : 'This is a temporary upstream gateway failure. Retry later and inspect upstream connectivity or proxy health.'
-    case 'upstream_rate_limited_429':
-      return language === 'zh'
-        ? '这是 Tavily 限流，建议降低频率、切换其他 Key，或等待限流窗口恢复。'
-        : 'Tavily is rate limiting this traffic. Reduce request rate, switch keys, or wait for the limit window to reset.'
-    case 'upstream_account_deactivated_401':
-      return language === 'zh'
-        ? '该 Key 可能已失效、被撤销或账户停用，建议更换可用 Key 并检查 Tavily 后台状态。'
-        : 'The key may be invalid, revoked, or tied to a deactivated account. Replace it and check the Tavily account state.'
+    case 'upstream_rate_limited_429': {
+      const name = guidanceProviderName(provider)
+      if (language === 'zh') {
+        return name
+          ? `这是 ${name} 限流，建议降低频率、切换其他 Key，或等待限流窗口恢复。`
+          : '这是上游供应商限流，建议降低频率、切换其他 Key，或等待限流窗口恢复。'
+      }
+      return name
+        ? `${name} is rate limiting this traffic. Reduce request rate, switch keys, or wait for the limit window to reset.`
+        : 'The upstream provider is rate limiting this traffic. Reduce request rate, switch keys, or wait for the limit window to reset.'
+    }
+    case 'upstream_account_deactivated_401': {
+      const name = guidanceProviderName(provider)
+      if (language === 'zh') {
+        return name
+          ? `该 Key 可能已失效、被撤销或账户停用，建议更换可用 Key 并检查 ${name} 后台状态。`
+          : '该 Key 可能已失效、被撤销或账户停用，建议更换可用 Key 并检查上游供应商后台状态。'
+      }
+      return name
+        ? `The key may be invalid, revoked, or tied to a deactivated ${name} account. Replace it and check the ${name} account state.`
+        : 'The key may be invalid, revoked, or tied to a deactivated upstream provider account. Replace it and check the upstream provider state.'
+    }
     case 'transport_send_error':
       return language === 'zh'
         ? '这是链路发送失败，建议检查 DNS、TLS、代理链路和上游可达性。'
@@ -179,8 +208,9 @@ export function operationalClassGuidance(
   operationalClass: string | null | undefined,
   failureKind: string | null | undefined,
   language: SupportedLanguage,
+  provider?: string | null,
 ): string | null {
-  const failureGuidance = failureKindGuidance(failureKind, language)
+  const failureGuidance = failureKindGuidance(failureKind, language, provider)
   if (failureGuidance) {
     return failureGuidance
   }
@@ -194,10 +224,17 @@ export function operationalClassGuidance(
       return language === 'zh'
         ? '这是客户端输入、协议或工具参数问题，建议先检查调用方请求。'
         : 'This is a client-side request, protocol, or tool-argument issue. Inspect the caller payload first.'
-    case 'upstream_error':
-      return language === 'zh'
-        ? '这是上游返回的外部错误，建议结合 Tavily 状态、限流与连通性继续排查。'
-        : 'This is an upstream-originated failure. Check Tavily status, rate limits, and upstream connectivity.'
+    case 'upstream_error': {
+      const name = guidanceProviderName(provider)
+      if (language === 'zh') {
+        return name
+          ? `这是上游返回的外部错误，建议结合 ${name} 状态、限流与连通性继续排查。`
+          : '这是上游返回的外部错误，建议结合上游供应商状态、限流与连通性继续排查。'
+      }
+      return name
+        ? `This is an upstream-originated failure. Check ${name} status, rate limits, and upstream connectivity.`
+        : 'This is an upstream-originated failure. Check the upstream provider status, rate limits, and upstream connectivity.'
+    }
     case 'system_error':
       return language === 'zh'
         ? '这是代理链路或系统侧异常，建议查看服务日志、网络链路与内部报错。'

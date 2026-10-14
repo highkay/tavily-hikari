@@ -82,4 +82,50 @@ describe('log operational class helpers', () => {
     expect(failureKindGuidance('upstream_gateway_5xx', 'en')).toContain('gateway')
     expect(operationalClassTone('quota_exhausted')).toBe('warning')
   })
+
+  it('interpolates the provider display name into failure guidance', () => {
+    const en429 = failureKindGuidance('upstream_rate_limited_429', 'en', 'serpapi')
+    expect(en429).toContain('SerpApi')
+    expect(en429).not.toContain('Tavily')
+
+    const zh429 = failureKindGuidance('upstream_rate_limited_429', 'zh', 'serpapi')
+    expect(zh429).toContain('SerpApi')
+    expect(zh429).not.toContain('Tavily')
+
+    const en401 = failureKindGuidance('upstream_account_deactivated_401', 'en', 'serpapi')
+    expect(en401).toContain('SerpApi')
+    expect(en401).not.toContain('Tavily')
+  })
+
+  it('falls back to generic upstream copy when the provider is null/legacy', () => {
+    const en429 = failureKindGuidance('upstream_rate_limited_429', 'en', null)
+    expect(en429).toContain('rate limiting')
+    expect(en429).toContain('upstream provider')
+    expect(en429).not.toContain('Tavily')
+    expect(en429).not.toContain('undefined')
+    expect(en429).not.toContain('null')
+
+    const zh401 = failureKindGuidance('upstream_account_deactivated_401', 'zh', null)
+    expect(zh401).toContain('账户停用')
+    expect(zh401).not.toContain('undefined')
+    expect(zh401).not.toContain('null')
+
+    // An omitted provider behaves exactly like an explicit null provider.
+    expect(failureKindGuidance('upstream_rate_limited_429', 'en')).not.toContain('Tavily')
+  })
+
+  it('carries the provider through operationalClassGuidance upstream-error copy', () => {
+    const en = operationalClassGuidance('upstream_error', null, 'en', 'serpapi')
+    expect(en).toContain('SerpApi')
+    expect(en).not.toContain('Tavily')
+
+    const generic = operationalClassGuidance('upstream_error', null, 'en', null)
+    expect(generic).toContain('upstream provider')
+    expect(generic).not.toContain('undefined')
+
+    // The failure-kind branch honours the provider param too.
+    expect(
+      operationalClassGuidance('upstream_error', 'upstream_rate_limited_429', 'zh', 'serpapi'),
+    ).toContain('SerpApi')
+  })
 })
