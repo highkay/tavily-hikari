@@ -830,6 +830,7 @@ pub struct ApiKeyListFacets {
     pub groups: Vec<ApiKeyFacetCount>,
     pub statuses: Vec<ApiKeyFacetCount>,
     pub regions: Vec<ApiKeyFacetCount>,
+    pub providers: Vec<ApiKeyFacetCount>,
 }
 
 #[derive(Debug, Clone)]

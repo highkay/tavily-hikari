@@ -753,3 +753,135 @@ fn tavily_dto_and_validate_result_shapes_stay_additive() {
         "unknown provider rejected"
     );
 }
+
+#[tokio::test]
+async fn key_list_facets_expose_provider_counts_with_tavily_merge() {
+    // Given a fresh admin surface seeded with tavily-only keys first: one
+    // stamped tavily, one legacy create WITHOUT the provider field
+    let harness = spawn_provider_admin_harness("provider-admin-facets").await;
+    let mut ids = HashMap::new();
+    for (api_key, payload) in [
+        (
+            "k-facet-tavily",
+            json!({ "api_key": "k-facet-tavily", "provider": "tavily" }),
+        ),
+        ("k-facet-legacy", json!({ "api_key": "k-facet-legacy" })),
+    ] {
+        let (status, body) = harness.create_key(payload).await;
+        assert_eq!(status, 201, "create {api_key}: {body}");
+        ids.insert(
+            api_key.to_string(),
+            body["id"].as_str().expect("id").to_string(),
+        );
+    }
+
+    fn provider_facets(body: &Value) -> Vec<(String, i64)> {
+        body["facets"]["providers"]
+            .as_array()
+            .unwrap_or_else(|| panic!("facets.providers present: {body}"))
+            .iter()
+            .map(|entry| {
+                let mut keys: Vec<&str> = entry
+                    .as_object()
+                    .expect("facet entry object")
+                    .keys()
+                    .map(String::as_str)
+                    .collect();
+                keys.sort_unstable();
+                assert_eq!(keys, vec!["count", "value"], "facet entry shape");
+                (
+                    entry["value"].as_str().expect("value").to_string(),
+                    entry["count"].as_i64().expect("count"),
+                )
+            })
+            .collect()
+    }
+
+    // Then the NULL→tavily merge rule (docs/multi-provider-search-proxy.md:328)
+    // is enforced STRUCTURALLY by the live schema: v45 defines api_keys.provider
+    // as NOT NULL DEFAULT 'tavily', so degrading a row to NULL is rejected and
+    // the facet can never observe a NULL provider (the facet SQL's COALESCE
+    // mirrors the convention defensively, matching the ?provider= filter).
+    {
+        let options = SqliteConnectOptions::new()
+            .filename(harness.db_path.as_path())
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(5));
+        let pool = SqlitePoolOptions::new()
+            .min_connections(1)
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("open facets db");
+        let err = sqlx::query("UPDATE api_keys SET provider = NULL WHERE id = ?")
+            .bind(&ids["k-facet-legacy"])
+            .execute(&pool)
+            .await
+            .expect_err("NULL provider rejected by schema");
+        assert!(
+            err.to_string().contains("NOT NULL"),
+            "schema blocks NULL provider: {err}"
+        );
+    }
+
+    // And the providers facet lists tavily only: the legacy create (no
+    // provider field) merged into tavily, with no phantom NULL/empty entry
+    let (status, body) = harness.get_json("/api/keys?per_page=100").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        provider_facets(&body),
+        vec![("tavily".to_string(), 2_i64)],
+        "tavily-only pool with legacy merge"
+    );
+
+    // When serpapi keys join the pool
+    for api_key in ["k-facet-serpapi-a", "k-facet-serpapi-b"] {
+        let (status, body) = harness
+            .create_key(json!({ "api_key": api_key, "provider": "serpapi" }))
+            .await;
+        assert_eq!(status, 201, "create {api_key}: {body}");
+    }
+
+    // Then the facet reflects the current DB state: both providers with exact
+    // counts, ordered by value
+    let (status, body) = harness.get_json("/api/keys?per_page=100").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        provider_facets(&body),
+        vec![("serpapi".to_string(), 2_i64), ("tavily".to_string(), 2_i64)],
+        "mixed pool facet counts"
+    );
+
+    // And the legacy row still answers the tavily filter (merge at filter level)
+    let (status, body) = harness.get_json("/api/keys?provider=tavily").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["total"], json!(2), "legacy row counts as tavily");
+
+    // When a provider filter is applied, the OTHER facets stay coherent:
+    // statuses narrows to the filtered rows while the providers facet keeps
+    // its own dimension unfiltered (mirrors groups/statuses/regions)
+    let (status, body) = harness.get_json("/api/keys?provider=serpapi").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["total"], json!(2), "serpapi total");
+    let statuses = body["facets"]["statuses"]
+        .as_array()
+        .expect("statuses facet");
+    assert_eq!(statuses.len(), 1, "statuses narrow to serpapi rows");
+    assert_eq!(statuses[0]["value"], json!("active"));
+    assert_eq!(statuses[0]["count"], json!(2));
+    assert_eq!(
+        provider_facets(&body),
+        vec![("serpapi".to_string(), 2_i64), ("tavily".to_string(), 2_i64)],
+        "providers facet ignores its own dimension"
+    );
+
+    // And an unknown provider value never 500s: empty page, coherent facets
+    let (status, body) = harness.get_json("/api/keys?provider=bogus").await;
+    assert_eq!(status, 200, "unknown provider does not 500: {body}");
+    assert_eq!(body["total"], json!(0));
+    assert_eq!(
+        provider_facets(&body),
+        vec![("serpapi".to_string(), 2_i64), ("tavily".to_string(), 2_i64)],
+        "providers facet survives unknown filter"
+    );
+}

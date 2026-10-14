@@ -151,6 +151,15 @@ async fn list_keys(
                             count: facet.count,
                         })
                         .collect(),
+                    providers: result
+                        .facets
+                        .providers
+                        .into_iter()
+                        .map(|facet| ApiKeyFacetCountView {
+                            value: facet.value,
+                            count: facet.count,
+                        })
+                        .collect(),
                 },
             })
         })
@@ -227,6 +236,7 @@ struct ApiKeyFacetsView {
     groups: Vec<ApiKeyFacetCountView>,
     statuses: Vec<ApiKeyFacetCountView>,
     regions: Vec<ApiKeyFacetCountView>,
+    providers: Vec<ApiKeyFacetCountView>,
 }
 
 #[derive(Debug, Serialize)]

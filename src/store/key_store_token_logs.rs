@@ -2175,6 +2175,39 @@ impl KeyStore {
             .map_err(ProxyError::from)
     }
 
+    /// Provider facet for the admin keys listing (plan M12). COALESCE mirrors
+    /// the documented NULL/legacy→'tavily' merge (the v45 schema enforces it
+    /// structurally via NOT NULL DEFAULT 'tavily'). Like every other facet
+    /// here, the query filters by all dimensions EXCEPT its own.
+    pub(crate) async fn fetch_api_key_provider_facets(
+        &self,
+        groups: &[String],
+        statuses: &[String],
+        registration_ip: Option<&str>,
+        regions: &[String],
+    ) -> Result<Vec<ApiKeyFacetCount>, ProxyError> {
+        let mut builder = QueryBuilder::<Sqlite>::new(
+            "SELECT COALESCE(ak.provider, 'tavily') AS value, COUNT(*) AS count",
+        );
+        builder.push(Self::api_key_metrics_from_clause());
+        Self::push_api_key_group_filters(&mut builder, groups);
+        Self::push_api_key_status_filters(&mut builder, statuses);
+        Self::push_api_key_registration_ip_filter(&mut builder, registration_ip);
+        Self::push_api_key_region_filters(&mut builder, regions);
+        builder.push(" GROUP BY value ORDER BY value ASC");
+
+        let rows = builder.build().fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ApiKeyFacetCount {
+                    value: row.try_get("value")?,
+                    count: row.try_get("count")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(ProxyError::from)
+    }
+
     pub(crate) async fn fetch_api_key_metrics(
         &self,
         include_quarantine_detail: bool,
@@ -2306,6 +2339,9 @@ impl KeyStore {
         let region_counts = self
             .fetch_api_key_region_facets(&groups, &statuses, registration_ip, &providers)
             .await?;
+        let provider_counts = self
+            .fetch_api_key_provider_facets(&groups, &statuses, registration_ip, &regions)
+            .await?;
 
         Ok(PaginatedApiKeyMetrics {
             items,
@@ -2316,6 +2352,7 @@ impl KeyStore {
                 groups: group_counts,
                 statuses: status_counts,
                 regions: region_counts,
+                providers: provider_counts,
             },
         })
     }
