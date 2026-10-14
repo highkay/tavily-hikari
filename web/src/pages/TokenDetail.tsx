@@ -237,8 +237,9 @@ interface QuotaStatCardProps {
 }
 
 function QuotaStatCard({ label, used, limit, resetAt, description }: QuotaStatCardProps): JSX.Element {
+  const resetStrings = useTranslate().admin.tokenDetail.reset
   const shouldShowReset = used > 0 && typeof resetAt === 'number' && resetAt * 1000 > Date.now()
-  let resetLabel = 'Not used yet'
+  let resetLabel = resetStrings.notUsedYet
   if (shouldShowReset) {
     try {
       resetLabel = dateTimeFormatter.format(new Date(resetAt! * 1000))
@@ -255,7 +256,7 @@ function QuotaStatCard({ label, used, limit, resetAt, description }: QuotaStatCa
       </div>
       <div className="quota-stat-description">{description}</div>
       <div className="quota-stat-reset">
-        {shouldShowReset ? `Next reset: ${resetLabel}` : resetLabel}
+        {shouldShowReset ? resetStrings.nextReset.replace('{value}', resetLabel) : resetLabel}
       </div>
     </div>
   )
@@ -653,7 +654,7 @@ export default function TokenDetail({
   const applyStartInput = (raw: string, nextPeriod: Period = period, opts?: { suppressWarning?: boolean }) => {
     const sanitized = sanitizeInput(nextPeriod, raw || defaultInputValue(nextPeriod))
     const shouldWarn = !opts?.suppressWarning && raw.trim() !== '' && sanitized !== raw
-    setWarning(shouldWarn ? 'Start value was adjusted to the valid range' : null)
+    setWarning(shouldWarn ? tokenDetailStrings.errors.startValueAdjusted : null)
     setSinceInput((prev) => (prev === sanitized ? prev : sanitized))
   }
 
@@ -716,12 +717,12 @@ export default function TokenDetail({
       throw new Error(body || `${res.status} ${res.statusText}`)
     }
     if (!contentType.toLowerCase().includes('application/json')) {
-      throw new Error(body || 'Response was not valid JSON')
+      throw new Error(body || tokenDetailStrings.errors.responseNotJson)
     }
     try {
       return JSON.parse(body) as T
     } catch {
-      throw new Error(body || 'Failed to parse response JSON')
+      throw new Error(body || tokenDetailStrings.errors.parseResponseJson)
     }
   }
 
@@ -917,7 +918,7 @@ export default function TokenDetail({
         void loadQuickStats()
       } catch (e) {
         if ((e as Error).name === 'AbortError') return
-        setError(e instanceof Error ? e.message : 'Failed to load token details')
+        setError(e instanceof Error ? e.message : tokenDetailStrings.errors.loadDetail)
         setSummaryLoadState('error')
       }
     }
@@ -925,7 +926,7 @@ export default function TokenDetail({
     return () => {
       detailController.abort()
     }
-  }, [id, period, sinceIso, summaryQueryBaseKey, untilIso])
+  }, [id, period, sinceIso, summaryQueryBaseKey, tokenDetailStrings.errors.loadDetail, untilIso])
 
   // load logs list when the time window, cursor, or filters change
   useEffect(() => {
@@ -955,7 +956,7 @@ export default function TokenDetail({
         if ((e as Error).name === 'AbortError') return
         setLogs([])
         setLogsPageInfo(createEmptyTokenLogsListPage(requestedPerPage))
-        setError(e instanceof Error ? e.message : 'Failed to load request records')
+        setError(e instanceof Error ? e.message : tokenDetailStrings.errors.loadRequestRecords)
         setLogsLoadState('error')
       }
     }
@@ -963,7 +964,7 @@ export default function TokenDetail({
     return () => {
       logsController.abort()
     }
-  }, [loadLogsPage, logsCursor, logsDirection, logsListQueryKey, logsQueryBaseKey])
+  }, [loadLogsPage, logsCursor, logsDirection, logsListQueryKey, logsQueryBaseKey, tokenDetailStrings.errors.loadRequestRecords])
 
   useEffect(() => {
     const controller = refreshLogsCatalog()
@@ -1137,11 +1138,11 @@ export default function TokenDetail({
       setIsRotatedDialogOpen(true)
     } catch (e) {
       setIsRotateDialogOpen(false)
-      alert((e as Error)?.message || 'Failed to regenerate token secret')
+      alert((e as Error)?.message || tokenDetailStrings.errors.regenerateSecret)
     } finally {
       setRotating(false)
     }
-  }, [id, onSecretRotated])
+  }, [id, onSecretRotated, tokenDetailStrings.errors.regenerateSecret])
 
   const handleCopyRotatedToken = useCallback(async () => {
     if (!rotatedToken) return

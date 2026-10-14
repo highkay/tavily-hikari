@@ -15,17 +15,23 @@ import TokenDetail, { __testables } from './TokenDetail'
  * `admin.tokenDetail.*` catalog instead of hardcoded English, in both
  * languages, and a missing catalog entry can never surface as a raw key path.
  *
- * Known catalog gap (the dictionaries belong to plan todo 3): QuotaStatCard's
- * 'Not used yet' / 'Next reset:' strings have no `admin.tokenDetail.*` key, so
- * they stay English and are deliberately not asserted here.
+ * Plan todo 14 closed the remaining catalog gap: QuotaStatCard's reset copy
+ * (`admin.tokenDetail.reset.*`) and the operator-facing failure copy
+ * (`admin.tokenDetail.errors.*`) are dictionary leaves too, so both directions
+ * are asserted for the reset label, the upcoming-reset line, and the
+ * detail-load failure banner.
  */
 
 const TOKEN_ID = 'a1b2'
 const RAW_KEY_PATH_MARKER = 'admin.tokenDetail.'
 const UNEXPECTED_REQUEST_MARKER = 'unexpected test request'
 const DETAIL_FAILURE_MARKER = 'stub-detail-unavailable'
+// A non-Error rejection is what makes the catch fall back to the catalog string
+// instead of `e.message`, so this marker must never reach the DOM.
+const NON_ERROR_FAILURE = 'stub-non-error-failure'
+const UPCOMING_RESET_AT = Math.floor(Date.now() / 1000) + 3600
 
-type DetailStub = 'ready' | 'failing'
+type DetailStub = 'ready' | 'failing' | 'rejecting' | 'upcoming-reset'
 
 const detailPayload = {
   id: TOKEN_ID,
@@ -69,6 +75,8 @@ const logsCatalogPayload = {
   requestKindOptions: [],
   facets: { results: [], keyEffects: [], bindingEffects: [], selectionEffects: [], tokens: [], keys: [] },
 }
+
+const detailPayloadWithUpcomingReset = { ...detailPayload, quota_hourly_reset_at: UPCOMING_RESET_AT }
 
 function jsonResponse(body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -127,12 +135,20 @@ function installTokenApiStub(detail: DetailStub): void {
     const { pathname } = new URL(request.url, window.location.origin)
     const base = `/api/tokens/${TOKEN_ID}`
     if (pathname === base) {
+      if (detail === 'rejecting') throw NON_ERROR_FAILURE
+      if (detail === 'upcoming-reset') return jsonResponse(detailPayloadWithUpcomingReset)
       return detail === 'failing'
         ? new Response(JSON.stringify({ error: DETAIL_FAILURE_MARKER }), {
             status: 500,
             headers: { 'content-type': 'application/json' },
           })
         : jsonResponse(detailPayload)
+    }
+    // In the rejecting mode the log list stays pending on purpose: its success
+    // path clears the error banner the detail failure just set, which would make
+    // the assertion depend on request resolution order.
+    if (detail === 'rejecting' && pathname === `${base}/logs/list`) {
+      return new Promise<Response>(() => undefined)
     }
     if (pathname === `${base}/metrics`) return jsonResponse(metricsPayload)
     if (pathname === `${base}/logs/list`) return jsonResponse(logsListPayload)
@@ -321,11 +337,13 @@ describe('TokenDetail localization', () => {
       '>限额<',
       '暂无日志。',
       '正在加载…',
+      '>尚未使用<',
     ]) {
       expect(markup).toContain(localized)
     }
     for (const hardcoded of [
       'Access Token Detail',
+      '>Not used yet<',
       'Live updates via SSE',
       'Regenerate Secret',
       '>Back<',
@@ -394,13 +412,60 @@ describe('TokenDetail localization', () => {
       '>Quota Exhausted<',
       'No logs yet.',
       'Loading…',
+      '>Not used yet<',
     ]) {
       expect(markup).toContain(original)
     }
-    for (const localized of ['访问令牌详情', '总请求数', '暂无日志。', '正在加载…']) {
+    for (const localized of ['访问令牌详情', '总请求数', '暂无日志。', '正在加载…', '尚未使用']) {
       expect(markup).not.toContain(localized)
     }
     expect(markup).not.toContain(UNEXPECTED_REQUEST_MARKER)
+    expect(markup).not.toContain(RAW_KEY_PATH_MARKER)
+  })
+
+  it('renders the zh upcoming-reset copy when the quota reset time is in the future', async () => {
+    const mounted = await mountTokenDetail('zh', 'upcoming-reset')
+    await waitFor(() => mounted.innerHTML.includes('下次重置：'), 'zh upcoming reset copy')
+
+    const markup = mounted.innerHTML
+    expect(markup).toContain('下次重置：')
+    expect(markup).toContain('>尚未使用<')
+    expect(markup).not.toContain('Next reset:')
+    expect(markup).not.toContain('>Not used yet<')
+    expect(markup).not.toContain(RAW_KEY_PATH_MARKER)
+  })
+
+  it('renders the en upcoming-reset copy when the quota reset time is in the future', async () => {
+    const mounted = await mountTokenDetail('en', 'upcoming-reset')
+    await waitFor(() => mounted.innerHTML.includes('Next reset:'), 'en upcoming reset copy')
+
+    const markup = mounted.innerHTML
+    expect(markup).toContain('Next reset:')
+    expect(markup).toContain('>Not used yet<')
+    expect(markup).not.toContain('下次重置：')
+    expect(markup).not.toContain('尚未使用')
+    expect(markup).not.toContain(RAW_KEY_PATH_MARKER)
+  })
+
+  it('renders the zh detail-load failure copy when the request fails without an Error', async () => {
+    const mounted = await mountTokenDetail('zh', 'rejecting')
+    await waitFor(() => mounted.innerHTML.includes('加载 Token 详情失败'), 'zh load failure copy')
+
+    const markup = mounted.innerHTML
+    expect(markup).toContain('加载 Token 详情失败')
+    expect(markup).not.toContain('Failed to load token details')
+    expect(markup).not.toContain(NON_ERROR_FAILURE)
+    expect(markup).not.toContain(RAW_KEY_PATH_MARKER)
+  })
+
+  it('renders the en detail-load failure copy when the request fails without an Error', async () => {
+    const mounted = await mountTokenDetail('en', 'rejecting')
+    await waitFor(() => mounted.innerHTML.includes('Failed to load token details'), 'en load failure copy')
+
+    const markup = mounted.innerHTML
+    expect(markup).toContain('Failed to load token details')
+    expect(markup).not.toContain('加载 Token 详情失败')
+    expect(markup).not.toContain(NON_ERROR_FAILURE)
     expect(markup).not.toContain(RAW_KEY_PATH_MARKER)
   })
 })

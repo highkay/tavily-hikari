@@ -75,6 +75,15 @@ export interface AdminTokenDetailTranslations {
     requestsAxis: string
     loading: string
   }
+  reset: { notUsedYet: string; nextReset: string }
+  errors: {
+    startValueAdjusted: string
+    responseNotJson: string
+    parseResponseJson: string
+    loadDetail: string
+    loadRequestRecords: string
+    regenerateSecret: string
+  }
 }
 
 /**
@@ -157,6 +166,15 @@ export const adminTokenDetailTranslations: Record<Language, AdminTokenDetailTran
       requestsAxis: 'Requests',
       loading: 'Loading…',
     },
+    reset: { notUsedYet: 'Not used yet', nextReset: 'Next reset: {value}' },
+    errors: {
+      startValueAdjusted: 'Start value was adjusted to the valid range',
+      responseNotJson: 'Response was not valid JSON',
+      parseResponseJson: 'Failed to parse response JSON',
+      loadDetail: 'Failed to load token details',
+      loadRequestRecords: 'Failed to load request records',
+      regenerateSecret: 'Failed to regenerate token secret',
+    },
   },
   zh: {
     sse: { title: '通过 SSE 实时更新', live: '实时', offline: '离线' },
@@ -221,6 +239,15 @@ export const adminTokenDetailTranslations: Record<Language, AdminTokenDetailTran
       otherFailures: '其他失败',
       requestsAxis: '请求数',
       loading: '正在加载…',
+    },
+    reset: { notUsedYet: '尚未使用', nextReset: '下次重置：{value}' },
+    errors: {
+      startValueAdjusted: '起始值已调整到有效范围',
+      responseNotJson: '响应不是有效的 JSON',
+      parseResponseJson: '解析响应 JSON 失败',
+      loadDetail: '加载 Token 详情失败',
+      loadRequestRecords: '加载请求记录失败',
+      regenerateSecret: '重置 Token Secret 失败',
     },
   },
 }
