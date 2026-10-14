@@ -41,8 +41,9 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from './components/ui/dropdown-menu'
-import { useLanguage, useTranslate, type Language } from './i18n'
+import { useLanguage, useTranslate, type Language, type Translations } from './i18n'
 import { copyText, selectAllReadonlyText } from './lib/clipboard'
+import { logProviderDisplayLabel, resolveLogProvider } from './lib/logProvider'
 import { useResponsiveModes } from './lib/responsive'
 import { useOfflineState } from './pwa/useOfflineState'
 import { buildProviderGuideContent } from './user-console/providerGuides'
@@ -109,6 +110,154 @@ const numberFormatter = new Intl.NumberFormat('en-US', {
 
 function formatNumber(value: number): string {
   return numberFormatter.format(value)
+}
+
+function formatTimestamp(ts: number): string {
+  try {
+    const d = new Date(ts * 1000)
+    return d.toLocaleString()
+  } catch {
+    return String(ts)
+  }
+}
+
+function statusTone(status: string): StatusTone {
+  const normalized = status.toLowerCase()
+  if (normalized === 'active' || normalized === 'success') return 'success'
+  if (normalized === 'exhausted' || normalized === 'quota_exhausted') return 'warning'
+  if (normalized === 'error') return 'error'
+  return 'neutral'
+}
+
+interface PublicLogsPanelsProps {
+  logs: PublicTokenLog[]
+  strings: Translations['public']['logs']
+  expandedLogs: ReadonlySet<number>
+  onToggleLog: (id: number) => void
+}
+
+/**
+ * Recent-requests panels for the public token view: the desktop table and the
+ * compact mobile cards. Provider labels follow the legacy NULL -> Tavily merge
+ * rule via the shared log-provider helpers (docs/multi-provider-search-proxy.md).
+ */
+export function PublicLogsPanels({ logs, strings, expandedLogs, onToggleLog }: PublicLogsPanelsProps): JSX.Element {
+  return (
+    <>
+      <div className="table-wrapper public-logs-md-up">
+        <table className="token-detail-table">
+          <thead>
+            <tr>
+              <th>{strings.table.time}</th>
+              <th>{strings.table.httpStatus}</th>
+              <th>{strings.table.mcpStatus}</th>
+              <th>{strings.table.provider}</th>
+              <th>{strings.table.result}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {logs.map((log) => (
+              <React.Fragment key={log.id}>
+                <tr>
+                  <td>{formatTimestamp(log.created_at)}</td>
+                  <td>{log.http_status ?? '—'}</td>
+                  <td>{log.mcp_status ?? '—'}</td>
+                  <td>{logProviderDisplayLabel(resolveLogProvider(log))}</td>
+                  <td>
+                    <button
+                      type="button"
+                      className={`log-result-button${expandedLogs.has(log.id) ? ' log-result-button-active' : ''}`}
+                      onClick={() => onToggleLog(log.id)}
+                      aria-expanded={expandedLogs.has(log.id)}
+                      aria-controls={`plog-${log.id}`}
+                      aria-label={expandedLogs.has(log.id) ? strings.toggles.hide : strings.toggles.show}
+                      title={expandedLogs.has(log.id) ? strings.toggles.hide : strings.toggles.show}
+                    >
+                      <StatusBadge tone={statusTone(log.result_status)}>
+                        {log.result_status}
+                      </StatusBadge>
+                      <Icon
+                        icon={expandedLogs.has(log.id) ? 'mdi:chevron-up' : 'mdi:chevron-down'}
+                        width={18}
+                        height={18}
+                        className="log-result-icon"
+                      />
+                    </button>
+                  </td>
+                </tr>
+                {expandedLogs.has(log.id) && (
+                  <tr className="log-details-row">
+                    <td colSpan={5} id={`plog-${log.id}`}>
+                      <div className="log-details-panel">
+                        <div className="log-details-summary">
+                          <div>
+                            <span className="log-details-label">Request</span>
+                            <span className="log-details-value">{`${log.method} ${log.path}${log.query ? `?${log.query}` : ''}`}</span>
+                          </div>
+                          <div>
+                            <span className="log-details-label">Response</span>
+                            <span className="log-details-value">{`${strings.table.httpStatus}: ${log.http_status ?? '—'} · ${strings.table.mcpStatus}: ${log.mcp_status ?? '—'}`}</span>
+                          </div>
+                          <div>
+                            <span className="log-details-label">Outcome</span>
+                            <span className="log-details-value">{log.result_status}</span>
+                          </div>
+                          {log.error_message && (
+                            <div>
+                              <span className="log-details-label">Error</span>
+                              <span className="log-details-value">{log.error_message}</span>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </td>
+                  </tr>
+                )}
+              </React.Fragment>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div className="public-log-mobile-list public-logs-md-down">
+        {logs.map((log) => (
+          <article key={log.id} className="user-console-mobile-card">
+            <div className="user-console-mobile-kv">
+              <span>{strings.table.time}</span>
+              <strong>{formatTimestamp(log.created_at)}</strong>
+            </div>
+            <div className="user-console-mobile-kv">
+              <span>{strings.table.httpStatus}</span>
+              <strong>{log.http_status ?? '—'}</strong>
+            </div>
+            <div className="user-console-mobile-kv">
+              <span>{strings.table.mcpStatus}</span>
+              <strong>{log.mcp_status ?? '—'}</strong>
+            </div>
+            <div className="user-console-mobile-kv">
+              <span>{strings.table.provider}</span>
+              <strong>{logProviderDisplayLabel(resolveLogProvider(log))}</strong>
+            </div>
+            <div className="user-console-mobile-kv">
+              <span>{strings.table.result}</span>
+              <StatusBadge className="user-console-mobile-status" tone={statusTone(log.result_status)}>
+                {log.result_status}
+              </StatusBadge>
+            </div>
+            <div className="user-console-mobile-kv">
+              <span>Request</span>
+              <strong>{`${log.method} ${log.path}${log.query ? `?${log.query}` : ''}`}</strong>
+            </div>
+            {log.error_message && (
+              <div className="user-console-mobile-kv">
+                <span>Error</span>
+                <strong>{log.error_message}</strong>
+              </div>
+            )}
+          </article>
+        ))}
+      </div>
+    </>
+  )
 }
 
 function PublicHome(): JSX.Element {
@@ -516,23 +665,6 @@ function PublicHome(): JSX.Element {
     })
   }, [])
 
-  const formatTimestamp = (ts: number): string => {
-    try {
-      const d = new Date(ts * 1000)
-      return d.toLocaleString()
-    } catch {
-      return String(ts)
-    }
-  }
-
-  const statusTone = (status: string): StatusTone => {
-    const normalized = status.toLowerCase()
-    if (normalized === 'active' || normalized === 'success') return 'success'
-    if (normalized === 'exhausted' || normalized === 'quota_exhausted') return 'warning'
-    if (normalized === 'error') return 'error'
-    return 'neutral'
-  }
-
   return (
     <main
       ref={pageRef}
@@ -690,114 +822,12 @@ function PublicHome(): JSX.Element {
                 <div className="empty-state alert">{publicStrings.logs.empty.none}</div>
               </div>
             ) : (
-              <>
-                <div className="table-wrapper public-logs-md-up">
-                  <table className="token-detail-table">
-                    <thead>
-                      <tr>
-                        <th>{publicStrings.logs.table.time}</th>
-                        <th>{publicStrings.logs.table.httpStatus}</th>
-                        <th>{publicStrings.logs.table.mcpStatus}</th>
-                        <th>{publicStrings.logs.table.result}</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {publicLogs.map((log) => (
-                        <React.Fragment key={log.id}>
-                          <tr>
-                            <td>{formatTimestamp(log.created_at)}</td>
-                            <td>{log.http_status ?? '—'}</td>
-                            <td>{log.mcp_status ?? '—'}</td>
-                            <td>
-                              <button
-                                type="button"
-                                className={`log-result-button${expandedPublicLogs.has(log.id) ? ' log-result-button-active' : ''}`}
-                                onClick={() => togglePublicLog(log.id)}
-                                aria-expanded={expandedPublicLogs.has(log.id)}
-                                aria-controls={`plog-${log.id}`}
-                                aria-label={expandedPublicLogs.has(log.id) ? publicStrings.logs.toggles.hide : publicStrings.logs.toggles.show}
-                                title={expandedPublicLogs.has(log.id) ? publicStrings.logs.toggles.hide : publicStrings.logs.toggles.show}
-                              >
-                                <StatusBadge tone={statusTone(log.result_status)}>
-                                  {log.result_status}
-                                </StatusBadge>
-                                <Icon
-                                  icon={expandedPublicLogs.has(log.id) ? 'mdi:chevron-up' : 'mdi:chevron-down'}
-                                  width={18}
-                                  height={18}
-                                  className="log-result-icon"
-                                />
-                              </button>
-                            </td>
-                          </tr>
-                          {expandedPublicLogs.has(log.id) && (
-                            <tr className="log-details-row">
-                              <td colSpan={4} id={`plog-${log.id}`}>
-                                <div className="log-details-panel">
-                                  <div className="log-details-summary">
-                                    <div>
-                                      <span className="log-details-label">Request</span>
-                                      <span className="log-details-value">{`${log.method} ${log.path}${log.query ? `?${log.query}` : ''}`}</span>
-                                    </div>
-                                    <div>
-                                      <span className="log-details-label">Response</span>
-                                      <span className="log-details-value">{`${publicStrings.logs.table.httpStatus}: ${log.http_status ?? '—'} · ${publicStrings.logs.table.mcpStatus}: ${log.mcp_status ?? '—'}`}</span>
-                                    </div>
-                                    <div>
-                                      <span className="log-details-label">Outcome</span>
-                                      <span className="log-details-value">{log.result_status}</span>
-                                    </div>
-                                    {log.error_message && (
-                                      <div>
-                                        <span className="log-details-label">Error</span>
-                                        <span className="log-details-value">{log.error_message}</span>
-                                      </div>
-                                    )}
-                                  </div>
-                                </div>
-                              </td>
-                            </tr>
-                          )}
-                        </React.Fragment>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-                <div className="public-log-mobile-list public-logs-md-down">
-                  {publicLogs.map((log) => (
-                    <article key={log.id} className="user-console-mobile-card">
-                      <div className="user-console-mobile-kv">
-                        <span>{publicStrings.logs.table.time}</span>
-                        <strong>{formatTimestamp(log.created_at)}</strong>
-                      </div>
-                      <div className="user-console-mobile-kv">
-                        <span>{publicStrings.logs.table.httpStatus}</span>
-                        <strong>{log.http_status ?? '—'}</strong>
-                      </div>
-                      <div className="user-console-mobile-kv">
-                        <span>{publicStrings.logs.table.mcpStatus}</span>
-                        <strong>{log.mcp_status ?? '—'}</strong>
-                      </div>
-                      <div className="user-console-mobile-kv">
-                        <span>{publicStrings.logs.table.result}</span>
-                        <StatusBadge className="user-console-mobile-status" tone={statusTone(log.result_status)}>
-                          {log.result_status}
-                        </StatusBadge>
-                      </div>
-                      <div className="user-console-mobile-kv">
-                        <span>Request</span>
-                        <strong>{`${log.method} ${log.path}${log.query ? `?${log.query}` : ''}`}</strong>
-                      </div>
-                      {log.error_message && (
-                        <div className="user-console-mobile-kv">
-                          <span>Error</span>
-                          <strong>{log.error_message}</strong>
-                        </div>
-                      )}
-                    </article>
-                  ))}
-                </div>
-              </>
+              <PublicLogsPanels
+                logs={publicLogs}
+                strings={publicStrings.logs}
+                expandedLogs={expandedPublicLogs}
+                onToggleLog={togglePublicLog}
+              />
             )}
           </section>
         </>

@@ -288,6 +288,7 @@ function PublicHomeHeroCard({
             <div className="metric-value">
               {summaryLoading ? '—' : availableKeys != null && totalKeys != null ? `${availableKeys}/${totalKeys}` : '—'}
             </div>
+            <p className="metric-subtitle">{publicStrings.metrics.pool.subtitle}</p>
           </div>
         </div>
       </div>

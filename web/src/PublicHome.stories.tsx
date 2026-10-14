@@ -13,9 +13,10 @@ import {
   DropdownMenuTrigger,
 } from './components/ui/dropdown-menu'
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from './components/ui/dialog'
+import type { PublicTokenLog } from './api'
 import { useTranslate } from './i18n'
 import { Icon, getGuideClientIconName } from './lib/icons'
-import { __testables as publicHomeTestables } from './PublicHome'
+import { PublicLogsPanels, __testables as publicHomeTestables } from './PublicHome'
 
 type CopyState = 'idle' | 'copied' | 'error'
 
@@ -296,6 +297,60 @@ function PublicHomeGuideTokenRevealedProof(): JSX.Element {
 
 const providerGuideProofKeys = ['serpapi', 'exa', 'brave'] as const
 
+/**
+ * Mixed-provider recent-requests fixture mirroring the live instance's two rows
+ * (plan todo 7 / M2): one Tavily row and one SerpApi row.
+ */
+export const mixedProviderPublicLogs: PublicTokenLog[] = [
+  {
+    id: 501,
+    method: 'POST',
+    path: '/mcp',
+    query: null,
+    http_status: 200,
+    mcp_status: 200,
+    result_status: 'success',
+    error_message: null,
+    created_at: 1760313600,
+    provider: 'tavily',
+  },
+  {
+    id: 502,
+    method: 'POST',
+    path: '/mcp',
+    query: null,
+    http_status: 200,
+    mcp_status: 200,
+    result_status: 'success',
+    error_message: null,
+    created_at: 1760313540,
+    provider: 'serpapi',
+  },
+]
+
+function PublicHomeLogsProviderProof(): JSX.Element {
+  const strings = useTranslate().public
+
+  return (
+    <main className="app-shell public-home">
+      <section className="surface panel">
+        <div className="panel-header">
+          <div>
+            <h2>{strings.logs.title}</h2>
+            <p className="panel-description">{strings.logs.description}</p>
+          </div>
+        </div>
+        <PublicLogsPanels
+          logs={mixedProviderPublicLogs}
+          strings={strings.logs}
+          expandedLogs={new Set([mixedProviderPublicLogs[1].id])}
+          onToggleLog={() => {}}
+        />
+      </section>
+    </main>
+  )
+}
+
 function PublicHomeProviderGuidesProof(): JSX.Element {
   const strings = useTranslate().public
   const exampleToken = 'th-a1b2-1234567890abcdef'
@@ -464,6 +519,40 @@ export const ProviderGuidesProof: Story = {
       description: {
         story:
           'Per-provider setup proof (plan todo 24): SerpApi, Exa, and Brave guide tabs with MCP and HTTP facade snippets, auth slots, and boundary copy.',
+      },
+    },
+  },
+}
+
+export const LogsProviderColumnProof: Story = {
+  args: {
+    showAdminAction: false,
+  },
+  render: () => <PublicHomeLogsProviderProof />,
+  parameters: {
+    layout: 'fullscreen',
+    viewport: { defaultViewport: '1440-device-desktop' },
+    docs: {
+      description: {
+        story:
+          'Recent-requests provider column proof (plan todo 7 / M2): the Provider column sits between Upstream and Result, rendering the per-row provider label with the SerpApi row expanded.',
+      },
+    },
+  },
+}
+
+export const LogsProviderColumnProofMobile: Story = {
+  args: {
+    showAdminAction: false,
+  },
+  render: () => <PublicHomeLogsProviderProof />,
+  parameters: {
+    layout: 'fullscreen',
+    viewport: { defaultViewport: '0390-device-iphone-14' },
+    docs: {
+      description: {
+        story:
+          'Compact proof (plan todo 7 / M2): the mobile request cards carry the provider label row between the upstream status and the result.',
       },
     },
   },
