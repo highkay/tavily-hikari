@@ -4,7 +4,7 @@
 
 - `src/`: Rust backend (`main.rs`, `lib.rs`, `server.rs`).
 - `web/`: Vite + React SPA (TypeScript). Built assets in `web/dist`.
-- `.env`: local config (e.g., `TAVILY_API_KEYS`). Do not commit secrets.
+- `.env`: local config (e.g., `TAVILY_API_KEYS`, `SERPAPI_API_KEYS`, `EXA_API_KEYS`, `BRAVE_API_KEYS`). Do not commit secrets.
 - SQLite files (`*.db`) are runtime artifacts and safe to ignore.
 
 ## Build, Test, and Development Commands
@@ -46,7 +46,7 @@
 
 ## Security & Configuration Tips
 
-- Configure keys via `.env` or env vars (`TAVILY_API_KEYS`).
+- Configure keys via `.env` or env vars (`TAVILY_API_KEYS`, `SERPAPI_API_KEYS`, `EXA_API_KEYS`, `BRAVE_API_KEYS`). Override provider upstreams with `TAVILY_UPSTREAM`, `SERPAPI_UPSTREAM`, `SERPAPI_MCP_UPSTREAM`, `EXA_UPSTREAM`, and `BRAVE_UPSTREAM` (defaults in README).
 - Do not commit secrets or local DB files. Backend can serve `web/dist` when present.
 
 ## Agent skills

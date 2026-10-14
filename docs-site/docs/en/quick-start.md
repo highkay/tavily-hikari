@@ -59,6 +59,13 @@ If you are not using `DEV_OPEN_ADMIN=true`, you must satisfy one of these first:
   `FORWARD_AUTH_HEADER=X-Forwarded-User` plus
   `FORWARD_AUTH_ADMIN_VALUE=admin@example.com`
 
+### Register other providers
+
+The same admin flow covers all four search providers (Tavily, SerpApi, Exa, Brave). In the admin
+UI, pick the provider in the add-key dialog before pasting keys; or bootstrap non-Tavily providers
+with `SERPAPI_API_KEYS`, `EXA_API_KEYS`, and `BRAVE_API_KEYS` as comma-separated lists. See the
+[HTTP API Guide](/http-api-guide) for each provider's endpoints and access-token slots.
+
 ## Verify the HTTP facade immediately
 
 With `DEV_OPEN_ADMIN=true`, you can send a first search request without a token:

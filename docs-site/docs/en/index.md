@@ -28,6 +28,22 @@ integrate clients, then review UI states when needed.
 - Deployability: local dev, Docker, Docker Compose, ForwardAuth gateways, and high-anonymity
   topologies are all first-class use cases.
 
+## Search providers
+
+Tavily Hikari fronts four search providers behind one endpoint, one key pool, and one shared credit
+wallet. Each provider keeps its native request shape, its own upstream key pool, and its own
+exhaustion semantics, while quota checks, audit logging, and key rotation stay inside Hikari.
+
+- **Tavily** — `/mcp` and `/api/tavily/*` (search, extract, crawl, map, research, usage)
+- **SerpApi** — `/serpapi/mcp` and `/api/serpapi/search` (synchronous search family)
+- **Exa** — `/exa/mcp`, `/api/exa/search`, `/api/exa/contents`, `/api/exa/answer`
+- **Brave** — `/brave/mcp`, `/api/brave/res/v1/web/search`, `/api/brave/res/v1/news/search`, and
+  `/api/brave/res/v1/llm/context`
+
+All four accept Hikari access tokens (`th-<id>-<secret>`) in their native auth slots. See the
+[HTTP API Guide](/http-api-guide) for endpoint details and
+[Configuration & Access](/configuration-access) for provider key bootstrap and upstream overrides.
+
 ## Documentation map
 
 1. Start with [Quick Start](/quick-start) when you want a running instance fast.

@@ -21,6 +21,20 @@ Tavily Hikari 是一个面向 Tavily 流量的 Rust + Axum 代理层。它负责
 - 可运营：提供用户控制台、管理员后台、Storybook 验收面和完整请求审计。
 - 可部署：既能本地开发，也能走 Docker、Docker Compose、ForwardAuth 网关和高匿名代理链路。
 
+## 搜索提供方
+
+Tavily Hikari 把四个搜索平台收敛到同一个端点、同一个密钥池和同一个共享额度钱包。每个提供方保留自己的
+请求格式、独立的上游密钥池和耗尽语义，而配额检查、审计日志与密钥轮换仍由 Hikari 统一处理。
+
+- **Tavily** — `/mcp` 与 `/api/tavily/*`（search、extract、crawl、map、research、usage）
+- **SerpApi** — `/serpapi/mcp` 与 `/api/serpapi/search`（同步搜索系列）
+- **Exa** — `/exa/mcp`、`/api/exa/search`、`/api/exa/contents`、`/api/exa/answer`
+- **Brave** — `/brave/mcp`、`/api/brave/res/v1/web/search`、`/api/brave/res/v1/news/search` 与
+  `/api/brave/res/v1/llm/context`
+
+四个平台都接受 Hikari 访问令牌（`th-<id>-<secret>`）并通过各自的鉴权槽位传入。端点细节见
+[HTTP API 指南](/zh/http-api-guide)，提供方密钥引导与上游覆盖见[配置与访问](/zh/configuration-access)。
+
 ## 文档地图
 
 1. 想先启动实例，看[快速开始](/zh/quick-start)。

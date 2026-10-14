@@ -55,6 +55,13 @@ curl http://127.0.0.1:58087/api/keys
 - 你临时把 `FORWARD_AUTH_HEADER=X-Forwarded-User`、`FORWARD_AUTH_ADMIN_VALUE=admin@example.com`
   注入到本地进程，再用 `X-Forwarded-User: admin@example.com` 这类头做调试。
 
+### 注册其他提供方
+
+同一套管理员流程覆盖全部四个搜索平台（Tavily、SerpApi、Exa、Brave）。在管理员 UI 中，先在添加
+密钥对话框里选择提供方再粘贴 key；也可以用 `SERPAPI_API_KEYS`、`EXA_API_KEYS`、`BRAVE_API_KEYS`
+（逗号分隔）引导非 Tavily 提供方。各提供方的端点与访问令牌槽位见
+[HTTP API 指南](/zh/http-api-guide)。
+
 ## 立刻验证 HTTP 代理
 
 在 `DEV_OPEN_ADMIN=true` 的本地模式下，可以直接发第一条搜索请求：

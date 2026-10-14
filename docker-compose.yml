@@ -8,6 +8,12 @@ services:
       PROXY_PORT: 8787
       PROXY_DB_PATH: /srv/app/data/tavily_proxy.db
       WEB_STATIC_DIR: /srv/app/web
+      # Optional additional providers. Uncomment together with matching keys:
+      # SERPAPI_API_KEYS:
+      # EXA_API_KEYS:
+      # BRAVE_API_KEYS:
+      # Provider upstreams (TAVILY/SERPAPI/EXA/BRAVE_UPSTREAM) default per README;
+      # override only when routing through a reverse proxy.
     ports:
       - "8787:8787"
     volumes:
