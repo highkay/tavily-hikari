@@ -176,16 +176,17 @@ curl -X POST http://127.0.0.1:8787/api/keys \
 
 ## HTTP API 速览
 
-| Method   | Path                   | 说明                                                               | 认证         |
-| -------- | ---------------------- | ------------------------------------------------------------------ | ------------ |
-| `GET`    | `/health`              | 健康检查，返回 200 代表代理可用。                                  | 无           |
-| `GET`    | `/api/summary`         | 汇总成功/失败次数、活跃 Key 数、最近活跃时间。                     | 无           |
-| `GET`    | `/api/keys`            | 列出 4 位短 ID、状态、请求统计。                                   | 管理员       |
-| `GET`    | `/api/logs?page=1`     | 最近请求日志（分页返回，默认每页 20 条），包含状态码与错误。       | 管理员       |
-| `POST`   | `/api/tavily/search`   | Tavily `/search` 的代理入口，供 Cherry Studio 等 HTTP 客户端使用。 | Hikari Token |
-| `POST`   | `/api/keys`            | 管理员接口，新增或“反删除”一个 Key。Body: `{ "api_key": "..." }`   | 管理员       |
-| `DELETE` | `/api/keys/:id`        | 管理员接口，软删除指定短 ID。                                      | 管理员       |
-| `GET`    | `/api/keys/:id/secret` | 管理员接口，返回真实 Tavily Key。                                  | 管理员       |
+| Method   | Path                      | 说明                                                                           | 认证         |
+| -------- | ------------------------- | ------------------------------------------------------------------------------ | ------------ |
+| `GET`    | `/health`                 | 健康检查，返回 200 代表代理可用。                                              | 无           |
+| `GET`    | `/api/summary`            | 汇总成功/失败次数、活跃 Key 数、最近活跃时间。                                 | 无           |
+| `GET`    | `/api/keys`               | 列出 4 位短 ID、状态、请求统计。                                               | 管理员       |
+| `GET`    | `/api/logs?page=1`        | 最近请求日志（分页返回，默认每页 20 条），包含状态码与错误。                   | 管理员       |
+| `GET`    | `/api/analysis/providers` | 管理员接口，按供应商汇总滚动 24h/7d/30d 窗口的请求、错误、配额耗尽与估算积分。 | 管理员       |
+| `POST`   | `/api/tavily/search`      | Tavily `/search` 的代理入口，供 Cherry Studio 等 HTTP 客户端使用。             | Hikari Token |
+| `POST`   | `/api/keys`               | 管理员接口，新增或“反删除”一个 Key。Body: `{ "api_key": "..." }`               | 管理员       |
+| `DELETE` | `/api/keys/:id`           | 管理员接口，软删除指定短 ID。                                                  | 管理员       |
+| `GET`    | `/api/keys/:id/secret`    | 管理员接口，返回真实 Tavily Key。                                              | 管理员       |
 
 管理员身份由 Passkey、内置管理员会话、显式启用的旧版 ForwardAuth 或本地 `DEV_OPEN_ADMIN` 判断；控制台仅在管理员会话下显示“复制原始 Key”按钮。
 

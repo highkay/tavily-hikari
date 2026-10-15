@@ -235,17 +235,32 @@ npx skills add https://github.com/IvanLi-CN/tavily-hikari --global
 
 ## 相关接口
 
-| Method | Path                  | 说明                     |
-| ------ | --------------------- | ------------------------ |
-| `GET`  | `/health`             | 存活探针                 |
-| `GET`  | `/api/summary`        | 公共汇总指标             |
-| `GET`  | `/api/user/token`     | 获取当前用户绑定的 token |
-| `GET`  | `/api/user/dashboard` | 用户控制台汇总数据       |
-| `POST` | `/api/user/logout`    | 用户登出                 |
-| `GET`  | `/api/keys`           | 管理员查看上游 key 列表  |
-| `POST` | `/api/keys`           | 管理员新增或恢复上游 key |
+| Method | Path                      | 说明                         |
+| ------ | ------------------------- | ---------------------------- |
+| `GET`  | `/health`                 | 存活探针                     |
+| `GET`  | `/api/summary`            | 公共汇总指标                 |
+| `GET`  | `/api/user/token`         | 获取当前用户绑定的 token     |
+| `GET`  | `/api/user/dashboard`     | 用户控制台汇总数据           |
+| `POST` | `/api/user/logout`        | 用户登出                     |
+| `GET`  | `/api/keys`               | 管理员查看上游 key 列表      |
+| `POST` | `/api/keys`               | 管理员新增或恢复上游 key     |
+| `GET`  | `/api/analysis/providers` | 管理员查看按供应商的请求指标 |
 
 这些管理员接口走的是管理员鉴权，不是 Hikari token。
+
+## 按供应商的请求指标
+
+管理端与用户控制台都提供四个搜索供应商的按供应商请求数：
+
+- `GET /api/analysis/providers`（管理员）返回 `generated_at` 与滚动窗口 `windows.last24h`、
+  `windows.last7d`、`windows.last30d`；每个窗口是行数组，每行含 `provider`、`requests`、
+  `success`、`errors`、`quota_exhausted` 与 `credits`（本地估算的业务积分）。没有供应商标记的
+  旧数据行归并到 `tavily`，行按 `requests` 降序排列。
+- `GET /api/dashboard/overview`（管理员）新增 `summary.providers[]` 与
+  `summaryWindows[].providers[]`，与 `GET /api/summary` 返回的按供应商计数一致；`/api/events`
+  SSE snapshot 继承相同字段。
+- `GET /api/user/dashboard/overview` 新增 `providers[]`，每项含 `provider`、`requests`、
+  `success`、`errors`；统计范围限定为当前用户名下的 token，日窗口与 summary 计数一致。
 
 ## 什么时候看 Storybook
 

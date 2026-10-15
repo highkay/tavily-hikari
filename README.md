@@ -192,16 +192,17 @@ If `--keys`/`TAVILY_API_KEYS` is supplied, the database sync logic adds or reviv
 
 ## HTTP API Cheat Sheet
 
-| Method   | Path                   | Description                                                       | Auth         |
-| -------- | ---------------------- | ----------------------------------------------------------------- | ------------ |
-| `GET`    | `/health`              | Liveness plus xray readiness after startup grace.                 | none         |
-| `GET`    | `/api/summary`         | High-level success/failure stats and last activity.               | none         |
-| `GET`    | `/api/keys`            | Lists short IDs, status, and counters.                            | Admin        |
-| `GET`    | `/api/logs?page=1`     | Recent proxy logs (paginated, default 20 per page).               | Admin        |
-| `POST`   | `/api/tavily/search`   | Tavily `/search` proxy via Hikari key pool (Cherry Studio, etc.). | Hikari token |
-| `POST`   | `/api/keys`            | Admin: add/restore a key. Body `{ "api_key": "..." }`.            | Admin        |
-| `DELETE` | `/api/keys/:id`        | Admin: soft-delete key by short ID.                               | Admin        |
-| `GET`    | `/api/keys/:id/secret` | Admin: reveal the real Tavily key.                                | Admin        |
+| Method   | Path                      | Description                                                                                                    | Auth         |
+| -------- | ------------------------- | -------------------------------------------------------------------------------------------------------------- | ------------ |
+| `GET`    | `/health`                 | Liveness plus xray readiness after startup grace.                                                              | none         |
+| `GET`    | `/api/summary`            | High-level success/failure stats and last activity.                                                            | none         |
+| `GET`    | `/api/keys`               | Lists short IDs, status, and counters.                                                                         | Admin        |
+| `GET`    | `/api/logs?page=1`        | Recent proxy logs (paginated, default 20 per page).                                                            | Admin        |
+| `GET`    | `/api/analysis/providers` | Admin: per-provider requests, errors, quota exhaustion, and estimated credits over rolling 24h/7d/30d windows. | Admin        |
+| `POST`   | `/api/tavily/search`      | Tavily `/search` proxy via Hikari key pool (Cherry Studio, etc.).                                              | Hikari token |
+| `POST`   | `/api/keys`               | Admin: add/restore a key. Body `{ "api_key": "..." }`.                                                         | Admin        |
+| `DELETE` | `/api/keys/:id`           | Admin: soft-delete key by short ID.                                                                            | Admin        |
+| `GET`    | `/api/keys/:id/secret`    | Admin: reveal the real Tavily key.                                                                             | Admin        |
 
 ### Cherry Studio integration
 

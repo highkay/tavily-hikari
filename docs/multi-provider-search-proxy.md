@@ -327,6 +327,12 @@ provider 化改造只新增旁路，不回写 Tavily 请求路径。
 - **读面（T20）**：`GET /api/summary`（+`/windows`）新增按 provider 分解；`GET /api/logs` 支持
   `?provider=` 过滤与 facets；用户 token 日志携带 provider；NULL/legacy 行按 `tavily` 归并。
   DashboardReadModel / AlertProjection 保持 provider-agnostic（M18：不允许把不同单位的用量混入同一序列）。
+- **读面收尾（对齐完成）**：`GET /api/analysis/providers` 返回滚动 24h/7d/30d 的按供应商行
+  （`requests` / `success` / `errors` / `quota_exhausted` / `credits`；`credits` 为本地估算的业务积分，
+  行按 `requests` 降序）；admin `GET /api/dashboard/overview` 新增 `summary.providers[]` 与
+  `summaryWindows[].providers[]`，对齐 `/api/summary` 口径，`/api/events` SSE snapshot 同步继承；
+  用户端 `GET /api/user/dashboard/overview` 新增 `providers[]`（`provider` / `requests` / `success` /
+  `errors`），限定当前用户名下 token 在与 summary 计数相同的日窗口内的用量。
 - **数据库**：`api_keys`、`auth_token_logs`、`mcp_sessions` 的 provider 列由主账本 migration v45 拥有；
   `request_logs.provider` 走 observability sidecar 的 ALTER 路径（两者机制不混用）。
 

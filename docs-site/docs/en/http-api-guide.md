@@ -241,17 +241,34 @@ Both paths still share:
 
 ## Related endpoints
 
-| Method | Path                  | Notes                          |
-| ------ | --------------------- | ------------------------------ |
-| `GET`  | `/health`             | Liveness probe                 |
-| `GET`  | `/api/summary`        | Public summary metrics         |
-| `GET`  | `/api/user/token`     | Resolve the current user token |
-| `GET`  | `/api/user/dashboard` | User dashboard summary         |
-| `POST` | `/api/user/logout`    | End-user logout                |
-| `GET`  | `/api/keys`           | Admin list of upstream keys    |
-| `POST` | `/api/keys`           | Admin add or restore a key     |
+| Method | Path                      | Notes                          |
+| ------ | ------------------------- | ------------------------------ |
+| `GET`  | `/health`                 | Liveness probe                 |
+| `GET`  | `/api/summary`            | Public summary metrics         |
+| `GET`  | `/api/user/token`         | Resolve the current user token |
+| `GET`  | `/api/user/dashboard`     | User dashboard summary         |
+| `POST` | `/api/user/logout`        | End-user logout                |
+| `GET`  | `/api/keys`               | Admin list of upstream keys    |
+| `POST` | `/api/keys`               | Admin add or restore a key     |
+| `GET`  | `/api/analysis/providers` | Admin per-provider metrics     |
 
 Those admin endpoints use admin authentication, not Hikari token auth.
+
+## Per-provider request metrics
+
+Admin and user consoles expose per-provider request counters for the four search providers:
+
+- `GET /api/analysis/providers` (admin) returns `generated_at` plus rolling `windows.last24h`,
+  `windows.last7d`, and `windows.last30d`. Each window holds rows with `provider`, `requests`,
+  `success`, `errors`, `quota_exhausted`, and `credits` (locally estimated business credits).
+  Legacy rows without a provider label merge into `tavily`, and rows sort by `requests`
+  descending.
+- `GET /api/dashboard/overview` (admin) now includes `summary.providers[]` and
+  `summaryWindows[].providers[]`, matching the per-provider counters served by `GET /api/summary`.
+  The `/api/events` SSE snapshot inherits the same fields.
+- `GET /api/user/dashboard/overview` now includes `providers[]` with `provider`, `requests`,
+  `success`, and `errors`, scoped to the requesting user's tokens over the same daily window as
+  the summary counters.
 
 ## When to use Storybook instead
 
