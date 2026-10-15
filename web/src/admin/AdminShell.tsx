@@ -12,6 +12,7 @@ export type AdminNavTarget =
   | 'analysis-usage'
   | 'analysis-rankings'
   | 'analysis-pressure'
+  | 'analysis-providers'
   | 'system-settings-status'
   | 'system-settings-admin'
   | 'system-settings-ha'

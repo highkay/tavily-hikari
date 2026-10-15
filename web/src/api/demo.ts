@@ -7,7 +7,7 @@ import {
 import { demoUserEntitlements } from './demoAccountEntitlements'
 import { createDemoRechargeOrders, demoAdminUserRechargeAudit, handleDemoAdminRechargeAction, handleDemoAdminRecharges, type DemoRechargeOrder } from './demoAdminRecharge'
 import { createDemoHaStatus, handleDemoHaRoute } from './demoHa'
-import { createDemoProviderBreakdown, createDemoProviderKeys, createDemoProviderLogs, createDemoProviderRequestKindOptions, handleProviderDemoRoute, isProviderMcpPath, withProviderBreakdown } from './demoProviders'
+import { createDemoAnalysisProvidersSnapshot, createDemoProviderBreakdown, createDemoProviderKeys, createDemoProviderLogs, createDemoProviderRequestKindOptions, createDemoUserProviderCounts, handleProviderDemoRoute, isProviderMcpPath, withProviderBreakdown } from './demoProviders'
 import { createDemoUpstreamPrivacyStatus } from './upstreamPrivacyStatusFixtures'
 import { rankingsStorySnapshot } from '../admin/rankingsStoryData'
 import { buildDemoAnalysisPressureSnapshot } from './demoAnalysisPressure'
@@ -526,15 +526,12 @@ function demoUserDashboardOverview(now = Date.now()) {
   const summary = demoUserDashboardSummary(now)
   return {
     summary,
+    providers: createDemoUserProviderCounts(demoState),
     progress: {
       requestRate: {
         used: summary.requestRate.used,
         limit: summary.requestRate.limit,
-        points: createOverviewPoints(
-          [8, 10, 9, 15, 14, 16, 21, 23, 29, 35, 42, summary.requestRate.used],
-          summary.requestRate.limit,
-          300,
-        ),
+        points: createOverviewPoints([8, 10, 9, 15, 14, 16, 21, 23, 29, 35, 42, summary.requestRate.used], summary.requestRate.limit, 300),
       },
       quotaHourly: {
         used: summary.quotaHourlyUsed,
@@ -2142,6 +2139,7 @@ async function handleDemoRoute(url: URL, method: string, init?: RequestInit): Pr
   if (path === '/api/analysis/pressure') {
     return jsonResponse(buildDemoAnalysisPressureSnapshot(nowSeconds, filterDemoUsers))
   }
+  if (path === '/api/analysis/providers') return jsonResponse(createDemoAnalysisProvidersSnapshot(demoState, nowSeconds()))
   if (path === '/api/users/rankings/events') return textResponse('demo event stream is provided by the browser demo runtime\n')
   if (path.startsWith('/api/users/')) return handleUserRoute(path, url, method, init)
   if (path === '/api/user-tags') return handleUserTags(path, method, init)

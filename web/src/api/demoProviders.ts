@@ -14,7 +14,7 @@
 import { demoExaAnswerFixture, demoExaContentsFixture, demoExaMcpToolFixture, demoExaSearchFixture, EXA_MCP_TOOLS, EXA_STREAM_REJECT_MESSAGE, isDemoExaStreamTruthy } from './demoExa'
 import { BRAVE_MCP_TOOLS, BRAVE_RATE_LIMIT_HEADERS, demoBraveLlmContextFixture, demoBraveMcpToolFixture, demoBraveNewsFixture, demoBraveWebFixture } from './demoBrave'
 import { demoSerpapiMcpToolResult, demoSerpapiMcpTools, demoSerpapiSearchFixture } from './demoSerpapi'
-import { normalizePayloadProvider, PROVIDER_IDS, type ProviderId, type SummaryProviderCount } from './providers'
+import { normalizePayloadProvider, parseProviderId, PROVIDER_IDS, type ProviderId, type SummaryProviderCount } from './providers'
 import type { SummaryQuotaCharge } from './runtime'
 
 type JsonObject = Record<string, unknown>
@@ -494,4 +494,122 @@ export function withProviderBreakdown(
     quota_charge: quotaCharge,
     providers: createDemoProviderBreakdown(source.keys, source.logs, windowTotalRequests),
   }
+}
+
+/** Wire row of `GET /api/analysis/providers` (C1): snake_case, credits included. */
+export interface DemoAnalysisProviderRow {
+  provider: string
+  requests: number
+  success: number
+  errors: number
+  quota_exhausted: number
+  credits: number
+}
+
+export type DemoAnalysisProviderWindow = 'last24h' | 'last7d' | 'last30d'
+
+/** One snapshot carries all three windows; the view switches tabs client-side. */
+export interface DemoAnalysisProvidersSnapshot {
+  generated_at: number
+  windows: Record<DemoAnalysisProviderWindow, DemoAnalysisProviderRow[]>
+}
+
+/** Wire row of `/api/user/dashboard/overview.providers` (C3). */
+export interface DemoUserProviderCount {
+  provider: string
+  requests: number
+  success: number
+  errors: number
+}
+
+/** The `demo.ts` slice the console-user provider fixture scopes to. */
+export interface DemoUserProviderFixtureSource {
+  logs: ReadonlyArray<Record<string, unknown>>
+  tokens: ReadonlyArray<Record<string, unknown>>
+}
+
+function demoProviderCreditTotals(
+  logs: ReadonlyArray<Record<string, unknown>>,
+): Map<ProviderId, number> {
+  const totals = new Map<ProviderId, number>()
+  for (const log of logs) {
+    const provider = normalizePayloadProvider(log)
+    totals.set(provider, (totals.get(provider) ?? 0) + (Number(log.business_credits) || 0))
+  }
+  return totals
+}
+
+/**
+ * C1 demo parity: the summary grouping rescaled to one analysis window and
+ * extended with local-estimated credits, sorted requests-desc with a provider
+ * tie-break exactly like the endpoint.
+ *
+ * The shared rescale rounds every counter on its own, which can add up to more
+ * than the window total; the split is therefore re-derived from that total so a
+ * table row never shows parts exceeding the whole.
+ */
+function demoAnalysisWindowRows(
+  source: DemoProviderFixtureSource,
+  windowTotalRequests: number,
+): DemoAnalysisProviderRow[] {
+  const baseTotal = createDemoProviderBreakdown(source.keys, source.logs)
+    .reduce((sum, row) => sum + row.total_requests, 0)
+  const creditTotals = demoProviderCreditTotals(source.logs)
+  const scale = baseTotal > 0 ? windowTotalRequests / baseTotal : 0
+  return createDemoProviderBreakdown(source.keys, source.logs, windowTotalRequests)
+    .map((row) => {
+      const quotaExhausted = Math.min(row.quota_exhausted_count, row.total_requests)
+      const success = Math.min(row.success_count, row.total_requests - quotaExhausted)
+      const credits = Math.round((creditTotals.get(parseProviderId(row.provider)) ?? 0) * scale)
+      return {
+        provider: row.provider,
+        requests: row.total_requests,
+        success,
+        errors: row.total_requests - success - quotaExhausted,
+        quota_exhausted: quotaExhausted,
+        credits: Math.min(success, credits),
+      }
+    })
+    .sort((left, right) => right.requests - left.requests || left.provider.localeCompare(right.provider))
+}
+
+export function createDemoAnalysisProvidersSnapshot(
+  source: DemoProviderFixtureSource,
+  generatedAt: number,
+): DemoAnalysisProvidersSnapshot {
+  return {
+    generated_at: generatedAt,
+    windows: {
+      last24h: demoAnalysisWindowRows(source, 760),
+      last7d: demoAnalysisWindowRows(source, 5_240),
+      last30d: demoAnalysisWindowRows(source, 24_882),
+    },
+  }
+}
+
+/**
+ * C3 demo parity: the console user's own request rows grouped by provider, so
+ * the user card shows a scoped subset rather than a copy of the admin breakdown.
+ */
+export function createDemoUserProviderCounts(
+  source: DemoUserProviderFixtureSource,
+): DemoUserProviderCount[] {
+  const tokenIds = new Set(source.tokens.map((token) => String(token.id ?? '')))
+  const rows = new Map<ProviderId, DemoUserProviderCount>()
+  for (const log of source.logs) {
+    if (!tokenIds.has(String(log.auth_token_id ?? ''))) continue
+    const provider = normalizePayloadProvider(log)
+    const row = rows.get(provider) ?? { provider, requests: 0, success: 0, errors: 0 }
+    row.requests += 1
+    if (log.result_status === 'success') {
+      row.success += 1
+    } else {
+      row.errors += 1
+    }
+    rows.set(provider, row)
+  }
+  return PROVIDER_IDS.flatMap((id) => {
+    const row = rows.get(id)
+    return row ? [row] : []
+  })
 }

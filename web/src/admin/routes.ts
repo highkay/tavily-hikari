@@ -11,7 +11,7 @@ export type AdminUsersCollectionView = 'users' | 'usage'
 export type AdminTokensCollectionView = 'tokens' | 'unbound-usage'
 export type AlertsCenterView = 'events' | 'groups'
 export type AdminSystemSettingsView = 'general' | 'status' | 'admin' | 'ha'
-export type AdminAnalysisView = 'rankings' | 'usage' | 'pressure'
+export type AdminAnalysisView = 'rankings' | 'usage' | 'pressure' | 'providers'
 export type AdminMcpSessionBindingsStatusView = 'active' | 'revoked' | 'all'
 export type RankingTabKey = 'last24h' | 'last7d' | 'last30d' | 'primarySuccess' | 'businessCredits' | 'uniqueIp'
 export type UserDetailTabKey = 'account' | 'quota' | 'activity'
@@ -132,6 +132,9 @@ export function parseAdminPath(pathname: string): AdminPathRoute {
   }
   if (path === `${ADMIN_BASE}/analysis/pressure`) {
     return { name: 'module', module: 'analysis', analysisView: 'pressure' }
+  }
+  if (path === `${ADMIN_BASE}/analysis/providers`) {
+    return { name: 'module', module: 'analysis', analysisView: 'providers' }
   }
   if (path === `${ADMIN_BASE}/rankings`) {
     return { name: 'module', module: 'analysis', analysisView: 'rankings' }

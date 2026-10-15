@@ -54,6 +54,7 @@ describe('admin user tag routes', () => {
     expect(parseAdminPath('/admin/analysis')).toEqual({ name: 'module', module: 'analysis', analysisView: 'rankings' })
     expect(parseAdminPath('/admin/analysis/rankings')).toEqual({ name: 'module', module: 'analysis', analysisView: 'rankings' })
     expect(parseAdminPath('/admin/analysis/pressure')).toEqual({ name: 'module', module: 'analysis', analysisView: 'pressure' })
+    expect(parseAdminPath('/admin/analysis/providers')).toEqual({ name: 'module', module: 'analysis', analysisView: 'providers' })
     expect(parseAdminPath('/admin/rankings')).toEqual({ name: 'module', module: 'analysis', analysisView: 'rankings' })
   })
 
@@ -194,6 +195,7 @@ describe('admin user tag routes', () => {
     expect(userTagsPath()).toBe('/admin/users/tags')
     expect(analysisPath()).toBe('/admin/analysis/rankings')
     expect(analysisPath('pressure')).toBe('/admin/analysis/pressure')
+    expect(analysisPath('providers')).toBe('/admin/analysis/providers')
     expect(userUsagePath()).toBe('/admin/analysis/usage')
     expect(unboundTokenUsagePath()).toBe('/admin/tokens/leaderboard')
     expect(unboundTokenUsagePath('ops', 2, 'quotaMonthlyUsed', 'asc')).toBe(
@@ -320,6 +322,18 @@ describe('admin user tag routes', () => {
         { name: 'module', module: 'analysis', analysisView: 'pressure' },
       ),
     ).toBe(false)
+    expect(
+      isSameAdminRoute(
+        { name: 'module', module: 'analysis', analysisView: 'providers' },
+        { name: 'module', module: 'analysis', analysisView: 'pressure' },
+      ),
+    ).toBe(false)
+    expect(
+      isSameAdminRoute(
+        { name: 'module', module: 'analysis', analysisView: 'providers' },
+        { name: 'module', module: 'analysis', analysisView: 'providers' },
+      ),
+    ).toBe(true)
   })
 
   it('compares HA node routes by node id', () => {
