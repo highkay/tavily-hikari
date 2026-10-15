@@ -65,6 +65,8 @@ describe('PublicHome Storybook proofs', () => {
     expect(markup).toContain('https://hikari.example.com/serpapi/mcp')
     expect(markup).toContain('https://hikari.example.com/exa/mcp')
     expect(markup).toContain('https://hikari.example.com/brave/mcp')
+    expect(markup).toContain('https://hikari.example.com/mcp')
+    expect(markup).toContain('https://hikari.example.com/api/tavily/search')
     expect(markup).toContain('Bearer th-a1b2-1234567890abcdef')
     expect(markup).toContain('api_key=th-a1b2-1234567890abcdef')
     expect(markup).toContain('x-api-key: th-a1b2-1234567890abcdef')
