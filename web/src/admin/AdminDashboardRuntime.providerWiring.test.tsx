@@ -7,6 +7,7 @@ import { StrictMode, act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 
 import { installDemoRuntime } from '../api/demo'
+import { fetchDashboardOverview, type DashboardSnapshotEvent } from '../api'
 import { LanguageProvider } from '../i18n'
 import { operationalClassGuidance } from '../lib/logOperationalClass'
 import { ThemeProvider } from '../theme'
@@ -37,7 +38,55 @@ const originalRequestAnimationFrame = window.requestAnimationFrame
 const originalCancelAnimationFrame = window.cancelAnimationFrame
 
 let listUrls: string[] = []
+let requestedPaths: string[] = []
 let root: Root | null = null
+
+/**
+ * Minimal controlled `EventSource`: the admin runtime's `/api/events` snapshot
+ * handler is driven on demand so the SSE ordering regression is deterministic
+ * (same shape as `AdminDashboardRuntime.route-switch.test.tsx`).
+ */
+class ControlledEventSource {
+  static instances: ControlledEventSource[] = []
+
+  readonly url: string
+  readonly withCredentials = false
+  onopen: ((this: EventSource, event: Event) => unknown) | null = null
+  onerror: ((this: EventSource, event: Event) => unknown) | null = null
+  private readonly listeners = new Map<string, Set<EventListenerOrEventListenerObject>>()
+
+  constructor(url: string | URL) {
+    this.url = String(url)
+    ControlledEventSource.instances.push(this)
+    queueMicrotask(() => this.onopen?.call(this as unknown as EventSource, new Event('open')))
+  }
+
+  addEventListener(type: string, listener: EventListenerOrEventListenerObject | null): void {
+    if (!listener) return
+    const listeners = this.listeners.get(type) ?? new Set<EventListenerOrEventListenerObject>()
+    listeners.add(listener)
+    this.listeners.set(type, listeners)
+  }
+
+  removeEventListener(type: string, listener: EventListenerOrEventListenerObject | null): void {
+    if (listener) this.listeners.get(type)?.delete(listener)
+  }
+
+  close(): void {
+    this.listeners.clear()
+  }
+
+  emitSnapshot(payload: DashboardSnapshotEvent): void {
+    const event = new MessageEvent('snapshot', { data: JSON.stringify(payload) })
+    for (const listener of this.listeners.get('snapshot') ?? []) {
+      if (typeof listener === 'function') {
+        listener.call(this as unknown as EventSource, event)
+      } else {
+        listener.handleEvent(event)
+      }
+    }
+  }
+}
 
 interface MockMediaQueryList {
   matches: boolean
@@ -163,51 +212,55 @@ async function mountRequestsRoute(search: string): Promise<HTMLElement> {
   return container
 }
 
-/** Recursively drops every `providers` key so a payload can be pinned facet-free. */
-function withoutProviders(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(withoutProviders)
-  if (typeof value !== 'object' || value === null) return value
-  const next: Record<string, unknown> = {}
-  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-    if (key === 'providers') continue
-    next[key] = withoutProviders(entry)
-  }
-  return next
-}
-
-/** The live `/api/summary` provider breakdown shape (orchestrator live-API evidence). */
-const SUMMARY_PROVIDERS = [
-  { provider: 'serpapi', total_requests: 1, success_count: 1, error_count: 0, quota_exhausted_count: 0 },
+/**
+ * Contract C2: `/api/dashboard/overview` — and the SSE snapshot built by the same
+ * payload builder — carries `summary.providers`, so the Provider-activity card
+ * must read it from the overview state. `/api/summary` is pinned to a *different*
+ * breakdown: an Exa row on screen means the removed dedicated fetch came back.
+ */
+const OVERVIEW_PROVIDERS = [
+  { provider: 'serpapi', total_requests: 41, success_count: 39, error_count: 2, quota_exhausted_count: 0 },
   { provider: 'tavily', total_requests: 1607, success_count: 1500, error_count: 100, quota_exhausted_count: 7 },
 ]
 
+/** Decoy breakdown: only the retired `/api/summary` path would ever render it. */
+const SUMMARY_PROVIDERS = [
+  { provider: 'exa', total_requests: 999, success_count: 999, error_count: 0, quota_exhausted_count: 0 },
+]
+
+/** A third breakdown, so an SSE snapshot is distinguishable from both pins. */
+const SSE_PROVIDERS = [
+  { provider: 'brave', total_requests: 42, success_count: 40, error_count: 2, quota_exhausted_count: 0 },
+]
+
 /**
- * Dashboard route reproducing the LIVE payload split: `/api/dashboard/overview`
- * carries `summary` and `summaryWindows` WITHOUT any `providers` array, while
- * `/api/summary` does carry it. The demo runtime alone hides this, because
- * `demoSummary()` is reused for both endpoints — so the overview payload is
- * stripped here and the summary payload is pinned to the live shape. The
- * Provider-activity card can therefore only render if the runtime reads
- * `fetchSummary()` rather than the overview's embedded summary (matrix M3).
+ * Dashboard route with both provider sources pinned: the overview summary carries
+ * `OVERVIEW_PROVIDERS` while `/api/summary` answers the decoy. `eventSource`
+ * swaps in {@link ControlledEventSource} so a snapshot can be emitted on demand.
  */
-async function mountDashboardRoute(): Promise<void> {
+async function mountDashboardRoute(eventSource?: typeof EventSource): Promise<void> {
   window.localStorage.setItem(DEMO_STORAGE_KEY, 'true')
   window.history.replaceState(null, '', '/admin')
   installDemoRuntime()
+  if (eventSource) {
+    Object.defineProperty(window, 'EventSource', {
+      configurable: true,
+      writable: true,
+      value: eventSource,
+    })
+  }
 
   const demoFetch = window.fetch.bind(window)
   window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     const url =
       typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
-    const response = await demoFetch(input, init)
     const parsed = new URL(url, 'http://localhost')
+    requestedPaths.push(parsed.pathname)
+    const response = await demoFetch(input, init)
     if (parsed.pathname === '/api/dashboard/overview') {
       const data = (await response.clone().json()) as Record<string, unknown>
-      return jsonResponse({
-        ...data,
-        summary: withoutProviders(data['summary']),
-        summaryWindows: withoutProviders(data['summaryWindows']),
-      })
+      const summary = (data['summary'] ?? {}) as Record<string, unknown>
+      return jsonResponse({ ...data, summary: { ...summary, providers: OVERVIEW_PROVIDERS } })
     }
     if (parsed.pathname === '/api/summary') {
       const data = (await response.clone().json()) as Record<string, unknown>
@@ -238,8 +291,20 @@ async function mountDashboardRoute(): Promise<void> {
   await flushUi(300)
 }
 
+function providerCardRows(): HTMLElement[] {
+  return Array.from(
+    document.querySelectorAll<HTMLElement>('.dashboard-provider-panel tbody tr[data-provider]'),
+  )
+}
+
+function rowCells(row: HTMLElement): string[] {
+  return Array.from(row.querySelectorAll('td')).map((cell) => (cell.textContent ?? '').trim())
+}
+
 beforeEach(() => {
   listUrls = []
+  requestedPaths = []
+  ControlledEventSource.instances = []
   installViewportMocks()
   HTMLElement.prototype.scrollIntoView = () => undefined
 })
@@ -295,25 +360,60 @@ describe('AdminDashboardRuntime provider caller wiring (plan todo 23b)', () => {
   }, 20_000)
 })
 
-describe('AdminDashboardRuntime summary provider wiring (plan todo 10 / matrix M3)', () => {
-  it('renders the provider activity card from /api/summary, not the overview summary', async () => {
-    await mountDashboardRoute()
+describe('AdminDashboardRuntime summary provider wiring (contract C2)', () => {
+  it('renders the provider activity card from the overview payload, not /api/summary', async () => {
+    // The demo EventSource is controlled so no unsolicited snapshot overwrites
+    // the pinned overview payload between the fetch and the assertion.
+    await mountDashboardRoute(ControlledEventSource as unknown as typeof EventSource)
 
-    // Given the overview payload carries no provider breakdown at all, the card
-    // can only appear if the runtime fed DashboardOverview from fetchSummary().
+    // Given the overview summary carries SerpApi+Tavily and /api/summary answers
+    // an Exa decoy, the card can only show these rows if it reads the overview.
     await waitFor(() => document.querySelector('.dashboard-provider-panel') !== null)
-    const rows = Array.from(
-      document.querySelectorAll<HTMLElement>('.dashboard-provider-panel tbody tr[data-provider]'),
-    )
+    const rows = providerCardRows()
     expect(rows.map((row) => row.dataset.provider)).toEqual(['serpapi', 'tavily'])
 
-    // And the rendered counts are the /api/summary values, label included.
     const serpapi = rows.find((row) => row.dataset.provider === 'serpapi')
     if (serpapi === undefined) {
       throw new Error('The provider activity card rendered no serpapi row')
     }
-    const cells = Array.from(serpapi.querySelectorAll('td')).map((cell) => (cell.textContent ?? '').trim())
-    expect(cells).toEqual(['SerpApi', '1', '1', '0', '0'])
+    expect(rowCells(serpapi)).toEqual(['SerpApi', '41', '39', '2', '0'])
+
+    // And the retired dedicated request never happens: the card rides the
+    // overview fetch that the dashboard route already makes.
+    expect(requestedPaths).not.toContain('/api/summary')
+    expect(requestedPaths).toContain('/api/dashboard/overview')
+  }, 20_000)
+
+  it('keeps the card fresh when an SSE snapshot carries a new provider breakdown', async () => {
+    await mountDashboardRoute(ControlledEventSource as unknown as typeof EventSource)
+    await waitFor(() => providerCardRows().length === 2)
+    expect(providerCardRows().map((row) => row.dataset.provider)).toEqual(['serpapi', 'tavily'])
+
+    const eventSource = ControlledEventSource.instances
+      .filter((source) => source.url === '/api/events')
+      .at(-1)
+    expect(eventSource).toBeDefined()
+    const overview = await fetchDashboardOverview()
+
+    // When the shared SSE snapshot arrives with its own summary.providers
+    await act(async () => {
+      eventSource?.emitSnapshot({
+        ...overview,
+        keys: overview.exhaustedKeys,
+        logs: overview.recentLogs,
+        summary: { ...overview.summary, providers: SSE_PROVIDERS },
+      })
+    })
+
+    // Then the card follows the snapshot instead of keeping the pre-SSE rows:
+    // the retired fetchSummary state could not be bumped by a snapshot, which is
+    // the ordering hazard the 2024b562 guard existed for.
+    await waitFor(() => providerCardRows().map((row) => row.dataset.provider).join(',') === 'brave')
+    const brave = providerCardRows()[0]
+    if (brave === undefined) {
+      throw new Error('The SSE snapshot rendered no provider row')
+    }
+    expect(rowCells(brave)).toEqual(['Brave', '42', '40', '2', '0'])
   }, 20_000)
 })
 

@@ -76,6 +76,9 @@ import AdminOverlayHost from './AdminOverlayHost'
 import DashboardOverview, { type DashboardQuotaChargeCardData } from './DashboardOverview'
 import AdminUserRankingsPage, { RankingsMeta } from './AdminUserRankingsPage'
 import PressureAnalysisScreen from './PressureAnalysisScreen'
+import AnalysisProvidersScreen from './AnalysisProvidersScreen'
+import { useAnalysisProviders } from './useAnalysisProviders'
+import { activeAnalysisNavItem, analysisModuleIntro, analysisNavChildren } from './analysisNavigation'
 import AdminJobTriggerMenu from './AdminJobTriggerMenu'
 import McpSessionBindingsStatusTabs from './McpSessionBindingsStatusTabs'
 import { AnchoredApiKeyBulkSyncProgressBubble } from './ApiKeyBulkSyncProgressBubble'
@@ -215,7 +218,6 @@ import {
   fetchRequestLogsList,
   fetchRequestLogDetails,
   fetchDashboardOverview,
-  fetchSummary,
   fetchVersion,
   type ApiKeyStats,
   type DashboardMonthSeries,
@@ -1801,7 +1803,6 @@ function AdminDashboard(): JSX.Element {
   const footerStrings = adminStrings.footer
   const errorStrings = adminStrings.errors
   const [summary, setSummary] = useState<Summary | null>(null)
-  const [summaryProviders, setSummaryProviders] = useState<Summary['providers']>(undefined)
   const [dashboardSummaryWindows, setDashboardSummaryWindows] = useState<SummaryWindowsResponse | null>(null)
   const [rankingsSnapshot, setRankingsSnapshot] = useState<AdminUserRankingsSnapshot | null>(null)
   const [rankingsLoading, setRankingsLoading] = useState(false)
@@ -1812,6 +1813,7 @@ function AdminDashboard(): JSX.Element {
   const [pressureSnapshot, setPressureSnapshot] = useState<AnalysisPressureSnapshot | null>(null)
   const [pressureLoading, setPressureLoading] = useState(false)
   const [pressureError, setPressureError] = useState<string | null>(null)
+  const analysisProviders = useAnalysisProviders(route)
   const [rankingsTab, setRankingsTab] = useState<RankingTabKey>(getAdminRankingsTabFromLocation)
   const [dashboardMonthSeries, setDashboardMonthSeries] = useState<DashboardMonthSeries>(() => createEmptyDashboardMonthSeries())
   const [dashboardSiteStatusSnapshot, setDashboardSiteStatusSnapshot] = useState<DashboardSiteStatusState | null>(null)
@@ -2027,7 +2029,6 @@ function AdminDashboard(): JSX.Element {
   const lastRankingsPathRef = useRef<string | null>(null)
   const baseDataLoadedRef = useRef(false)
   const dashboardOverviewVersionRef = useRef(0)
-  const summaryProvidersVersionRef = useRef(0)
   const unboundTokenUsageQueryKeyRef = useRef<string | null>(null)
   const requestsLoadedRef = useRef(false)
   const jobsLoadedRef = useRef(false)
@@ -2844,14 +2845,7 @@ function AdminDashboard(): JSX.Element {
   const loadDashboardOverview = useCallback(
     async (signal?: AbortSignal) => {
       const requestVersion = ++dashboardOverviewVersionRef.current
-      const providersVersion = ++summaryProvidersVersionRef.current
-      // M3: neither /api/dashboard/overview nor the SSE snapshot carries Summary.providers, so the
-      // card reads /api/summary on a counter the snapshot cannot bump; failure only hides the card.
-      void fetchSummary(signal).then((snapshot) => {
-        if (!signal?.aborted && providersVersion === summaryProvidersVersionRef.current) setSummaryProviders(snapshot.providers)
-      }).catch(() => {
-        if (!signal?.aborted && providersVersion === summaryProvidersVersionRef.current) setSummaryProviders(undefined)
-      })
+      // C2: summary.providers rides the overview payload (and its SSE snapshot), so the card follows summary state.
       try {
         const overview = await fetchDashboardOverview(signal)
 
@@ -4792,6 +4786,10 @@ function AdminDashboard(): JSX.Element {
         navigateToPath(analysisPath('pressure'))
         return
       }
+      if (target === 'analysis-providers') {
+        navigateToPath(analysisPath('providers'))
+        return
+      }
       if (
         target === 'users'
         && (
@@ -5219,6 +5217,9 @@ function AdminDashboard(): JSX.Element {
     }
     if (route.name === 'module' && route.module === 'analysis' && route.analysisView === 'pressure') {
       tasks.push(loadAnalysisPressure(controller.signal))
+    }
+    if (route.name === 'module' && route.module === 'analysis' && route.analysisView === 'providers') {
+      tasks.push(analysisProviders.reload(controller.signal))
     }
     if (route.name === 'unbound-token-usage') {
       tasks.push(loadUnboundTokenUsage({ signal: controller.signal, reason: 'refresh' }))
@@ -6117,6 +6118,7 @@ function AdminDashboard(): JSX.Element {
     (route.name === 'module' && route.module === 'tokens' && tokensBlocking)
     || (route.name === 'module' && route.module === 'analysis' && route.analysisView === 'rankings' && rankingsLoading)
     || (route.name === 'module' && route.module === 'analysis' && route.analysisView === 'pressure' && pressureLoading)
+    || (route.name === 'module' && route.module === 'analysis' && route.analysisView === 'providers' && analysisProviders.loading)
     || (route.name === 'module' && route.module === 'requests' && requestsBlocking)
     || (route.name === 'module' && route.module === 'jobs' && jobsBlocking)
     || (isUsersCollectionRoute || route.name === 'user') && usersBlocking
@@ -7906,11 +7908,7 @@ function AdminDashboard(): JSX.Element {
       target: 'analysis',
       label: adminStrings.nav.analysis,
       icon: <ChartColumnIncreasing size={18} strokeWidth={2.2} />,
-      children: [
-        { target: 'analysis-rankings', label: adminStrings.nav.rankings },
-        { target: 'analysis-usage', label: adminStrings.nav.usage },
-        { target: 'analysis-pressure', label: adminStrings.nav.pressure },
-      ],
+      children: analysisNavChildren(adminStrings, language),
     },
     { target: 'tokens', label: adminStrings.nav.tokens, icon: <Icon icon="mdi:key-chain-variant" width={18} height={18} /> },
     { target: 'keys', label: adminStrings.nav.keys, icon: <Icon icon="mdi:key-outline" width={18} height={18} /> },
@@ -7944,11 +7942,7 @@ function AdminDashboard(): JSX.Element {
               ? 'system-settings-admin'
               : 'system-settings'
         : route.module === 'analysis'
-          ? route.analysisView === 'usage'
-            ? 'analysis-usage'
-            : route.analysisView === 'pressure'
-              ? 'analysis-pressure'
-              : 'analysis-rankings'
+          ? activeAnalysisNavItem(route.analysisView)
           : route.module
       : route.name === 'ha-node'
         ? 'system-settings-ha'
@@ -10019,6 +10013,7 @@ function AdminDashboard(): JSX.Element {
   const showRankings = showAnalysis && analysisView === 'rankings'
   const showAnalysisUsage = showAnalysis && analysisView === 'usage'
   const showPressure = showAnalysis && analysisView === 'pressure'
+  const showAnalysisProviders = showAnalysis && analysisView === 'providers'
   const showTokens = activeModule === 'tokens'
   const showKeys = activeModule === 'keys'
   const showRequests = activeModule === 'requests'
@@ -10091,20 +10086,7 @@ function AdminDashboard(): JSX.Element {
           description: headerStrings.subtitle,
         }
       case 'analysis':
-        return analysisView === 'usage'
-          ? {
-              title: adminStrings.users.usage.title,
-              description: adminStrings.users.usage.description,
-            }
-          : analysisView === 'pressure'
-            ? {
-                title: adminStrings.pressure.title,
-                description: adminStrings.pressure.description,
-              }
-            : {
-                title: adminStrings.rankings.title,
-                description: adminStrings.rankings.description,
-              }
+        return analysisModuleIntro(analysisView, adminStrings, language)
       case 'tokens':
         return {
           title: tokenStrings.title,
@@ -10694,7 +10676,7 @@ function AdminDashboard(): JSX.Element {
       {showDashboard && (
         <DashboardOverview
           strings={adminStrings.dashboard}
-          providerCounts={summaryProviders}
+          providerCounts={summary?.providers}
           overviewReady={dashboardOverviewLoaded}
           statusLoading={dashboardStatusLoading}
           todayMetrics={todayMetrics}
@@ -10748,6 +10730,16 @@ function AdminDashboard(): JSX.Element {
             const controller = new AbortController()
             void loadAnalysisPressure(controller.signal)
           }}
+        />
+      )}
+
+      {showAnalysisProviders && (
+        <AnalysisProvidersScreen
+          snapshot={analysisProviders.snapshot}
+          loading={analysisProviders.loading}
+          error={analysisProviders.error}
+          language={language}
+          onRetry={analysisProviders.retry}
         />
       )}
 

@@ -137,6 +137,19 @@ const routeSwitchCases: RouteSwitchCase[] = [
     },
   },
   {
+    name: 'rankings -> analysis providers -> rankings',
+    startPath: rankingsPath('last24h'),
+    nextPath: analysisPath('providers'),
+    nextExpectation: {
+      selector: '.analysis-providers-panel tbody tr[data-provider]',
+      text: 'Provider Analysis',
+    },
+    returnPath: rankingsPath('last24h'),
+    returnExpectation: {
+      selector: '.admin-rankings-tab.is-active',
+    },
+  },
+  {
     name: 'keys overview -> key detail',
     startPath: buildAdminKeysPath(),
     nextPath: keyDetailPath('Hk01'),
