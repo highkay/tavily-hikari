@@ -5,6 +5,8 @@ import type {
   UserDashboardOverviewSeriesPoint,
   UserDashboardProgressCard,
 } from '../api'
+import { adminDashboardProvidersTranslations } from '../i18n/translations/tokenDetail'
+import { logProviderDisplayLabel } from '../lib/logProvider'
 import { UsageMetricLabel } from '../components/UsageMetricLabel'
 import type { Language } from '../i18n'
 
@@ -304,6 +306,10 @@ export default function UserDashboardOverview({
 }: UserDashboardOverviewProps): JSX.Element {
   const summary = overview?.summary ?? null
   const progress = overview?.progress ?? null
+  // C3: the overview payload carries the per-provider breakdown; an absent or
+  // empty list hides the card (no zero-row placeholder).
+  const providerRows = overview?.providers ?? []
+  const providerStrings = adminDashboardProvidersTranslations[language]
   const markerText = language === 'zh'
     ? {
         today: '今日',
@@ -404,6 +410,38 @@ export default function UserDashboardOverview({
           formatNumber={formatNumber}
         />
       </div>
+
+      {providerRows.length > 0 ? (
+        <section className="user-console-provider-panel" aria-label={providerStrings.title}>
+          <header className="user-console-provider-header">
+            <h2>{providerStrings.title}</h2>
+          </header>
+          <div className="user-console-provider-table-wrapper">
+            <table className="user-console-provider-table">
+              <thead>
+                <tr>
+                  <th scope="col">
+                    <span className="sr-only">{providerStrings.title}</span>
+                  </th>
+                  <th scope="col">{providerStrings.requests}</th>
+                  <th scope="col">{providerStrings.success}</th>
+                  <th scope="col">{providerStrings.errors}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {providerRows.map((row) => (
+                  <tr key={row.provider} data-provider={row.provider}>
+                    <th scope="row">{logProviderDisplayLabel(row.provider)}</th>
+                    <td>{loading ? '--' : formatNumber(row.requests)}</td>
+                    <td>{loading ? '--' : formatNumber(row.success)}</td>
+                    <td>{loading ? '--' : formatNumber(row.errors)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      ) : null}
     </div>
   )
 }

@@ -247,6 +247,11 @@ function createOverviewPoints(values: Array<number | null>, limit: number) {
 
 const dashboardOverviewSample: UserDashboardOverview = {
   summary: dashboardSample,
+  providers: [
+    { provider: 'tavily', requests: 1284, success: 1201, errors: 83 },
+    { provider: 'serpapi', requests: 312, success: 301, errors: 11 },
+    { provider: 'exa', requests: 96, success: 91, errors: 5 },
+  ],
   progress: withOverviewProgressCanonical({
     requestRate: {
       used: dashboardSample.requestRate.used,

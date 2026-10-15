@@ -8,7 +8,7 @@ import type { ClientIpHeaderValue } from './clientIp'
 import type { HaChannelHealth } from './haTypes'
 import { normalizeHaStatus, type HaStatus, type HaStatusWire } from './haStatus'
 import type { RequestLogRetentionSettings } from './requestLogRetention'
-import type { ApiKeyUsageSyncOutcome, ProviderId, ProviderQuotaSource, ProviderQuotaSyncSnapshot, SummaryProviderCount, SyncUsageErrorBody } from './providers'
+import type { ApiKeyUsageSyncOutcome, ProviderId, ProviderQuotaSource, ProviderQuotaSyncSnapshot, SummaryProviderCount, SyncUsageErrorBody, UserProviderCount } from './providers'
 import type {
   AdminMcpSessionBindingsPage,
   AdminMcpSessionBindingsQuery,
@@ -2635,6 +2635,7 @@ export interface UserDashboardOverviewProgress {
 export interface UserDashboardOverview {
   summary: UserDashboard
   progress: UserDashboardOverviewProgress
+  providers: UserProviderCount[]
 }
 
 export interface UserTokenSummary {

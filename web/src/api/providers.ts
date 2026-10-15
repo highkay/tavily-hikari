@@ -192,6 +192,20 @@ export interface SummaryProviderCount {
   quota_exhausted_count: number
 }
 
+/**
+ * Per-provider counters scoped to the requesting user's own tokens on
+ * `/api/user/dashboard/overview` (multi-provider-alignment-completion C3).
+ * Source note: the admin card reads a key-join breakdown while these rows come
+ * from the user's request window, so the two cards can legitimately differ.
+ * Legacy `NULL` provider rows coalesce to `tavily` in the boundary normalizer.
+ */
+export interface UserProviderCount {
+  provider: string
+  requests: number
+  success: number
+  errors: number
+}
+
 /** `POST /api/keys/:id/sync-usage` 200 body for the non-Tavily arms. */
 export interface ProviderQuotaSyncSnapshot {
   source: ProviderQuotaSource

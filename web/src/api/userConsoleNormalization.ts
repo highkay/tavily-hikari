@@ -14,6 +14,7 @@ import type {
   UserBillingSummary,
 } from './billing'
 import type { RechargeConfig, RechargeOrder, RechargeQuote, RechargeQuoteMonth } from './recharge'
+import { LEGACY_PROVIDER_ID, type UserProviderCount } from './providers'
 
 type RecordLike = Record<string, unknown>
 
@@ -377,6 +378,28 @@ export function normalizeUserDashboard(value: unknown): UserDashboard {
   }
 }
 
+/**
+ * C3 provider rows. The wire shape is verified against the emitter
+ * (`src/server/dto.rs UserProviderCountView`: provider/requests/success/errors).
+ * An absent or blank provider coalesces to the legacy `tavily` id — the same
+ * rule the backend applies to `NULL` rows — while an unknown non-empty id is
+ * kept verbatim so a future provider is never mislabeled.
+ */
+function normalizeUserProviderCount(value: unknown): UserProviderCount {
+  const source = isRecordLike(value) ? value : {}
+  const provider = readString(source, 'provider')
+  return {
+    provider: provider.trim().length > 0 ? provider : LEGACY_PROVIDER_ID,
+    requests: readNumber(source, 'requests'),
+    success: readNumber(source, 'success'),
+    errors: readNumber(source, 'errors'),
+  }
+}
+
+function normalizeUserProviderCounts(value: unknown): UserProviderCount[] {
+  return Array.isArray(value) ? value.map(normalizeUserProviderCount) : []
+}
+
 export function normalizeUserDashboardOverview(value: unknown): UserDashboardOverview {
   const source = isRecordLike(value) ? value : {}
   const progress = isRecordLike(source.progress) ? source.progress : {}
@@ -406,6 +429,7 @@ export function normalizeUserDashboardOverview(value: unknown): UserDashboardOve
       dailyCredits,
       monthlyCredits,
     },
+    providers: normalizeUserProviderCounts(source.providers),
   }
 }
 
