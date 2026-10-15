@@ -302,6 +302,11 @@ export const BUNDLED_ICONS: Record<string, IconifyIcon> = {
     "width": 24,
     "height": 24
   },
+  "mdi:telescope": {
+    "body": "<path fill=\"currentColor\" d=\"m21.9 8.9l-1.7 1l-4-6.9l1.7-1zm-12.1-1l3 5.2l6.1-3.5l-3-5.2zm1.6 4.8l-2-3.5l-4.3 2.5l2 3.5zm-9.3 1.9l1 1.7l2.6-1.5l-1-1.7zm10-.6l-.3-.4l-4.3 2.5l.3.4c.2.3.5.6.8.8L7 22h2l1.4-4.3h.1L12 22h2l-1.9-5.6c.5-.7.5-1.6 0-2.4\"/>",
+    "width": 24,
+    "height": 24
+  },
   "mdi:timer-sand": {
     "body": "<path fill=\"currentColor\" d=\"M6 2h12v6l-4 4l4 4v6H6v-6l4-4l-4-4zm10 14.5l-4-4l-4 4V20h8zm-4-5l4-4V4H8v3.5zM10 6h4v.75l-2 2l-2-2z\"/>",
     "width": 24,

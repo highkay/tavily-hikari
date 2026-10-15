@@ -62,6 +62,7 @@ const REQUIRED_RUNTIME_ICON_NAMES = [
   'mdi:search-web',
   'mdi:share-variant',
   'mdi:shield-check-outline',
+  'mdi:telescope',
   'mdi:trash-can-outline',
   'mdi:trash-outline',
   'mdi:tray-arrow-down',
@@ -91,12 +92,13 @@ describe('local icon registry', () => {
     expect(getGuideClientIconName('serpapi')).toBe('mdi:search-web')
     expect(getGuideClientIconName('exa')).toBe('mdi:lightning-bolt')
     expect(getGuideClientIconName('brave')).toBe('simple-icons:brave')
+    expect(getGuideClientIconName('tavily')).toBe('mdi:telescope')
     expect(getGuideClientIconName('unknown-client')).toBe('mdi:dots-horizontal')
   })
 
-  it('maps the three provider guide tabs to distinct non-fallback icons', () => {
-    const providerIcons = ['serpapi', 'exa', 'brave'].map((id) => getGuideClientIconName(id))
-    expect(new Set(providerIcons).size).toBe(3)
+  it('maps every provider guide tab to a distinct non-fallback icon', () => {
+    const providerIcons = ['serpapi', 'exa', 'brave', 'tavily'].map((id) => getGuideClientIconName(id))
+    expect(new Set(providerIcons).size).toBe(4)
     expect(providerIcons).not.toContain(getGuideClientIconName('other'))
   })
 

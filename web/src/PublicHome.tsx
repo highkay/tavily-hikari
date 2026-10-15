@@ -50,7 +50,7 @@ import { buildProviderGuideContent } from './user-console/providerGuides'
 
 type GuideLanguage = 'toml' | 'json' | 'bash'
 
-type GuideKey = 'codex' | 'hikariCli' | 'claude' | 'vscode' | 'claudeDesktop' | 'cursor' | 'windsurf' | 'cherryStudio' | 'serpapi' | 'exa' | 'brave' | 'other'
+type GuideKey = 'codex' | 'hikariCli' | 'claude' | 'vscode' | 'claudeDesktop' | 'cursor' | 'windsurf' | 'cherryStudio' | 'serpapi' | 'exa' | 'brave' | 'tavily' | 'other'
 
 interface GuideReference {
   label: string
@@ -100,9 +100,10 @@ const GUIDE_KEY_ORDER: GuideKey[] = [
   'serpapi',
   'exa',
   'brave',
+  'tavily',
   'other',
 ]
-const PRIMARY_GUIDE_KEYS = new Set<GuideKey>(['codex', 'hikariCli', 'claude', 'vscode'])
+const PRIMARY_GUIDE_KEYS = new Set<GuideKey>(['codex', 'hikariCli', 'claude', 'vscode', 'serpapi', 'exa', 'brave', 'tavily'])
 
 const numberFormatter = new Intl.NumberFormat('en-US', {
   maximumFractionDigits: 0,
@@ -1267,7 +1268,10 @@ function buildGuideContent(language: Language, baseUrl: string, prettyToken: str
               5）将 <strong>API 密钥 / API key</strong> 填写为步骤 1 中复制的 Hikari 访问令牌（完整的 <code>{prettyToken}</code>），而不是
               Tavily 官方 API key。
             </>,
-            <>6）可按需在 Cherry 中调整返回条数、是否附带答案/日期等选项。</>,
+            <>
+              6）可按需在 Cherry 中调整返回条数、是否附带答案/日期等选项。Cherry Studio 会将这些字段透传给
+              Tavily；Hikari 负责轮换 Tavily key，并按令牌执行配额限制。
+            </>,
           ],
     },
     other: {

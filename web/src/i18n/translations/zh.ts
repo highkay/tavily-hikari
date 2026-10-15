@@ -157,7 +157,7 @@ export const ZH: TranslationShape = {
           cursor: 'Cursor',
           windsurf: 'Windsurf',
           cherryStudio: 'Cherry Studio',
-          serpapi: 'SerpApi', exa: 'Exa', brave: 'Brave',
+          serpapi: 'SerpApi', exa: 'Exa', brave: 'Brave', tavily: 'Tavily',
           other: '其他',
         },
       },

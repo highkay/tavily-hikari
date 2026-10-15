@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react'
 
-export type ProviderGuideKey = 'serpapi' | 'exa' | 'brave'
+export type ProviderGuideKey = 'serpapi' | 'exa' | 'brave' | 'tavily'
 
 type ProviderGuideLanguage = 'toml' | 'json' | 'bash'
 
@@ -28,9 +28,14 @@ export interface ProviderGuideContent {
  *   `X-Subscription-Token`); slot names pinned by `src/providers/spec.rs`.
  * - Tool catalogs: `src/server/provider_mcp_serpapi.rs:30`,
  *   `provider_mcp_exa.rs:211-233`, `provider_mcp_brave.rs:178-205`.
+ * - Tavily itself: `src/server/serve.rs:566` MCP ingress `/mcp` (passthrough;
+ *   tool names normalized as `tavily-{search,extract,crawl,map,research}` in
+ *   `src/analysis.rs:879-883`) plus `src/server/serve.rs:353-362` REST routes
+ *   `/api/tavily/{search,extract,crawl,map,research,usage}`.
  * Boundaries: Exa streaming is a typed 400 before any upstream call
  * (`provider_facade.rs:435-445`); Brave has no URL-extraction route; SerpApi
- * mirrors the search family only.
+ * mirrors the search family only; the `tvly-hikari` CLI wrapper targets the
+ * Tavily REST family only.
  */
 export function buildProviderGuideContent(
   language: 'en' | 'zh',
@@ -155,6 +160,46 @@ export function buildProviderGuideContent(
         },
       ],
     },
+    tavily: {
+      title: 'Tavily',
+      steps: isEnglish
+        ? [
+            <>Point any HTTP MCP client at <code>{baseUrl}/mcp</code> with <code>Authorization: Bearer {prettyToken}</code>; this is the hosted Tavily MCP passthrough.</>,
+            <>The façade advertises <code>tavily-search</code>, <code>tavily-extract</code>, <code>tavily-crawl</code>, <code>tavily-map</code>, and <code>tavily-research</code>.</>,
+            <>HTTP clients can call <code>POST {baseUrl}/api/tavily/search</code>; the REST family also mirrors <code>/extract</code>, <code>/crawl</code>, <code>/map</code>, <code>/research</code>, and <code>GET /usage</code>. Send the Hikari token as <code>Authorization: Bearer {prettyToken}</code>, or as the JSON field <code>api_key</code> when headers are unavailable.</>,
+            <>The <code>tvly-hikari</code> CLI wrapper is Tavily-only by design: it injects <code>{baseUrl}/api/tavily</code> and the Hikari token for <code>search/extract/crawl/map/research</code> — see the <strong>CLI + Skills</strong> tab.</>,
+            <>Boundary: other providers have their own tabs — SerpApi, Exa, and Brave each expose a separate MCP ingress and REST family.</>,
+          ]
+        : [
+            <>将任意 HTTP MCP 客户端指向 <code>{baseUrl}/mcp</code>，并携带 <code>Authorization: Bearer {prettyToken}</code>；这是 Tavily 托管 MCP 的透传入口。</>,
+            <>该入口会通告 <code>tavily-search</code>、<code>tavily-extract</code>、<code>tavily-crawl</code>、<code>tavily-map</code>、<code>tavily-research</code> 五个工具。</>,
+            <>HTTP 客户端可调用 <code>POST {baseUrl}/api/tavily/search</code>；REST 家族同样镜像 <code>/extract</code>、<code>/crawl</code>、<code>/map</code>、<code>/research</code> 与 <code>GET /usage</code>。推荐用 <code>Authorization: Bearer {prettyToken}</code> 携带 Hikari token；无法自定义 Header 时，可写入 JSON 请求体字段 <code>api_key</code>。</>,
+            <><code>tvly-hikari</code> CLI wrapper 按设计只服务 Tavily：它会注入 <code>{baseUrl}/api/tavily</code> 与 Hikari token，覆盖 <code>search/extract/crawl/map/research</code> 子命令，详见 <strong>CLI + Skills</strong> 标签页。</>,
+            <>边界：其他服务商有各自独立的标签页——SerpApi、Exa、Brave 分别提供自己的 MCP 入口与 REST 路由。</>,
+          ],
+      samples: [
+        {
+          title: isEnglish ? 'Example: ~/.codex/config.toml' : '示例：~/.codex/config.toml',
+          language: 'toml',
+          snippet: buildProviderCodexSnippet('tavily_hikari', baseUrl, '/mcp', 'TAVILY_HIKARI_TOKEN'),
+        },
+        {
+          title: isEnglish ? 'Example: claude mcp add-json' : '示例：claude mcp add-json',
+          language: 'bash',
+          snippet: buildProviderClaudeSnippet('tavily-hikari', baseUrl, '/mcp', prettyToken),
+        },
+        {
+          title: isEnglish ? 'Example: VS Code / generic mcp.json' : '示例：VS Code / 通用 mcp.json',
+          language: 'json',
+          snippet: buildProviderVscodeSnippet('tavily-hikari', baseUrl, '/mcp', prettyToken),
+        },
+        {
+          title: isEnglish ? 'Example: POST /api/tavily/search' : '示例：POST /api/tavily/search',
+          language: 'bash',
+          snippet: buildTavilyHttpSnippet(baseUrl, prettyToken),
+        },
+      ],
+    },
   }
 }
 
@@ -230,4 +275,14 @@ export function buildExaHttpSnippet(baseUrl: string, prettyToken: string): strin
 export function buildBraveHttpSnippet(baseUrl: string, prettyToken: string): string {
   return `curl "${baseUrl}/api/brave/res/v1/web/search?q=coffee&count=5" \\
   -H "X-Subscription-Token: ${prettyToken}"`
+}
+
+export function buildTavilyHttpSnippet(baseUrl: string, prettyToken: string): string {
+  return `curl -X POST "${baseUrl}/api/tavily/search" \\
+  -H "Content-Type: application/json" \\
+  -H "Authorization: Bearer ${prettyToken}" \\
+  -d '{
+    "query": "latest AI agent news",
+    "max_results": 5
+  }'`
 }

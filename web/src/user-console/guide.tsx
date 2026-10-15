@@ -333,7 +333,10 @@ export function buildGuideContent(language: Language, baseUrl: string, prettyTok
               5）将 <strong>API 密钥 / API key</strong> 填写为步骤 1 中复制的 Hikari 访问令牌（完整的 <code>{prettyToken}</code>），而不是
               Tavily 官方 API key。
             </>,
-            <>6）可按需在 Cherry 中调整返回条数、是否附带答案/日期等选项。</>,
+            <>
+              6）可按需在 Cherry 中调整返回条数、是否附带答案/日期等选项。Cherry Studio 会将这些字段透传给
+              Tavily；Hikari 负责轮换 Tavily key，并按令牌执行配额限制。
+            </>,
           ],
     },
     other: {

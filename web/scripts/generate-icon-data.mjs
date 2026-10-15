@@ -66,6 +66,7 @@ const ICON_SOURCES = [
     ['mdi:shape-outline', 'shape-outline'],
     ['mdi:shield-alert-outline', 'shield-alert-outline'],
     ['mdi:shield-check-outline', 'shield-check-outline'],
+    ['mdi:telescope', 'telescope'],
     ['mdi:timer-sand', 'timer-sand'],
     ['mdi:trash-can-outline', 'trash-can-outline'],
     ['mdi:trash-outline', 'trash-can-outline'],

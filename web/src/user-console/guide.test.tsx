@@ -8,6 +8,7 @@ import {
   guideSnippetToPlainText,
   resolveGuideSamples,
 } from './guide'
+import { resolveSetupGuide } from './guideSearch'
 import type { GuideContent, GuideKey } from './runtime'
 import { getGuideClientIconName } from '../lib/icons'
 
@@ -39,7 +40,7 @@ const PROVIDER_BASE_URL = 'https://hikari.example.com'
 const PROVIDER_TOKEN = 'th-a1b2-secretsecret'
 
 interface ProviderExpectation {
-  key: 'serpapi' | 'exa' | 'brave'
+  key: 'serpapi' | 'exa' | 'brave' | 'tavily'
   mcpPath: string
   httpPath: string
   httpAuthMarker: string
@@ -67,6 +68,13 @@ const PROVIDER_EXPECTATIONS: ProviderExpectation[] = [
     httpPath: '/api/brave/res/v1/web/search',
     httpAuthMarker: `X-Subscription-Token: ${PROVIDER_TOKEN}`,
     boundary: { en: 'no URL extraction', zh: 'URL 抽取' },
+  },
+  {
+    key: 'tavily',
+    mcpPath: '/mcp',
+    httpPath: '/api/tavily/search',
+    httpAuthMarker: `Authorization: Bearer ${PROVIDER_TOKEN}`,
+    boundary: { en: 'own tabs', zh: '独立的标签页' },
   },
 ]
 
@@ -163,12 +171,19 @@ describe('provider setup guides', () => {
   })
 })
 
+describe('provider guide deep links', () => {
+  it('resolves the tavily guide key from the setup-guide query param', () => {
+    expect(resolveSetupGuide('?guide=tavily')).toBe('tavily')
+    expect(resolveSetupGuide('?guide=unknown')).toBe('codex')
+  })
+})
+
 describe('provider guide tab icons', () => {
-  it('resolves the three provider tabs to three distinct icons that are not the generic fallback', () => {
+  it('resolves every provider tab to a distinct icon that is not the generic fallback', () => {
     const providerIcons = PROVIDER_EXPECTATIONS.map((provider) => getGuideClientIconName(provider.key))
 
-    expect(providerIcons).toHaveLength(3)
-    expect(new Set(providerIcons).size).toBe(3)
+    expect(providerIcons).toHaveLength(PROVIDER_EXPECTATIONS.length)
+    expect(new Set(providerIcons).size).toBe(PROVIDER_EXPECTATIONS.length)
     expect(providerIcons).not.toContain(getGuideClientIconName('other'))
   })
 })
