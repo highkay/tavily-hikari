@@ -137,7 +137,6 @@ export default function AnalysisProvidersScreen({
         <div className="panel-header">
           <div>
             <h2>{strings.tabs[windowKey]}</h2>
-            <p className="panel-description">{strings.description}</p>
           </div>
           <div className="admin-ranking-stale-hint">
             {loading ? strings.refreshing : `${strings.generatedAt} ${formatGeneratedAt(language, snapshot.generatedAt)}`}
