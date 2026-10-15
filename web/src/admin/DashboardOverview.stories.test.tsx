@@ -308,4 +308,56 @@ describe('DashboardOverview Storybook coverage', () => {
     expect(withEmpty).not.toContain('dashboard-provider-panel')
     expect(withEmpty).not.toContain('Provider activity')
   })
+
+  it('labels the recent-requests teaser rows with their provider (contract C5)', async () => {
+    const container = document.createElement('div')
+    document.body.appendChild(container)
+    const root = createRoot(container)
+    const teaserLog = {
+      auth_token_id: '9vsN',
+      method: 'POST',
+      path: '/mcp',
+      query: null,
+      http_status: 200,
+      mcp_status: 0,
+      created_at: 1,
+      error_message: null,
+      request_body: null,
+      response_body: null,
+      forwarded_headers: [],
+      dropped_headers: [],
+    }
+
+    await act(async () => {
+      root.render(
+        createElement(meta.component, {
+          ...dashboardStories.Default.args,
+          initialVisibleResultSeries: [],
+          initialVisibleTypeSeries: [],
+          initialVisibleCreditSeries: [],
+          logs: [
+            { ...teaserLog, id: 1, key_id: 'Sp06', provider: 'serpapi', result_status: 'success' },
+            { ...teaserLog, id: 2, key_id: 'Hk01', result_status: 'error' },
+          ],
+        } as never),
+      )
+    })
+
+    // The first actions card is the recent-requests teaser; the jobs card has
+    // no provider column.
+    const teaserCard = container.querySelector<HTMLElement>('.dashboard-actions-card')
+    const teaserRows = Array.from(teaserCard?.querySelectorAll<HTMLElement>('li') ?? [])
+    const providerLabels = teaserRows.map(
+      (row) => row.querySelector('.dashboard-actions-provider')?.textContent ?? '',
+    )
+    // The provider row is labeled, and a legacy row without the field reads Tavily.
+    expect(providerLabels).toEqual(['SerpApi', 'Tavily'])
+    expect(teaserRows[0]?.querySelector('.dashboard-actions-provider')?.dataset.provider).toBe('serpapi')
+    expect(teaserRows[1]?.querySelector('.dashboard-actions-provider')?.dataset.provider).toBe('tavily')
+
+    await act(async () => {
+      root.unmount()
+    })
+    container.remove()
+  })
 })

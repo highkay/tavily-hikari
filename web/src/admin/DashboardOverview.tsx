@@ -1239,6 +1239,9 @@ export default function DashboardOverview({
               {logs.slice(0, 5).map((log) => (
                 <li key={log.id}>
                   <code>{log.key_id}</code>
+                  <span className="dashboard-actions-provider" data-provider={log.provider ?? 'tavily'}>
+                    {logProviderDisplayLabel(log.provider)}
+                  </span>
                   <span>{log.result_status}</span>
                 </li>
               ))}

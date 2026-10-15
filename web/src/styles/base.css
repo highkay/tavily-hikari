@@ -1586,6 +1586,12 @@ body.not-found-page-body,
   font-size: 0.86rem;
 }
 
+.dashboard-actions-provider {
+  margin-right: auto;
+  color: hsl(var(--muted-foreground));
+  font-size: 0.8rem;
+}
+
 .module-placeholder-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
