@@ -1155,6 +1155,10 @@ impl From<tavily_hikari::UserDashboardOverviewProgress> for UserDashboardOvervie
 struct UserDashboardOverviewView {
     summary: UserDashboardView,
     progress: UserDashboardOverviewProgressView,
+    /// Multi-provider alignment (C3): additive per-provider counters over the
+    /// same daily window as `summary`. Always present; empty when the user has
+    /// no attributed request-log rows in the window.
+    providers: Vec<UserProviderCountView>,
 }
 
 impl From<tavily_hikari::UserDashboardOverviewSnapshot> for UserDashboardOverviewView {
@@ -1162,6 +1166,11 @@ impl From<tavily_hikari::UserDashboardOverviewSnapshot> for UserDashboardOvervie
         Self {
             summary: snapshot.summary.into(),
             progress: snapshot.progress.into(),
+            providers: snapshot
+                .providers
+                .into_iter()
+                .map(UserProviderCountView::from)
+                .collect(),
         }
     }
 }

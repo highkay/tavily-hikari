@@ -363,6 +363,10 @@ async fn serve_with_shutdown(
         .route("/api/summary", get(fetch_summary))
         .route("/api/summary/windows", get(fetch_summary_windows))
         .route("/api/analysis/pressure", get(get_analysis_pressure_snapshot))
+        .route(
+            "/api/analysis/providers",
+            get(get_analysis_providers_snapshot),
+        )
         .route("/api/users/rankings", get(get_user_rankings))
         .route("/api/users/rankings/events", get(sse_user_rankings))
         .route("/api/settings", get(get_settings))

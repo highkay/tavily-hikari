@@ -503,4 +503,34 @@ pub struct UserDashboardOverviewProgress {
 pub struct UserDashboardOverviewSnapshot {
     pub summary: UserDashboardSummary,
     pub progress: UserDashboardOverviewProgress,
+    /// Multi-provider alignment (C3): per-provider counters over the SAME
+    /// daily window as `summary`'s daily counters, scoped to the requesting
+    /// user. Empty when the user has no attributed rows in the window.
+    pub providers: Vec<ProviderRequestCounts>,
+}
+
+/// Multi-provider alignment (C1/C3): per-provider request counters read from
+/// ONE bounded `observability.request_logs` window scan. `credits` sums
+/// `COALESCE(business_credits, 0)` — the local-estimated business credits the
+/// log rows already carry. Declared here rather than in `models.rs` because
+/// that file sits at its line budget and this module is glob-re-exported.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderRequestCounts {
+    pub provider: String,
+    pub requests: i64,
+    pub success: i64,
+    pub errors: i64,
+    pub quota_exhausted: i64,
+    pub credits: i64,
+}
+
+/// Multi-provider alignment (C1): the `GET /api/analysis/providers` snapshot.
+/// One payload carries all three windows, mirroring `/api/users/rankings`, so
+/// tab switching stays client-side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalysisProviderSnapshot {
+    pub generated_at: i64,
+    pub last24h: Vec<ProviderRequestCounts>,
+    pub last7d: Vec<ProviderRequestCounts>,
+    pub last30d: Vec<ProviderRequestCounts>,
 }

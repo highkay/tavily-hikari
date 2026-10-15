@@ -5,9 +5,14 @@
 //! request-kind catalog registration of every todo-3 kind with M9 billing
 //! groups, and the M18 boundary (rollup-backed legacy totals untouched).
 
-use super::core_support_and_parsing::{connect_sqlite_test_pool, temp_db_path};
+use super::core_support_and_parsing::{
+    connect_sqlite_test_pool, read_sse_event_until, temp_db_path,
+};
 use super::linuxdo_oauth_and_admin_keys::find_cookie_pair;
-use super::upstream_support_and_manual_jobs::spawn_builtin_keys_admin_server;
+use super::upstream_support_and_manual_jobs::{
+    linuxdo_oauth_options_for_test, spawn_builtin_keys_admin_server,
+    spawn_user_oauth_server_with_options,
+};
 use super::*;
 
 /// The STATIC todo-3 whitelist (src/analysis.rs PROVIDER_REQUEST_KINDS):
@@ -1016,6 +1021,629 @@ async fn key_metrics_stay_provider_scoped_via_key_binding() {
         .expect("metrics request");
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["total_requests"], json!(2), "brave key only: {body}");
+
+    cleanup_db_dir(&db_path);
+}
+
+// ---------- multi-provider alignment: C1 / C2 / C3 ----------
+
+/// One seeded `observability.request_logs` row for the alignment surfaces.
+/// `provider` stays `None` for a legacy row so readers must coalesce it to
+/// `tavily`; `business_credits` feeds the C1 credits column.
+#[derive(Clone, Copy)]
+struct ProviderLogRow<'a> {
+    provider: Option<&'a str>,
+    result_status: &'a str,
+    business_credits: Option<i64>,
+    request_user_id: Option<&'a str>,
+    created_at: i64,
+}
+
+async fn seed_provider_request_logs(
+    pool: &sqlx::SqlitePool,
+    key_id: &str,
+    rows: &[ProviderLogRow<'_>],
+) {
+    for (index, row) in rows.iter().enumerate() {
+        sqlx::query(
+            r#"
+            INSERT INTO observability.request_logs (
+                api_key_id, auth_token_id, request_user_id, method, path, query,
+                status_code, tavily_status_code, error_message, result_status,
+                request_kind_key, request_kind_label, provider, business_credits,
+                request_body, response_body, forwarded_headers, dropped_headers,
+                created_at
+            ) VALUES (?, NULL, ?, 'POST', '/search', ?, 200, 200, NULL, ?, 'api:search', 'API | search', ?, ?, NULL, NULL, '[]', '[]', ?)
+            "#,
+        )
+        .bind(key_id)
+        .bind(row.request_user_id)
+        .bind(format!("q=alignment-{index}"))
+        .bind(row.result_status)
+        .bind(row.provider)
+        .bind(row.business_credits)
+        .bind(row.created_at)
+        .execute(pool)
+        .await
+        .expect("insert alignment request log");
+    }
+}
+
+fn json_counter(row: &Value, key: &str) -> i64 {
+    row[key]
+        .as_i64()
+        .unwrap_or_else(|| panic!("missing integer {key:?} in {row}"))
+}
+
+/// C1 row shape: (provider, requests, success, errors, quota_exhausted,
+/// credits) in payload order, so the assertions also pin the sort.
+fn analysis_provider_rows(value: &Value) -> Vec<(String, i64, i64, i64, i64, i64)> {
+    let rows = value
+        .as_array()
+        .unwrap_or_else(|| panic!("provider row array: {value}"));
+    rows.iter()
+        .map(|row| {
+            (
+                row["provider"].as_str().unwrap_or_default().to_string(),
+                json_counter(row, "requests"),
+                json_counter(row, "success"),
+                json_counter(row, "errors"),
+                json_counter(row, "quota_exhausted"),
+                json_counter(row, "credits"),
+            )
+        })
+        .collect()
+}
+
+/// /api/summary-shaped row: (provider, total, success, error,
+/// quota_exhausted) in payload order.
+fn summary_shaped_provider_rows(value: &Value) -> Vec<(String, i64, i64, i64, i64)> {
+    let rows = value
+        .as_array()
+        .unwrap_or_else(|| panic!("provider row array: {value}"));
+    rows.iter()
+        .map(|row| {
+            (
+                row["provider"].as_str().unwrap_or_default().to_string(),
+                json_counter(row, "total_requests"),
+                json_counter(row, "success_count"),
+                json_counter(row, "error_count"),
+                json_counter(row, "quota_exhausted_count"),
+            )
+        })
+        .collect()
+}
+
+/// Expected-value counterpart of `analysis_provider_rows`, so the assertions
+/// read as literal fixture rows instead of six positional constructor
+/// arguments.
+fn expected_analysis_rows(
+    rows: &[(&str, i64, i64, i64, i64, i64)],
+) -> Vec<(String, i64, i64, i64, i64, i64)> {
+    rows.iter()
+        .map(
+            |(provider, requests, success, errors, quota_exhausted, credits)| {
+                (
+                    (*provider).to_string(),
+                    *requests,
+                    *success,
+                    *errors,
+                    *quota_exhausted,
+                    *credits,
+                )
+            },
+        )
+        .collect()
+}
+
+async fn spawn_analysis_providers_route(proxy: TavilyProxy, dev_open_admin: bool) -> SocketAddr {
+    let app = Router::new()
+        .route("/api/analysis/providers", get(get_analysis_providers_snapshot))
+        .with_state(read_surface_state(proxy, dev_open_admin));
+    bind_read_surface_ephemeral(app).await
+}
+
+#[tokio::test]
+async fn analysis_providers_carries_three_windows_with_credits_and_null_merge() {
+    // Given request logs spread over the 24h/7d/30d windows, one legacy
+    // NULL-provider row, one NULL-credits row, and one row older than 30 days
+    let db_path = temp_db_path("read-surface-analysis-providers");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy = TavilyProxy::with_endpoint(
+        vec!["tvly-read-surface-analysis".to_string()],
+        DEFAULT_UPSTREAM,
+        &db_str,
+    )
+    .await
+    .expect("proxy created");
+    let key_id = proxy
+        .list_api_key_metrics()
+        .await
+        .expect("list api key metrics")
+        .into_iter()
+        .next()
+        .expect("seeded key exists")
+        .id;
+    let now = chrono::Utc::now().timestamp();
+    let pool = connect_sqlite_test_pool(&db_str).await;
+    seed_provider_request_logs(
+        &pool,
+        &key_id,
+        &[
+            // last24h: the legacy NULL row merges into tavily ...
+            ProviderLogRow {
+                provider: None,
+                result_status: "success",
+                business_credits: Some(5),
+                request_user_id: None,
+                created_at: now - 3_600,
+            },
+            // ... and this NULL-credits tavily row adds requests, not credits
+            ProviderLogRow {
+                provider: Some("tavily"),
+                result_status: "success",
+                business_credits: None,
+                request_user_id: None,
+                created_at: now - 3_600,
+            },
+            ProviderLogRow {
+                provider: Some("serpapi"),
+                result_status: "success",
+                business_credits: Some(7),
+                request_user_id: None,
+                created_at: now - 3_600,
+            },
+            // last7d only
+            ProviderLogRow {
+                provider: Some("brave"),
+                result_status: "error",
+                business_credits: Some(3),
+                request_user_id: None,
+                created_at: now - 2 * 86_400,
+            },
+            // last30d only
+            ProviderLogRow {
+                provider: Some("exa"),
+                result_status: "quota_exhausted",
+                business_credits: Some(11),
+                request_user_id: None,
+                created_at: now - 10 * 86_400,
+            },
+            // outside every window
+            ProviderLogRow {
+                provider: Some("serpapi"),
+                result_status: "success",
+                business_credits: Some(99),
+                request_user_id: None,
+                created_at: now - 40 * 86_400,
+            },
+        ],
+    )
+    .await;
+    drop(pool);
+
+    let addr = spawn_analysis_providers_route(proxy, true).await;
+    let client = Client::new();
+
+    // When an admin reads the analysis provider snapshot
+    let response = client
+        .get(format!("http://{addr}/api/analysis/providers"))
+        .send()
+        .await
+        .expect("analysis providers request");
+
+    // Then it answers 200 and one payload carries exactly the three windows
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: Value = response.json().await.expect("json body");
+    assert!(
+        json_counter(&body, "generated_at") >= now,
+        "generated_at is the server's own now: {body}"
+    );
+    let windows = body
+        .get("windows")
+        .unwrap_or_else(|| panic!("windows object: {body}"));
+    let window_keys = windows
+        .as_object()
+        .unwrap_or_else(|| panic!("windows object: {body}"))
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<String>>();
+    assert_eq!(
+        window_keys,
+        ["last24h", "last7d", "last30d"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<std::collections::BTreeSet<String>>(),
+        "window keys: {body}"
+    );
+
+    // And last24h coalesces NULL -> tavily, sums only the non-NULL credits,
+    // and orders by requests desc
+    assert_eq!(
+        analysis_provider_rows(&windows["last24h"]),
+        expected_analysis_rows(&[
+            ("tavily", 2, 2, 0, 0, 5),
+            ("serpapi", 1, 1, 0, 0, 7),
+        ]),
+        "last24h: {body}"
+    );
+    // And last7d adds the brave row, tie-breaking equal request counts by
+    // provider id asc
+    assert_eq!(
+        analysis_provider_rows(&windows["last7d"]),
+        expected_analysis_rows(&[
+            ("tavily", 2, 2, 0, 0, 5),
+            ("brave", 1, 0, 1, 0, 3),
+            ("serpapi", 1, 1, 0, 0, 7),
+        ]),
+        "last7d: {body}"
+    );
+    // And last30d adds the quota-exhausted exa row while the 40-day-old row
+    // (99 credits) stays outside every window
+    assert_eq!(
+        analysis_provider_rows(&windows["last30d"]),
+        expected_analysis_rows(&[
+            ("tavily", 2, 2, 0, 0, 5),
+            ("brave", 1, 0, 1, 0, 3),
+            ("exa", 1, 0, 0, 1, 11),
+            ("serpapi", 1, 1, 0, 0, 7),
+        ]),
+        "last30d: {body}"
+    );
+
+    cleanup_db_dir(&db_path);
+}
+
+#[tokio::test]
+async fn analysis_providers_reject_callers_without_an_admin_session() {
+    // Given the route mounted on a runtime with no admin bypass
+    let db_path = temp_db_path("read-surface-analysis-providers-guard");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy =
+        TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
+            .await
+            .expect("proxy created");
+    let addr = spawn_analysis_providers_route(proxy, false).await;
+
+    // When reading it without an admin session
+    let response = Client::new()
+        .get(format!("http://{addr}/api/analysis/providers"))
+        .send()
+        .await
+        .expect("analysis providers request");
+
+    // Then the guard answers 403 before any provider row is read
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+
+    cleanup_db_dir(&db_path);
+}
+
+#[tokio::test]
+async fn dashboard_overview_carries_summary_and_window_provider_breakdowns() {
+    // Given per-key daily usage buckets (the /api/summary provider source) and
+    // today's mixed-provider request logs (the summaryWindows provider source)
+    let db_path = temp_db_path("read-surface-overview-providers");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy = TavilyProxy::with_endpoint(
+        vec!["tvly-read-surface-overview".to_string()],
+        DEFAULT_UPSTREAM,
+        &db_str,
+    )
+    .await
+    .expect("proxy created");
+    let key_id = proxy
+        .list_api_key_metrics()
+        .await
+        .expect("list api key metrics")
+        .into_iter()
+        .next()
+        .expect("seeded key exists")
+        .id;
+    let windows = proxy.summary_windows().await.expect("summary windows");
+    let created_at = windows.today_start + (windows.today_end - windows.today_start) / 2;
+    let pool = connect_sqlite_test_pool(&db_str).await;
+    for (id, api_key, provider) in [
+        ("read-surface-overview-brave", "k-overview-brave", "brave"),
+        ("read-surface-overview-serp", "k-overview-serpapi", "serpapi"),
+    ] {
+        sqlx::query(
+            r#"
+            INSERT INTO api_keys (id, api_key, status, provider, created_at)
+            VALUES (?, ?, 'active', ?, ?)
+            "#,
+        )
+        .bind(id)
+        .bind(api_key)
+        .bind(provider)
+        .bind(created_at)
+        .execute(&pool)
+        .await
+        .expect("insert provider key");
+    }
+    for (bound_key_id, total, success, error) in [
+        (key_id.clone(), 4_i64, 3_i64, 1_i64),
+        ("read-surface-overview-brave".to_string(), 2, 2, 0),
+        ("read-surface-overview-serp".to_string(), 1, 0, 1),
+    ] {
+        sqlx::query(
+            r#"
+            INSERT INTO observability.api_key_usage_buckets (
+                api_key_id, bucket_start, bucket_secs,
+                total_requests, success_count, error_count, quota_exhausted_count, updated_at
+            ) VALUES (?, ?, 86400, ?, ?, ?, 0, ?)
+            "#,
+        )
+        .bind(&bound_key_id)
+        .bind(windows.today_start)
+        .bind(total)
+        .bind(success)
+        .bind(error)
+        .bind(created_at)
+        .execute(&pool)
+        .await
+        .expect("insert usage bucket");
+    }
+    seed_provider_request_logs(
+        &pool,
+        &key_id,
+        &[
+            ProviderLogRow {
+                provider: None,
+                result_status: "success",
+                business_credits: Some(2),
+                request_user_id: None,
+                created_at,
+            },
+            ProviderLogRow {
+                provider: Some("brave"),
+                result_status: "error",
+                business_credits: Some(1),
+                request_user_id: None,
+                created_at: created_at - 1,
+            },
+        ],
+    )
+    .await;
+    drop(pool);
+
+    let admin_password = "read-surface-overview-password";
+    let admin_addr = spawn_builtin_keys_admin_server(proxy, admin_password).await;
+    let client = Client::new();
+    let cookie = login_admin(&client, admin_addr, admin_password).await;
+
+    // When reading the admin dashboard overview
+    let body = admin_get_json(&client, admin_addr, &cookie, "/api/dashboard/overview").await;
+
+    // Then summary.providers rides along in the overview payload, so the
+    // dashboard card needs no second /api/summary request
+    assert_eq!(
+        summary_shaped_provider_rows(&body["summary"]["providers"]),
+        vec![
+            ("brave".to_string(), 2, 2, 0, 0),
+            ("serpapi".to_string(), 1, 0, 1, 0),
+            ("tavily".to_string(), 4, 3, 1, 0),
+        ],
+        "overview summary providers: {body}"
+    );
+    // And every populated summaryWindows bucket carries the bounded
+    // request_logs scan, with the legacy NULL row merged into tavily
+    for bucket in ["today", "month"] {
+        assert!(
+            body["summaryWindows"][bucket]["providers"].is_array(),
+            "{bucket} bucket providers: {body}"
+        );
+    }
+    // An empty window keeps the additive field absent, so legacy payloads stay
+    // byte-identical (yesterday holds no seeded row).
+    assert!(
+        body["summaryWindows"]["yesterday"].get("providers").is_none(),
+        "empty window omits providers: {body}"
+    );
+    assert_eq!(
+        summary_shaped_provider_rows(&body["summaryWindows"]["today"]["providers"]),
+        vec![
+            ("brave".to_string(), 1, 0, 1, 0),
+            ("tavily".to_string(), 1, 1, 0, 0),
+        ],
+        "overview today window providers: {body}"
+    );
+
+    // And the SSE snapshot frame flattens the SAME payload builder, so it
+    // inherits both provider arrays without a separate code path
+    let mut events = client
+        .get(format!("http://{admin_addr}/api/events"))
+        .header(reqwest::header::COOKIE, cookie)
+        .send()
+        .await
+        .expect("admin events request");
+    assert_eq!(events.status(), reqwest::StatusCode::OK);
+    let frame = read_sse_event_until(
+        &mut events,
+        |chunk| chunk.contains("event: snapshot"),
+        "overview snapshot frame",
+    )
+    .await;
+    let data = frame
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .expect("snapshot data line");
+    let frame_body: Value = serde_json::from_str(data).expect("snapshot json");
+    assert_eq!(
+        summary_shaped_provider_rows(&frame_body["summary"]["providers"]),
+        summary_shaped_provider_rows(&body["summary"]["providers"]),
+        "SSE snapshot inherits the overview provider breakdown"
+    );
+    assert_eq!(
+        summary_shaped_provider_rows(&frame_body["summaryWindows"]["today"]["providers"]),
+        summary_shaped_provider_rows(&body["summaryWindows"]["today"]["providers"]),
+        "SSE snapshot inherits the window provider breakdown"
+    );
+
+    cleanup_db_dir(&db_path);
+}
+
+#[tokio::test]
+async fn user_dashboard_overview_carries_provider_counts_scoped_to_the_session_user() {
+    // Given two users and request logs attributed to each inside one fixed
+    // natural-day window (a UTC day keeps the fixture independent of the
+    // server timezone and of the wall clock at run time)
+    let db_path = temp_db_path("read-surface-user-providers");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy =
+        TavilyProxy::with_endpoint(Vec::<String>::new(), DEFAULT_UPSTREAM, &db_str)
+            .await
+            .expect("proxy created");
+    let mut users = Vec::new();
+    for provider_user_id in ["linuxdo-alice", "linuxdo-bob"] {
+        users.push(
+            proxy
+                .upsert_oauth_account(&OAuthAccountProfile {
+                    provider: "linuxdo".to_string(),
+                    provider_user_id: provider_user_id.to_string(),
+                    username: Some(provider_user_id.to_string()),
+                    name: Some(provider_user_id.to_string()),
+                    avatar_template: None,
+                    active: true,
+                    trust_level: Some(1),
+                    raw_payload_json: None,
+                })
+                .await
+                .expect("upsert oauth user"),
+        );
+    }
+    let bob = users.pop().expect("second oauth user");
+    let alice = users.pop().expect("first oauth user");
+    let session = proxy
+        .create_user_session(&alice, 3_600)
+        .await
+        .expect("create user session");
+
+    let window_start = Utc
+        .with_ymd_and_hms(2026, 1, 5, 0, 0, 0)
+        .single()
+        .expect("valid utc day start");
+    let window_end = window_start + ChronoDuration::days(1);
+    let inside = window_start.timestamp() + 43_200;
+    let pool = connect_sqlite_test_pool(&db_str).await;
+    let key_id = String::from("read-surface-user-key");
+    seed_provider_request_logs(
+        &pool,
+        &key_id,
+        &[
+            // alice: the NULL row merges into tavily and sorts first
+            ProviderLogRow {
+                provider: None,
+                result_status: "success",
+                business_credits: Some(4),
+                request_user_id: Some(alice.user_id.as_str()),
+                created_at: inside,
+            },
+            ProviderLogRow {
+                provider: Some("tavily"),
+                result_status: "error",
+                business_credits: Some(1),
+                request_user_id: Some(alice.user_id.as_str()),
+                created_at: inside + 1,
+            },
+            ProviderLogRow {
+                provider: Some("serpapi"),
+                result_status: "success",
+                business_credits: Some(6),
+                request_user_id: Some(alice.user_id.as_str()),
+                created_at: inside + 2,
+            },
+            // bob: never visible to alice's card
+            ProviderLogRow {
+                provider: Some("brave"),
+                result_status: "success",
+                business_credits: Some(8),
+                request_user_id: Some(bob.user_id.as_str()),
+                created_at: inside + 3,
+            },
+            // unattributed: never visible to either card
+            ProviderLogRow {
+                provider: Some("exa"),
+                result_status: "success",
+                business_credits: Some(9),
+                request_user_id: None,
+                created_at: inside + 4,
+            },
+            // alice, but outside the requested window
+            ProviderLogRow {
+                provider: Some("serpapi"),
+                result_status: "success",
+                business_credits: Some(10),
+                request_user_id: Some(alice.user_id.as_str()),
+                created_at: window_end.timestamp() + 60,
+            },
+        ],
+    )
+    .await;
+    drop(pool);
+
+    let addr = spawn_user_oauth_server_with_options(proxy, linuxdo_oauth_options_for_test()).await;
+    // `Z` rather than `+00:00`: a `+` in a query value decodes to a space.
+    let rfc3339_utc = |value: chrono::DateTime<Utc>| {
+        value.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    };
+    let overview_url = format!(
+        "http://{addr}/api/user/dashboard/overview?today_start={}&today_end={}",
+        rfc3339_utc(window_start),
+        rfc3339_utc(window_end)
+    );
+
+    // When alice reads her console overview for that window
+    let response = Client::new()
+        .get(&overview_url)
+        .header(
+            reqwest::header::COOKIE,
+            format!("{USER_SESSION_COOKIE_NAME}={}", session.token),
+        )
+        .send()
+        .await
+        .expect("user overview request");
+
+    // Then the payload gains providers[] scoped to her attributed rows only,
+    // with the legacy NULL row merged into tavily and requests-desc ordering
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: Value = response.json().await.expect("json body");
+    let providers = body
+        .get("providers")
+        .unwrap_or_else(|| panic!("providers array: {body}"));
+    assert_eq!(
+        providers
+            .as_array()
+            .expect("providers array")
+            .iter()
+            .map(|row| (
+                row["provider"].as_str().unwrap_or_default().to_string(),
+                json_counter(row, "requests"),
+                json_counter(row, "success"),
+                json_counter(row, "errors"),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("tavily".to_string(), 2, 1, 1),
+            ("serpapi".to_string(), 1, 1, 0),
+        ],
+        "user provider rows: {body}"
+    );
+    // And the user row shape stays {provider, requests, success, errors}: the
+    // console card shows no credit split, so credits must not leak into it
+    let row_keys = providers.as_array().expect("providers array")[0]
+        .as_object()
+        .expect("provider row object")
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<String>>();
+    assert_eq!(
+        row_keys,
+        ["errors", "provider", "requests", "success"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<std::collections::BTreeSet<String>>(),
+        "user provider row keys: {body}"
+    );
 
     cleanup_db_dir(&db_path);
 }

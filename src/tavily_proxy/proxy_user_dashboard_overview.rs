@@ -158,6 +158,28 @@ impl TavilyProxy {
                 now,
             )
             .await?;
+        // Multi-provider alignment (C3): DATA SOURCE is ONE bounded
+        // `observability.request_logs` scan filtered by `request_user_id` (the
+        // attribution column the analysis-pressure and unique-IP ranking reads
+        // already use, covered by `idx_request_logs_user_ip_time`) and grouped
+        // by `COALESCE(provider, 'tavily')`. The window is the same daily
+        // window `user_dashboard_summary` resolves for its daily counters.
+        // Cross-source by design, exactly like the admin card: the daily
+        // totals come from `auth_token_logs` joined through
+        // `user_token_bindings`, so the provider rows segment the same
+        // traffic without being the same query.
+        let resolved_daily_window = daily_window
+            .unwrap_or_else(|| server_local_day_window_utc(now.with_timezone(&Local)));
+        let providers = self
+            .key_store
+            .fetch_user_window_provider_counts(
+                user_id,
+                (
+                    resolved_daily_window.start,
+                    resolved_daily_window.end,
+                ),
+            )
+            .await?;
 
         Ok(UserDashboardOverviewSnapshot {
             summary,
@@ -167,6 +189,7 @@ impl TavilyProxy {
                 daily_credits,
                 monthly_credits,
             },
+            providers,
         })
     }
 

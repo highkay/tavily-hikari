@@ -1198,6 +1198,25 @@ async fn get_analysis_pressure_snapshot(
         .map_err(|err| admin_proxy_error_response("get analysis pressure snapshot error", err))
 }
 
+/// Multi-provider alignment (C1): `GET /api/analysis/providers`. One snapshot
+/// carries all three windows (last24h/last7d/last30d), mirroring the rankings
+/// endpoint so the client switches tabs without a second request.
+async fn get_analysis_providers_snapshot(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<AnalysisProvidersView>, (StatusCode, String)> {
+    if !is_admin_request(state.as_ref(), &headers).await {
+        return Err((StatusCode::FORBIDDEN, "forbidden".to_string()));
+    }
+
+    state
+        .proxy
+        .analysis_provider_snapshot()
+        .await
+        .map(|snapshot| Json(AnalysisProvidersView::from(snapshot)))
+        .map_err(|err| admin_proxy_error_response("get analysis providers snapshot error", err))
+}
+
 #[axum::debug_handler]
 async fn create_user_token(
     State(state): State<Arc<AppState>>,

@@ -1565,6 +1565,34 @@ async fn build_dashboard_overview_payload(
         .proxy
         .dashboard_overview_read_components_with_quota_token_at(now_local, quota_charge_token)
         .await?;
+    // C2 (multi-provider alignment): the overview payload carries the same
+    // provider breakdowns as /api/summary and /api/summary/windows, so the
+    // dashboard card needs no second request. Both reads are the existing
+    // additive ones; a failed segmentation degrades to the legacy `None`
+    // shape exactly like those endpoints do.
+    let summary_providers = state
+        .proxy
+        .summary_provider_breakdown()
+        .await
+        .unwrap_or_else(|err| {
+            eprintln!("dashboard overview provider breakdown error: {err}");
+            Vec::new()
+        });
+    let summary_window_providers = state
+        .proxy
+        .summary_window_provider_counts([
+            (summary_windows.today_start, summary_windows.today_end),
+            (
+                summary_windows.yesterday_start,
+                summary_windows.yesterday_end,
+            ),
+            (summary_windows.month_start, summary_windows.month_end),
+        ])
+        .await
+        .unwrap_or_else(|err| {
+            eprintln!("dashboard overview window provider counts error: {err}");
+            [Vec::new(), Vec::new(), Vec::new()]
+        });
     let rollup_integrity = state.proxy.dashboard_rollup_integrity_status().await?;
     let month_series = state.proxy.dashboard_month_series(&summary_windows).await?;
     let dashboard_api_key_lifecycle_signature = state
@@ -1648,9 +1676,16 @@ async fn build_dashboard_overview_payload(
         .iter()
         .map(|job| (job.id, job.status.clone(), job.finished_at))
         .collect::<Vec<_>>();
+    let mut summary_view: SummaryView = summary.clone().into();
+    summary_view.providers = summary_provider_count_views(summary_providers.clone());
+    let mut summary_windows_view = SummaryWindowsView::from(summary_windows.clone());
+    let [today_providers, yesterday_providers, month_providers] = summary_window_providers.clone();
+    summary_windows_view.today.providers = summary_provider_count_views(today_providers);
+    summary_windows_view.yesterday.providers = summary_provider_count_views(yesterday_providers);
+    summary_windows_view.month.providers = summary_provider_count_views(month_providers);
     let payload = DashboardOverviewPayload {
-            summary: summary.clone().into(),
-            summary_windows: SummaryWindowsView::from(summary_windows.clone()),
+            summary: summary_view,
+            summary_windows: summary_windows_view,
             hourly_request_window: DashboardHourlyRequestWindowView::from(hourly_request_window),
             rollup_integrity: rollup_integrity.clone(),
             month_series: DashboardMonthSeriesView::from(month_series.clone()),
@@ -1712,6 +1747,8 @@ async fn build_dashboard_overview_payload(
                 summary_windows.yesterday_start,
                 summary_windows.month_start,
             ],
+            summary_providers,
+            summary_window_providers,
             dashboard_rollup_signature,
             pending_dashboard_rollup_signature,
             rollup_integrity: (
@@ -1889,6 +1926,33 @@ async fn compute_dashboard_overview_freshness(
         .await?;
     let forward_proxy = state.proxy.get_forward_proxy_dashboard_summary().await?;
     let summary_window_starts = [today_start, yesterday_start, month_start];
+    // C2 (multi-provider alignment): the probe reads the SAME two provider
+    // sources the build does, so a provider-only change re-emits a snapshot
+    // instead of leaving the dashboard card on a stale segmentation. Window
+    // bounds mirror `summary_windows_at` (`today_end = now + 1`,
+    // `month_end = today_end`); only the resulting arrays enter the
+    // signature, so sub-second clock skew between probe and build cannot
+    // force a rebuild.
+    let probe_today_end = now_local
+        .with_timezone(&Utc)
+        .timestamp()
+        .saturating_add(1);
+    let probe_yesterday_end =
+        yesterday_start.saturating_add(probe_today_end.saturating_sub(today_start));
+    let summary_providers = state
+        .proxy
+        .summary_provider_breakdown()
+        .await
+        .unwrap_or_default();
+    let summary_window_providers = state
+        .proxy
+        .summary_window_provider_counts([
+            (today_start, probe_today_end),
+            (yesterday_start, probe_yesterday_end),
+            (month_start, probe_today_end),
+        ])
+        .await
+        .unwrap_or_else(|_| [Vec::new(), Vec::new(), Vec::new()]);
     let (request_log_retention_days, retention_since) =
         dashboard_request_log_retention(state).await?;
     let trend_request_logs = state
@@ -1933,6 +1997,8 @@ async fn compute_dashboard_overview_freshness(
         ],
         summary_last_activity: summary.last_activity,
         summary_window_starts,
+        summary_providers,
+        summary_window_providers,
         dashboard_rollup_signature,
         pending_dashboard_rollup_signature,
         rollup_integrity: (

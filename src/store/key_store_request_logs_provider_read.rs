@@ -17,7 +17,7 @@ use crate::analysis::{
     request_log_operational_class_case_sql, request_log_request_kind_key_sql,
     result_bucket_case_sql,
 };
-use crate::models::{LogFacetOption, RequestLogsPage};
+use crate::models::{LogFacetOption, ProviderRequestCounts, RequestLogsPage};
 use crate::{OUTCOME_ERROR, OUTCOME_QUOTA_EXHAUSTED, OUTCOME_SUCCESS};
 use sqlx::sqlite::Sqlite;
 use sqlx::{QueryBuilder, Row};
@@ -301,5 +301,97 @@ impl KeyStore {
             row.try_get("error_count")?,
             row.try_get("quota_exhausted_count")?,
         ))
+    }
+
+    /// Multi-provider alignment (C1): per-provider counters for the three
+    /// `/api/analysis/providers` windows (last24h/last7d/last30d). Each window
+    /// is ONE bounded `observability.request_logs` scan, so the analysis
+    /// windows stay independent of the `/api/summary/windows` buckets.
+    pub(crate) async fn fetch_analysis_window_provider_counts(
+        &self,
+        windows: [(i64, i64); 3],
+    ) -> Result<[Vec<ProviderRequestCounts>; 3], ProxyError> {
+        let [last24h, last7d, last30d] = windows;
+        Ok([
+            self.fetch_provider_request_counts(last24h, None).await?,
+            self.fetch_provider_request_counts(last7d, None).await?,
+            self.fetch_provider_request_counts(last30d, None).await?,
+        ])
+    }
+
+    /// Multi-provider alignment (C3): per-provider counters for ONE user over
+    /// the daily window. `request_user_id` is the attribution column the
+    /// analysis-pressure and unique-IP ranking reads already rely on, and it
+    /// is covered by `idx_request_logs_user_ip_time`.
+    pub(crate) async fn fetch_user_window_provider_counts(
+        &self,
+        request_user_id: &str,
+        window: (i64, i64),
+    ) -> Result<Vec<ProviderRequestCounts>, ProxyError> {
+        self.fetch_provider_request_counts(window, Some(request_user_id))
+            .await
+    }
+
+    /// Shared bounded scan behind the two analysis/user provider reads. Cloned
+    /// from `fetch_window_provider_counts` — which keeps its five-column
+    /// projection and provider-ASC order because `/api/summary/windows` pins
+    /// that payload — and extended with the local-estimated business credits
+    /// sum plus the analysis ordering (`requests DESC`, provider-id ASC
+    /// tie-break). Legacy NULL providers coalesce to `tavily`.
+    async fn fetch_provider_request_counts(
+        &self,
+        (window_start, window_end): (i64, i64),
+        request_user_id: Option<&str>,
+    ) -> Result<Vec<ProviderRequestCounts>, ProxyError> {
+        type ProviderRequestCountsRow = (String, i64, i64, i64, i64, i64);
+        if window_end <= window_start {
+            return Ok(Vec::new());
+        }
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT COALESCE(provider, 'tavily') AS provider, COUNT(*) AS requests, \
+             COALESCE(SUM(CASE WHEN result_status = ",
+        );
+        query.push_bind(OUTCOME_SUCCESS);
+        query.push(" THEN 1 ELSE 0 END), 0) AS success, COALESCE(SUM(CASE WHEN result_status = ");
+        query.push_bind(OUTCOME_ERROR);
+        query.push(
+            " THEN 1 ELSE 0 END), 0) AS errors, COALESCE(SUM(CASE WHEN result_status = ",
+        );
+        query.push_bind(OUTCOME_QUOTA_EXHAUSTED);
+        query.push(
+            " THEN 1 ELSE 0 END), 0) AS quota_exhausted, \
+             COALESCE(SUM(COALESCE(business_credits, 0)), 0) AS credits \
+             FROM observability.request_logs WHERE visibility = ",
+        );
+        query.push_bind(crate::REQUEST_LOG_VISIBILITY_VISIBLE);
+        query.push(" AND created_at >= ");
+        query.push_bind(window_start);
+        query.push(" AND created_at < ");
+        query.push_bind(window_end);
+        if let Some(request_user_id) = request_user_id {
+            query.push(" AND request_user_id = ");
+            query.push_bind(request_user_id.to_string());
+        }
+        query.push(" GROUP BY 1 ORDER BY requests DESC, provider ASC");
+        let rows = query
+            .build_query_as::<ProviderRequestCountsRow>()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(ProxyError::from)?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(provider, requests, success, errors, quota_exhausted, credits)| {
+                    ProviderRequestCounts {
+                        provider,
+                        requests,
+                        success,
+                        errors,
+                        quota_exhausted,
+                        credits,
+                    }
+                },
+            )
+            .collect())
     }
 }

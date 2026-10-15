@@ -2130,6 +2130,36 @@ impl TavilyProxy {
             .await
     }
 
+    /// Multi-provider alignment (C1): the `GET /api/analysis/providers`
+    /// snapshot. Window math matches the rankings snapshot (`now - 86400k`
+    /// through `now`), and `generated_at` is that same `now` so the client can
+    /// age the payload. Each window is ONE bounded `request_logs` scan.
+    pub async fn analysis_provider_snapshot(
+        &self,
+    ) -> Result<AnalysisProviderSnapshot, ProxyError> {
+        let generated_at = self.backend_time.now_utc().timestamp();
+        let analysis_window = |days: i64| {
+            (
+                generated_at.saturating_sub(days.saturating_mul(SECS_PER_DAY)),
+                generated_at,
+            )
+        };
+        let [last24h, last7d, last30d] = self
+            .key_store
+            .fetch_analysis_window_provider_counts([
+                analysis_window(1),
+                analysis_window(7),
+                analysis_window(30),
+            ])
+            .await?;
+        Ok(AnalysisProviderSnapshot {
+            generated_at,
+            last24h,
+            last7d,
+            last30d,
+        })
+    }
+
     pub async fn request_log_bodies(
         &self,
         log_id: i64,

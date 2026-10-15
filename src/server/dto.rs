@@ -356,6 +356,83 @@ fn summary_provider_count_views(
     })
 }
 
+/// Multi-provider alignment (C1): one `GET /api/analysis/providers` row.
+/// `credits` is the local-estimated business credits summed from
+/// `request_logs.business_credits`; there is no upstream-credit split in v1.
+#[derive(Debug, Clone, Serialize)]
+struct AnalysisProviderCountView {
+    provider: String,
+    requests: i64,
+    success: i64,
+    errors: i64,
+    quota_exhausted: i64,
+    credits: i64,
+}
+
+/// Multi-provider alignment (C1): all three analysis windows in one snapshot,
+/// mirroring `/api/users/rankings` so tab switching stays client-side.
+#[derive(Debug, Clone, Serialize)]
+struct AnalysisProviderWindowsView {
+    last24h: Vec<AnalysisProviderCountView>,
+    last7d: Vec<AnalysisProviderCountView>,
+    last30d: Vec<AnalysisProviderCountView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AnalysisProvidersView {
+    generated_at: i64,
+    windows: AnalysisProviderWindowsView,
+}
+
+fn analysis_provider_count_views(
+    rows: Vec<tavily_hikari::ProviderRequestCounts>,
+) -> Vec<AnalysisProviderCountView> {
+    rows.into_iter()
+        .map(|counts| AnalysisProviderCountView {
+            provider: counts.provider,
+            requests: counts.requests,
+            success: counts.success,
+            errors: counts.errors,
+            quota_exhausted: counts.quota_exhausted,
+            credits: counts.credits,
+        })
+        .collect()
+}
+
+impl From<tavily_hikari::AnalysisProviderSnapshot> for AnalysisProvidersView {
+    fn from(snapshot: tavily_hikari::AnalysisProviderSnapshot) -> Self {
+        Self {
+            generated_at: snapshot.generated_at,
+            windows: AnalysisProviderWindowsView {
+                last24h: analysis_provider_count_views(snapshot.last24h),
+                last7d: analysis_provider_count_views(snapshot.last7d),
+                last30d: analysis_provider_count_views(snapshot.last30d),
+            },
+        }
+    }
+}
+
+/// Multi-provider alignment (C3): one user-console provider card row. Credits
+/// stay out of the user payload — the card shows no credit split.
+#[derive(Debug, Clone, Serialize)]
+struct UserProviderCountView {
+    provider: String,
+    requests: i64,
+    success: i64,
+    errors: i64,
+}
+
+impl From<tavily_hikari::ProviderRequestCounts> for UserProviderCountView {
+    fn from(counts: tavily_hikari::ProviderRequestCounts) -> Self {
+        Self {
+            provider: counts.provider,
+            requests: counts.requests,
+            success: counts.success,
+            errors: counts.errors,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PublicMetricsView {

@@ -16,11 +16,19 @@ pub(crate) struct AppState {
     remote_attempt_admission: Arc<RemoteAttemptAdmissionController>,
 }
 
+/// C2 (multi-provider alignment): the additive provider segmentation carried
+/// in the overview freshness signature, so a provider-only change re-emits an
+/// SSE snapshot. Tuple order matches `SummaryProviderCountView`: provider,
+/// total, success, error, quota_exhausted.
+type SummaryProviderSignature = Vec<(String, i64, i64, i64, i64)>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DashboardOverviewFreshness {
     summary: [i64; 10],
     summary_last_activity: Option<i64>,
     summary_window_starts: [i64; 3],
+    summary_providers: SummaryProviderSignature,
+    summary_window_providers: [SummaryProviderSignature; 3],
     dashboard_rollup_signature: [i64; 19],
     pending_dashboard_rollup_signature: [i64; 10],
     rollup_integrity: (String, Option<i64>, Option<i64>, i64),
