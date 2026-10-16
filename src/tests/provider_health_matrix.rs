@@ -911,3 +911,748 @@ async fn brave_full_path_sql_kind_whitelist_pins() {
         assert_eq!(request_log, "api:brave/web", "path {path}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Plan provider-key-429-retry todo 3 — auth-block family LIVE matrix rows:
+// bare 401/403 → classify → arm → selector avoidance, plus the negative rows
+// that keep the family's longer ceiling from leaking outside it.
+// ---------------------------------------------------------------------------
+
+/// One scripted answer from the stub upstream (a local listener only — these
+/// rows never touch a production endpoint).
+struct MatrixUpstreamRecipe {
+    status: StatusCode,
+    retry_after: Option<&'static str>,
+    body: &'static [u8],
+}
+
+/// The `api_key` secrets the stub upstream saw, in hit order: the observable
+/// record of WHICH pooled key the live selector handed to each attempt.
+type MatrixUpstreamHits = Arc<std::sync::Mutex<Vec<String>>>;
+
+fn matrix_upstream_hits() -> MatrixUpstreamHits {
+    Arc::new(std::sync::Mutex::new(Vec::new()))
+}
+
+fn matrix_hits_seen(hits: &MatrixUpstreamHits) -> Vec<String> {
+    hits.lock().expect("upstream hit log lock").clone()
+}
+
+/// Stub Tavily upstream: `/search` answers from the recipe list (the last
+/// recipe repeats for any extra hit) and `/usage` keeps the quota-sync lane
+/// resolvable should the executor reach it.
+async fn spawn_matrix_upstream(
+    recipes: Vec<MatrixUpstreamRecipe>,
+    hits: MatrixUpstreamHits,
+) -> std::net::SocketAddr {
+    let recipes = Arc::new(recipes);
+    let app = Router::new()
+        .route(
+            "/search",
+            post(move |body: axum::body::Bytes| {
+                let recipes = Arc::clone(&recipes);
+                let hits = Arc::clone(&hits);
+                async move {
+                    let api_key = serde_json::from_slice::<Value>(body.as_ref())
+                        .ok()
+                        .and_then(|parsed| {
+                            parsed
+                                .get("api_key")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_default();
+                    let index = {
+                        let mut seen = hits.lock().expect("upstream hit log lock");
+                        seen.push(api_key);
+                        seen.len() - 1
+                    };
+                    let recipe = &recipes[index.min(recipes.len() - 1)];
+                    let mut response =
+                        axum::response::Response::new(axum::body::Body::from(recipe.body.to_vec()));
+                    *response.status_mut() = recipe.status;
+                    if let Some(retry_after) = recipe.retry_after {
+                        response.headers_mut().insert(
+                            axum::http::header::RETRY_AFTER,
+                            axum::http::HeaderValue::from_str(retry_after)
+                                .expect("retry-after header value"),
+                        );
+                    }
+                    response
+                }
+            }),
+        )
+        .route(
+            "/usage",
+            get(|| async {
+                Json(serde_json::json!({
+                    "key": { "limit": 1000, "usage": 1 },
+                    "account": { "plan_limit": 1000, "usage": 1 },
+                }))
+            }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stub upstream");
+    let addr = listener.local_addr().expect("stub upstream address");
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .await
+            .expect("serve stub upstream");
+    });
+    addr
+}
+
+/// Seeds every Tavily key in ONE `sync_keys` call: the sync soft-deletes
+/// same-provider keys absent from the list, so seeding one key at a time would
+/// drop the pool member the avoidance rows depend on.
+async fn seed_tavily_matrix_keys(proxy: &TavilyProxy, secrets: &[&str]) -> Vec<String> {
+    let owned = secrets
+        .iter()
+        .map(|secret| (*secret).to_string())
+        .collect::<Vec<_>>();
+    proxy
+        .key_store
+        .sync_keys(ProviderId::Tavily, &owned)
+        .await
+        .expect("seed tavily matrix keys");
+    let mut ids = Vec::with_capacity(owned.len());
+    for secret in &owned {
+        ids.push(
+            sqlx::query_scalar("SELECT id FROM api_keys WHERE api_key = ?")
+                .bind(secret)
+                .fetch_one(&proxy.key_store.pool)
+                .await
+                .expect("matrix key id lookup"),
+        );
+    }
+    ids
+}
+
+async fn seed_matrix_auth_token(proxy: &TavilyProxy, token_id: &str) {
+    sqlx::query("INSERT INTO auth_tokens (id, secret, created_at) VALUES (?, ?, ?)")
+        .bind(token_id)
+        .bind(format!("{token_id}-secret"))
+        .bind(proxy.backend_time.now_ts())
+        .execute(&proxy.key_store.pool)
+        .await
+        .expect("seed matrix auth token");
+}
+
+/// One live Tavily HTTP search through the production executor: key selection →
+/// upstream call → classification → reconcile → backoff arm → request_logs.
+/// This is the entry point `/api/tavily/search` calls, so the rows below pin
+/// the auth-block family end to end instead of pinning the store call alone.
+async fn matrix_live_search(
+    proxy: &TavilyProxy,
+    usage_base: &str,
+    token_id: &str,
+) -> (ProxyResponse, AttemptAnalysis) {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    proxy
+        .proxy_http_json_endpoint(
+            usage_base,
+            "/search",
+            Some(token_id),
+            false,
+            None,
+            None,
+            &Method::POST,
+            "/api/tavily/search",
+            serde_json::json!({ "query": "matrix auth block" }),
+            &headers,
+            false,
+            None,
+        )
+        .await
+        .expect("live matrix search completes")
+}
+
+/// The single `(key_id, scope)` backoff row — reason, absolute deadline and
+/// sized Retry-After — whether or not its cooldown has elapsed.
+async fn matrix_backoff_row(
+    proxy: &TavilyProxy,
+    key_id: &str,
+    scope: &str,
+) -> Option<(String, i64, i64)> {
+    sqlx::query(
+        "SELECT reason_code, cooldown_until, retry_after_secs FROM api_key_transient_backoffs \
+         WHERE key_id = ? AND scope = ?",
+    )
+    .bind(key_id)
+    .bind(scope)
+    .fetch_optional(&proxy.key_store.pool)
+    .await
+    .expect("matrix backoff row lookup")
+    .map(|row| {
+        (
+            row.get::<Option<String>, _>("reason_code")
+                .unwrap_or_default(),
+            row.get::<i64, _>("cooldown_until"),
+            row.get::<Option<i64>, _>("retry_after_secs").unwrap_or(-1),
+        )
+    })
+}
+
+async fn matrix_backoff_row_count(proxy: &TavilyProxy, key_id: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM api_key_transient_backoffs WHERE key_id = ?")
+        .bind(key_id)
+        .fetch_one(&proxy.key_store.pool)
+        .await
+        .expect("matrix backoff row count")
+}
+
+/// Visible `request_logs` rows for one key, oldest first:
+/// `(status_code, failure_kind, key_effect_code)`.
+async fn matrix_request_log_rows(
+    proxy: &TavilyProxy,
+    key_id: &str,
+) -> Vec<(Option<i64>, Option<String>, Option<String>)> {
+    sqlx::query_as(
+        "SELECT status_code, failure_kind, key_effect_code FROM request_logs \
+         WHERE api_key_id = ? ORDER BY id ASC",
+    )
+    .bind(key_id)
+    .fetch_all(&proxy.key_store.pool)
+    .await
+    .expect("matrix request log rows")
+}
+/// LIVE end-to-end auth-block row (plan todo 3a): a bare Tavily 403 — no
+/// quarantine keyword anywhere in the body — travels the production executor,
+/// arms `upstream_auth_blocked` on the shared `http_global` scope with the
+/// upstream's own Retry-After (600s, above the old 300s ladder ceiling), keeps
+/// the key active and unquarantined, and the NEXT acquisition hands out the
+/// other pooled key instead.
+///
+/// The `tavily_` name prefix is deliberate, not cosmetic: libtest collects (and
+/// therefore starts) this shard's tests in NAME order, so the three proxy +
+/// SQLite + stub-HTTP rows below sort last and never share a two-thread window
+/// with the pre-existing `alert_events_*` row. That row's `admin_alerts_read`
+/// runs on a 250ms wall-clock admission budget (`src/store/sqlite_runtime.rs:34`)
+/// which turns even a successful query into `Deferred{reason:"read_budget"}`
+/// once the deadline passes, so a heavy neighbour alone is enough to fail it.
+#[tokio::test]
+async fn tavily_auth_block_bare_403_live_path_arms_and_next_acquisition_avoids_key() {
+    let (proxy, _clock) = spawn_matrix_proxy("health-matrix-auth-block-live").await;
+    let secrets = ["mtx-ab-live-a", "mtx-ab-live-b"];
+    let key_ids = seed_tavily_matrix_keys(&proxy, &secrets).await;
+    let token_id = "hmx-ab-live-token";
+    seed_matrix_auth_token(&proxy, token_id).await;
+    let hits = matrix_upstream_hits();
+    let addr = spawn_matrix_upstream(
+        vec![
+            MatrixUpstreamRecipe {
+                status: StatusCode::FORBIDDEN,
+                retry_after: Some("600"),
+                body: br#"{"detail":"Forbidden"}"#,
+            },
+            MatrixUpstreamRecipe {
+                status: StatusCode::OK,
+                retry_after: None,
+                body: br#"{"status":200,"results":[]}"#,
+            },
+        ],
+        Arc::clone(&hits),
+    )
+    .await;
+    let usage_base = format!("http://{addr}");
+    let now = proxy.backend_time.now_ts();
+
+    let (blocked_resp, blocked_analysis) = matrix_live_search(&proxy, &usage_base, token_id).await;
+    assert_eq!(blocked_resp.status, StatusCode::FORBIDDEN);
+    assert_eq!(blocked_analysis.status, OUTCOME_ERROR);
+    assert_eq!(blocked_analysis.tavily_status_code, Some(403));
+    assert_eq!(
+        blocked_analysis.failure_kind.as_deref(),
+        Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED),
+        "a bare 403 classifies into the auth-block family"
+    );
+    assert_eq!(blocked_analysis.key_health_action, KeyHealthAction::None);
+    assert_eq!(
+        blocked_resp.key_effect_code,
+        KEY_EFFECT_TRANSIENT_BACKOFF_SET
+    );
+    assert_eq!(
+        blocked_resp.body.as_ref(),
+        br#"{"detail":"Forbidden"}"#.as_slice(),
+        "the rejected upstream body still passes through byte-identical"
+    );
+
+    let seen = matrix_hits_seen(&hits);
+    assert_eq!(seen.len(), 1, "one upstream attempt");
+    let blocked_index = secrets
+        .iter()
+        .position(|secret| *secret == seen[0])
+        .expect("the leased key is a pooled key");
+    let blocked_id = key_ids[blocked_index].clone();
+    assert_eq!(
+        blocked_resp.api_key_id.as_deref(),
+        Some(blocked_id.as_str())
+    );
+
+    let (reason, cooldown_until, retry_after) =
+        matrix_backoff_row(&proxy, &blocked_id, HTTP_GLOBAL_BACKOFF_SCOPE)
+            .await
+            .expect("auth-block backoff armed");
+    assert_eq!(reason, FAILURE_KIND_UPSTREAM_AUTH_BLOCKED);
+    assert_eq!(
+        retry_after, 600,
+        "RA=600 survives the family's [30, 900] clamp (todo 2)"
+    );
+    assert_eq!(cooldown_until, now + 600);
+    assert_eq!(
+        key_status(&proxy, &seen[0]).await,
+        "active",
+        "cooling never exhausts the key"
+    );
+    assert!(
+        active_quarantine_reason(&proxy, &blocked_id)
+            .await
+            .is_none(),
+        "no quarantine keyword → no quarantine row"
+    );
+    assert_eq!(
+        matrix_request_log_rows(&proxy, &blocked_id).await,
+        vec![(
+            Some(403),
+            Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED.to_string()),
+            Some(KEY_EFFECT_TRANSIENT_BACKOFF_SET.to_string())
+        )],
+        "the blocked attempt stays visible with its family label"
+    );
+    std::eprintln!(
+        "[auth-block-matrix] live-403 key={blocked_id} reason={reason} cooldown_secs={} \
+         retry_after={retry_after} effect={} upstream_hits={seen:?}",
+        cooldown_until - now,
+        blocked_resp.key_effect_code,
+    );
+
+    // Phase 2 — the next acquisition routes around the cooled key.
+    let (healthy_resp, healthy_analysis) = matrix_live_search(&proxy, &usage_base, token_id).await;
+    let seen = matrix_hits_seen(&hits);
+    assert_eq!(
+        seen.len(),
+        2,
+        "the retry-free executor still makes one attempt"
+    );
+    assert_ne!(
+        seen[1], seen[0],
+        "the selector avoids the cooled key on the next acquisition"
+    );
+    let healthy_index = secrets
+        .iter()
+        .position(|secret| *secret == seen[1])
+        .expect("the leased key is a pooled key");
+    assert_ne!(healthy_index, blocked_index);
+    let healthy_id = key_ids[healthy_index].clone();
+    assert_eq!(
+        healthy_resp.api_key_id.as_deref(),
+        Some(healthy_id.as_str())
+    );
+    assert_eq!(healthy_resp.status, StatusCode::OK);
+    assert_eq!(healthy_analysis.status, OUTCOME_SUCCESS);
+    assert!(
+        matrix_backoff_row(&proxy, &healthy_id, HTTP_GLOBAL_BACKOFF_SCOPE)
+            .await
+            .is_none(),
+        "the healthy key never enters the family"
+    );
+    let (reason_after, cooldown_after, retry_after_after) =
+        matrix_backoff_row(&proxy, &blocked_id, HTTP_GLOBAL_BACKOFF_SCOPE)
+            .await
+            .expect("the armed row survives");
+    assert_eq!(
+        (reason_after.as_str(), cooldown_after, retry_after_after),
+        (FAILURE_KIND_UPSTREAM_AUTH_BLOCKED, now + 600, 600),
+        "another key's success does not clear the cooled key's row"
+    );
+    std::eprintln!(
+        "[auth-block-matrix] live-403 avoidance blocked={blocked_id} -> next={healthy_id} \
+         second_status={} remaining_cooldown_secs={} healthy_backoff_rows=0",
+        healthy_resp.status.as_u16(),
+        cooldown_after - now,
+    );
+}
+
+/// One LIVE row of the auth-block family boundary. `expected_reason` and
+/// `expected_secs` describe the `http_global` backoff the row must arm; both
+/// `None` means the row must arm NOTHING on any scope.
+struct MatrixFamilyRow {
+    label: &'static str,
+    status: StatusCode,
+    retry_after: Option<&'static str>,
+    body: &'static [u8],
+    expected_kind: &'static str,
+    expected_effect: &'static str,
+    expected_reason: Option<&'static str>,
+    expected_secs: Option<i64>,
+    expect_quarantine: bool,
+}
+
+/// LIVE family-boundary rows (plan todo 3, malformed_input + 防误扩 probes),
+/// table-driven over ONE shared proxy, ONE shared stub upstream and ONE token —
+/// the fixture count is the minimum that keeps the coverage:
+/// * what ENTERS the family: a bare 401 with an EMPTY body and a bare 403 with
+///   an invalid-UTF-8 body both classify as `upstream_auth_blocked`, never
+///   quarantine, and arm the sized cooldown (120s base with no Retry-After,
+///   900s for RA=1200 through the lifted ceiling). Family membership keys off
+///   the effective status, so every malformed-body shape shares one code path;
+///   the 30s floor and the remaining Retry-After fixtures stay pinned by the
+///   pure sizing table
+///   `unknown_403_auth_block_backoff_honors_retry_after_up_to_the_900s_ceiling`.
+/// * what must NOT enter it: a keyword 403 quarantines with ZERO backoff rows
+///   on any scope, a 500 arms nothing even with RA=600 on the wire, and a 429
+///   keeps the rate-limit ladder (RA=600 clamps to 300, not the family's 900).
+/// Each row lands on a fresh pooled key, so the run re-proves selector
+/// avoidance row by row. ROW ORDER IS LOAD-BEARING: the token's primary
+/// affinity re-serves a still-eligible key on the next acquisition, so every
+/// row except the last must leave its key ineligible (cooled or quarantined) —
+/// the one row that arms nothing (`upstream-500`) therefore runs last.
+#[tokio::test]
+async fn tavily_auth_block_family_boundary_live_rows() {
+    let rows = [
+        MatrixFamilyRow {
+            label: "bare-401-empty-body",
+            status: StatusCode::UNAUTHORIZED,
+            retry_after: None,
+            body: b"",
+            expected_kind: FAILURE_KIND_UPSTREAM_AUTH_BLOCKED,
+            expected_effect: KEY_EFFECT_TRANSIENT_BACKOFF_SET,
+            expected_reason: Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED),
+            expected_secs: Some(120),
+            expect_quarantine: false,
+        },
+        MatrixFamilyRow {
+            label: "bare-403-invalid-utf8-ra-above-ceiling",
+            status: StatusCode::FORBIDDEN,
+            retry_after: Some("1200"),
+            body: b"\xff\xfe\x00\x80 garbage",
+            expected_kind: FAILURE_KIND_UPSTREAM_AUTH_BLOCKED,
+            expected_effect: KEY_EFFECT_TRANSIENT_BACKOFF_SET,
+            expected_reason: Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED),
+            expected_secs: Some(900),
+            expect_quarantine: false,
+        },
+        MatrixFamilyRow {
+            label: "keyword-403-quarantine",
+            status: StatusCode::FORBIDDEN,
+            retry_after: Some("600"),
+            body: br#"{"detail":{"error":"The account associated with this API key has been deactivated."}}"#,
+            expected_kind: FAILURE_KIND_UPSTREAM_ACCOUNT_DEACTIVATED_401,
+            expected_effect: KEY_EFFECT_QUARANTINED,
+            expected_reason: None,
+            expected_secs: None,
+            expect_quarantine: true,
+        },
+        MatrixFamilyRow {
+            label: "rate-limited-429",
+            status: StatusCode::TOO_MANY_REQUESTS,
+            retry_after: Some("600"),
+            body: br#"{"detail":"Excessive requests"}"#,
+            expected_kind: FAILURE_KIND_UPSTREAM_RATE_LIMITED_429,
+            expected_effect: KEY_EFFECT_TRANSIENT_BACKOFF_SET,
+            expected_reason: Some(FAILURE_KIND_UPSTREAM_RATE_LIMITED_429),
+            expected_secs: Some(300),
+            expect_quarantine: false,
+        },
+        // LAST on purpose: this is the only row that arms nothing, so its key
+        // stays eligible and the affinity lane would hand the SAME key to a
+        // following row.
+        MatrixFamilyRow {
+            label: "upstream-500",
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            retry_after: Some("600"),
+            body: br#"{"detail":"upstream boom"}"#,
+            expected_kind: FAILURE_KIND_OTHER,
+            expected_effect: KEY_EFFECT_NONE,
+            expected_reason: None,
+            expected_secs: None,
+            expect_quarantine: false,
+        },
+    ];
+
+    let (proxy, _clock) = spawn_matrix_proxy("health-matrix-auth-block-boundary").await;
+    let secrets = [
+        "mtx-ab-b1",
+        "mtx-ab-b2",
+        "mtx-ab-b3",
+        "mtx-ab-b4",
+        "mtx-ab-b5",
+    ];
+    let key_ids = seed_tavily_matrix_keys(&proxy, &secrets).await;
+    let token_id = "hmx-ab-boundary-token";
+    seed_matrix_auth_token(&proxy, token_id).await;
+    let hits = matrix_upstream_hits();
+    let recipes = rows
+        .iter()
+        .map(|row| MatrixUpstreamRecipe {
+            status: row.status,
+            retry_after: row.retry_after,
+            body: row.body,
+        })
+        .collect::<Vec<_>>();
+    let addr = spawn_matrix_upstream(recipes, Arc::clone(&hits)).await;
+    let usage_base = format!("http://{addr}");
+
+    let mut used_secrets: Vec<String> = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        let label = row.label;
+        let before = proxy.backend_time.now_ts();
+        let (resp, analysis) = matrix_live_search(&proxy, &usage_base, token_id).await;
+        assert_eq!(resp.status, row.status, "{label}");
+        assert_eq!(analysis.status, OUTCOME_ERROR, "{label}");
+        assert_eq!(
+            analysis.failure_kind.as_deref(),
+            Some(row.expected_kind),
+            "{label}"
+        );
+        assert_eq!(resp.key_effect_code, row.expected_effect, "{label}");
+
+        let seen = matrix_hits_seen(&hits);
+        assert_eq!(seen.len(), index + 1, "{label}: one upstream attempt");
+        let secret = seen[index].clone();
+        assert!(
+            !used_secrets.contains(&secret),
+            "{label}: every earlier row left its key cooled or quarantined, so the selector \
+             must hand out a fresh one"
+        );
+        used_secrets.push(secret.clone());
+        let key_index = secrets
+            .iter()
+            .position(|candidate| *candidate == secret)
+            .expect("the leased key is a pooled key");
+        let key_id = key_ids[key_index].clone();
+        assert_eq!(resp.api_key_id.as_deref(), Some(key_id.as_str()), "{label}");
+
+        let armed = matrix_backoff_row(&proxy, &key_id, HTTP_GLOBAL_BACKOFF_SCOPE).await;
+        if let (Some(reason), Some(secs)) = (row.expected_reason, row.expected_secs) {
+            let (armed_reason, cooldown_until, sized) = armed
+                .as_ref()
+                .unwrap_or_else(|| panic!("{label}: backoff armed"));
+            assert_eq!(armed_reason.as_str(), reason, "{label}");
+            if reason == FAILURE_KIND_UPSTREAM_AUTH_BLOCKED {
+                assert_eq!(
+                    analysis.key_health_action,
+                    KeyHealthAction::None,
+                    "{label}: a bare 401/403 cools, it never quarantines"
+                );
+            } else {
+                assert_ne!(
+                    armed_reason.as_str(),
+                    FAILURE_KIND_UPSTREAM_AUTH_BLOCKED,
+                    "{label}: the family code must not leak onto another signal"
+                );
+            }
+            assert_eq!(*sized, secs, "{label}");
+            assert_eq!(*cooldown_until, before + secs, "{label}");
+        } else {
+            assert!(armed.is_none(), "{label}: no http_global row");
+            assert_eq!(
+                matrix_backoff_row_count(&proxy, &key_id).await,
+                0,
+                "{label}: nothing armed on any scope"
+            );
+        }
+        if row.expect_quarantine {
+            assert_eq!(
+                active_quarantine_reason(&proxy, &key_id).await.as_deref(),
+                Some("account_deactivated"),
+                "{label}"
+            );
+        } else {
+            assert!(
+                active_quarantine_reason(&proxy, &key_id).await.is_none(),
+                "{label}"
+            );
+            assert_eq!(key_status(&proxy, &secret).await, "active", "{label}");
+        }
+        assert_eq!(
+            matrix_request_log_rows(&proxy, &key_id).await,
+            vec![(
+                Some(i64::from(row.status.as_u16())),
+                Some(row.expected_kind.to_string()),
+                Some(row.expected_effect.to_string())
+            )],
+            "{label}: one visible row"
+        );
+        std::eprintln!(
+            "[auth-block-matrix] boundary {label} status={} retry_after={:?} -> kind={} \
+             effect={} armed={armed:?} quarantine={}",
+            row.status.as_u16(),
+            row.retry_after,
+            row.expected_kind,
+            row.expected_effect,
+            row.expect_quarantine,
+        );
+    }
+    assert_eq!(
+        depletion_rows(&proxy).await,
+        0,
+        "neither the family nor its neighbours write depletion rows"
+    );
+}
+
+/// LIVE repeat-arm row (plan todo 3b, stale-state probe): three consecutive
+/// bare 403s on a single-key pool re-enter classification and the arm path
+/// every time, so the store's MAX(cooldown_until) upsert is exercised through
+/// the executor rather than by a direct store call — a shorter later hint keeps
+/// the longer armed deadline, a longer one extends it. The backend clock is
+/// ADVANCED between hits, so the extension is an absolute-deadline move, and
+/// the effect labels pin the arm's own report: only an EXTENDING arm re-labels
+/// the attempt `transient_backoff_set`.
+#[tokio::test]
+async fn tavily_auth_block_repeat_live_hits_extend_and_never_shorten_cooldown() {
+    let (proxy, clock) = spawn_matrix_proxy("health-matrix-auth-block-rearm").await;
+    let secrets = ["mtx-ab-rearm-only"];
+    let key_ids = seed_tavily_matrix_keys(&proxy, &secrets).await;
+    let key_id = key_ids.first().expect("seeded key").clone();
+    let token_id = "hmx-ab-rearm-token";
+    seed_matrix_auth_token(&proxy, token_id).await;
+    let hits = matrix_upstream_hits();
+    let blocked_body: &'static [u8] = br#"{"detail":"Forbidden"}"#;
+    let addr = spawn_matrix_upstream(
+        vec![
+            MatrixUpstreamRecipe {
+                status: StatusCode::FORBIDDEN,
+                retry_after: Some("600"),
+                body: blocked_body,
+            },
+            MatrixUpstreamRecipe {
+                status: StatusCode::FORBIDDEN,
+                retry_after: None,
+                body: blocked_body,
+            },
+            MatrixUpstreamRecipe {
+                status: StatusCode::FORBIDDEN,
+                retry_after: Some("900"),
+                body: blocked_body,
+            },
+        ],
+        Arc::clone(&hits),
+    )
+    .await;
+    let usage_base = format!("http://{addr}");
+    let t0 = proxy.backend_time.now_ts();
+
+    // Hit 1 — RA=600 arms the family's full 600s (todo 2's lifted ceiling).
+    let (first_resp, first_analysis) = matrix_live_search(&proxy, &usage_base, token_id).await;
+    assert_eq!(
+        first_analysis.failure_kind.as_deref(),
+        Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED)
+    );
+    assert_eq!(first_resp.key_effect_code, KEY_EFFECT_TRANSIENT_BACKOFF_SET);
+    let first_row = matrix_backoff_row(&proxy, &key_id, HTTP_GLOBAL_BACKOFF_SCOPE)
+        .await
+        .expect("armed after hit 1");
+    assert_eq!(
+        first_row,
+        (
+            FAILURE_KIND_UPSTREAM_AUTH_BLOCKED.to_string(),
+            t0 + 600,
+            600
+        )
+    );
+
+    // Hit 2 — 300s later with NO Retry-After: sizing asks for t0+300+120,
+    // earlier than the armed t0+600, so the deadline must not move.
+    clock.advance_wall(Duration::from_secs(300));
+    let t1 = proxy.backend_time.now_ts();
+    assert_eq!(t1, t0 + 300);
+    let (second_resp, second_analysis) = matrix_live_search(&proxy, &usage_base, token_id).await;
+    assert_eq!(
+        second_analysis.failure_kind.as_deref(),
+        Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED),
+        "the repeat hit re-enters the family"
+    );
+    assert_eq!(
+        second_resp.key_effect_code, KEY_EFFECT_NONE,
+        "a non-extending re-arm reports no NEW cooldown, so the label stays none"
+    );
+    let second_row = matrix_backoff_row(&proxy, &key_id, HTTP_GLOBAL_BACKOFF_SCOPE)
+        .await
+        .expect("still armed after hit 2");
+    assert_eq!(
+        second_row, first_row,
+        "a shorter re-arm never shortens the armed cooldown"
+    );
+    assert_eq!(
+        second_row.1 - t1,
+        300,
+        "300s of the original cooldown remain"
+    );
+
+    // Hit 3 — 60s later with RA=900: t0+360+900 beats the armed deadline.
+    clock.advance_wall(Duration::from_secs(60));
+    let t2 = proxy.backend_time.now_ts();
+    assert_eq!(t2, t0 + 360);
+    let (third_resp, third_analysis) = matrix_live_search(&proxy, &usage_base, token_id).await;
+    assert_eq!(
+        third_analysis.failure_kind.as_deref(),
+        Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED)
+    );
+    assert_eq!(third_resp.key_effect_code, KEY_EFFECT_TRANSIENT_BACKOFF_SET);
+    let third_row = matrix_backoff_row(&proxy, &key_id, HTTP_GLOBAL_BACKOFF_SCOPE)
+        .await
+        .expect("still armed after hit 3");
+    assert_eq!(
+        third_row,
+        (
+            FAILURE_KIND_UPSTREAM_AUTH_BLOCKED.to_string(),
+            t2 + 900,
+            900
+        ),
+        "a longer later hint extends the absolute deadline"
+    );
+    assert!(
+        third_row.1 > second_row.1,
+        "the cooldown grew, never shrank"
+    );
+
+    assert_eq!(
+        matrix_hits_seen(&hits),
+        vec![secrets[0].to_string(); 3],
+        "the single pooled key is re-leased for every repeat hit"
+    );
+    assert_eq!(
+        matrix_request_log_rows(&proxy, &key_id).await,
+        vec![
+            (
+                Some(403),
+                Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED.to_string()),
+                Some(KEY_EFFECT_TRANSIENT_BACKOFF_SET.to_string())
+            ),
+            (
+                Some(403),
+                Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED.to_string()),
+                Some(KEY_EFFECT_NONE.to_string())
+            ),
+            (
+                Some(403),
+                Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED.to_string()),
+                Some(KEY_EFFECT_TRANSIENT_BACKOFF_SET.to_string())
+            ),
+        ],
+        "every repeat hit stays visible with its family label"
+    );
+    assert_eq!(
+        key_status(&proxy, secrets[0]).await,
+        "active",
+        "repeat blocks cool the key, they never exhaust it"
+    );
+    assert!(active_quarantine_reason(&proxy, &key_id).await.is_none());
+    assert_eq!(depletion_rows(&proxy).await, 0);
+    std::eprintln!(
+        "[auth-block-matrix] live-rearm key={key_id} hits=3 deadline=[t0+{}, t0+{} (kept), \
+         t0+{} (extended)] sized=[{}, {}, {}] effects=[set, none, set]",
+        first_row.1 - t0,
+        second_row.1 - t0,
+        third_row.1 - t0,
+        first_row.2,
+        second_row.2,
+        third_row.2,
+    );
+}
