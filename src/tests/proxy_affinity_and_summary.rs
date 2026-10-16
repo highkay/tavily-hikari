@@ -2294,3 +2294,165 @@ async fn summary_windows_count_distinct_upstream_exhausted_keys() {
 
     let _ = std::fs::remove_file(db_path);
 }
+
+fn sizing_headers_for_retry_after(retry_after: Option<&str>) -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(value) = retry_after {
+        headers.insert(
+            "retry-after",
+            reqwest::header::HeaderValue::from_str(value).expect("retry-after header value"),
+        );
+    }
+    headers
+}
+
+/// Auth-block family sizing pin (plan provider-key-429-retry todo 2): a 120s
+/// base when the upstream sends no Retry-After and a [30, 900] clamp for parsed
+/// values, so an upstream RA=600 arms a 600s cooldown instead of being
+/// truncated to the minute ladder's old 300s ceiling. Both auth-block reason
+/// literals - the dedicated code from plan todo 1 and the `upstream_unknown_403`
+/// it replaced, which retained rows still carry - must size identically.
+#[test]
+fn unknown_403_auth_block_backoff_honors_retry_after_up_to_the_900s_ceiling() {
+    let now = 1_700_000_000_i64;
+    let fixtures: [(&str, Option<&str>, i64); 13] = [
+        ("no-retry-after", None, 120),
+        ("retry-after=empty", Some(""), 120),
+        ("retry-after=29", Some("29"), 30),
+        ("retry-after=30", Some("30"), 30),
+        ("retry-after=300", Some("300"), 300),
+        ("retry-after=301", Some("301"), 301),
+        ("retry-after=600", Some("600"), 600),
+        ("retry-after=900", Some("900"), 900),
+        ("retry-after=901", Some("901"), 900),
+        ("retry-after=7200", Some("7200"), 900),
+        ("retry-after=negative", Some("-5"), 30),
+        ("retry-after=overflow", Some("99999999999999999999"), 120),
+        ("retry-after=invalid", Some("invalid"), 120),
+    ];
+    for reason_code in [
+        FAILURE_KIND_UPSTREAM_AUTH_BLOCKED,
+        FAILURE_KIND_UPSTREAM_UNKNOWN_403,
+    ] {
+        for (label, retry_after, expected) in fixtures {
+            let headers = sizing_headers_for_retry_after(retry_after);
+            let secs = TavilyProxy::transient_backoff_retry_after_secs(&headers, now, reason_code);
+            std::eprintln!(
+                "[auth-block-sizing] reason={reason_code} fixture={label} -> cooldown_secs={secs}"
+            );
+            assert_eq!(secs, expected, "auth-block family {reason_code} {label}");
+        }
+    }
+}
+
+/// Companion pin for todo 2: lifting the auth-block ceiling must not move the
+/// rate-limited ladder, which keeps its 60s base and [30, 300] clamp.
+#[test]
+fn proxy_affinity_rate_limited_backoff_keeps_the_300s_ladder_ceiling() {
+    let now = 1_700_000_000_i64;
+    let fixtures: [(&str, Option<&str>, i64); 4] = [
+        ("no-retry-after", None, 60),
+        ("retry-after=5", Some("5"), 30),
+        ("retry-after=600", Some("600"), 300),
+        ("retry-after=7200", Some("7200"), 300),
+    ];
+    for (label, retry_after, expected) in fixtures {
+        let headers = sizing_headers_for_retry_after(retry_after);
+        let secs = TavilyProxy::transient_backoff_retry_after_secs(
+            &headers,
+            now,
+            FAILURE_KIND_UPSTREAM_RATE_LIMITED_429,
+        );
+        std::eprintln!(
+            "[rate-limited-sizing] reason={FAILURE_KIND_UPSTREAM_RATE_LIMITED_429} fixture={label} -> cooldown_secs={secs}"
+        );
+        assert_eq!(secs, expected, "rate-limited ladder {label}");
+    }
+}
+
+/// Stale-state pin for todo 2: re-arming the auth-block family with a shorter
+/// value keeps the longer armed cooldown, because the store upserts with
+/// MAX(cooldown_until) - repeated hits extend, never shorten, a cooldown.
+#[tokio::test]
+async fn unknown_403_auth_block_backoff_rearm_extends_and_never_shortens_cooldown() {
+    let db_path = temp_db_path("auth-block-backoff-max-upsert");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy = TavilyProxy::with_endpoint(
+        vec!["tvly-auth-block-max-upsert-a".to_string()],
+        DEFAULT_UPSTREAM,
+        &db_str,
+    )
+    .await
+    .expect("proxy created");
+    let rows = sqlx::query_as::<_, (String, String)>(
+        "SELECT id, api_key FROM api_keys ORDER BY api_key ASC",
+    )
+    .fetch_all(&proxy.key_store.pool)
+    .await
+    .expect("fetch keys");
+    let key_id = rows.first().expect("seeded key").0.clone();
+    let now = Utc::now().timestamp();
+
+    let long_secs = TavilyProxy::transient_backoff_retry_after_secs(
+        &sizing_headers_for_retry_after(Some("600")),
+        now,
+        FAILURE_KIND_UPSTREAM_AUTH_BLOCKED,
+    );
+    assert_eq!(long_secs, 600, "RA=600 must not be truncated to 300");
+    let armed = proxy
+        .key_store
+        .arm_api_key_transient_backoff(ApiKeyTransientBackoffArm {
+            key_id: &key_id,
+            scope: HTTP_GLOBAL_BACKOFF_SCOPE,
+            cooldown_until: now + long_secs,
+            retry_after_secs: long_secs,
+            reason_code: Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED),
+            source_request_log_id: None,
+            now,
+        })
+        .await
+        .expect("arm long auth-block cooldown");
+    assert_eq!(
+        armed.expect("first arm reports state").cooldown_until,
+        now + 600
+    );
+
+    let short_secs = TavilyProxy::transient_backoff_retry_after_secs(
+        &sizing_headers_for_retry_after(None),
+        now,
+        FAILURE_KIND_UPSTREAM_AUTH_BLOCKED,
+    );
+    assert_eq!(short_secs, 120, "no Retry-After arms the 120s base");
+    let rearmed = proxy
+        .key_store
+        .arm_api_key_transient_backoff(ApiKeyTransientBackoffArm {
+            key_id: &key_id,
+            scope: HTTP_GLOBAL_BACKOFF_SCOPE,
+            cooldown_until: now + short_secs,
+            retry_after_secs: short_secs,
+            reason_code: Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED),
+            source_request_log_id: None,
+            now,
+        })
+        .await
+        .expect("rearm shorter auth-block cooldown");
+    assert!(
+        rearmed.is_none(),
+        "a shorter re-arm must not report a new cooldown"
+    );
+
+    let state = proxy
+        .key_store
+        .api_key_transient_backoff_state(&key_id, HTTP_GLOBAL_BACKOFF_SCOPE)
+        .await
+        .expect("read auth-block backoff state")
+        .expect("cooldown still armed");
+    std::eprintln!(
+        "[auth-block-sizing] rearm fixture=no-retry-after over armed=600 -> cooldown_secs={}",
+        state.cooldown_until - now
+    );
+    assert_eq!(state.cooldown_until, now + 600);
+    assert_eq!(state.retry_after_secs, 600);
+
+    let _ = std::fs::remove_file(db_path);
+}

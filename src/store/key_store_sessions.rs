@@ -186,14 +186,22 @@ impl KeyStore {
         Ok(())
     }
 
+    /// Clear the still-active transient backoffs of one key across `scopes`.
+    ///
+    /// `reason_codes` is a list because one behavioural family can carry more
+    /// than one literal: the auth-block family is `upstream_auth_blocked` (plan
+    /// provider-key-429-retry todo 1) plus the `upstream_unknown_403` it
+    /// replaced, which retained rows and the legacy read models still hold. A
+    /// single statement keeps the clear atomic, so a later success lifts the
+    /// whole family instead of leaving the longer ceiling armed.
     pub(crate) async fn clear_api_key_transient_backoffs(
         &self,
         key_id: &str,
         scopes: &[&str],
-        reason_code: &str,
+        reason_codes: &[&str],
         now: i64,
     ) -> Result<i64, ProxyError> {
-        if scopes.is_empty() {
+        if scopes.is_empty() || reason_codes.is_empty() {
             return Ok(0);
         }
 
@@ -203,8 +211,14 @@ impl KeyStore {
         builder.push_bind(key_id);
         builder.push(" AND cooldown_until > ");
         builder.push_bind(now);
-        builder.push(" AND reason_code = ");
-        builder.push_bind(reason_code);
+        builder.push(" AND reason_code IN (");
+        {
+            let mut separated = builder.separated(", ");
+            for reason_code in reason_codes {
+                separated.push_bind(*reason_code);
+            }
+        }
+        builder.push(")");
         builder.push(" AND scope IN (");
         {
             let mut separated = builder.separated(", ");

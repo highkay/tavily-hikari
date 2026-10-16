@@ -166,13 +166,19 @@ impl TavilyProxy {
                     .maybe_arm_mcp_session_init_backoff(&lease.id, &headers, &outcome)
                     .await?;
                 if key_effect.code == KEY_EFFECT_NONE && armed_mcp_init_backoff {
-                    key_effect =
-                        if outcome.failure_kind.as_deref() == Some(FAILURE_KIND_UPSTREAM_UNKNOWN_403)
-                        {
-                            Self::transient_backoff_set_effect()
-                        } else {
-                            Self::mcp_session_init_backoff_effect()
-                        };
+                    // The auth-block family keeps the `transient_backoff_set`
+                    // label (plan provider-key-429-retry todo 1-2): a bare
+                    // 401/403 arm is a transient key cooldown, and only the
+                    // rate-limit ladder arms the MCP-init labelled backoff.
+                    key_effect = if outcome
+                        .failure_kind
+                        .as_deref()
+                        .is_some_and(Self::is_auth_block_transient_backoff_reason)
+                    {
+                        Self::transient_backoff_set_effect()
+                    } else {
+                        Self::mcp_session_init_backoff_effect()
+                    };
                 }
                 let selection_effect = mcp_session_init_effect.clone();
 

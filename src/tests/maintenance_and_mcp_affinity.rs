@@ -1518,7 +1518,7 @@ async fn unknown_403_temporarily_cools_key_without_quarantine_and_success_clears
     assert_eq!(first_resp.status, StatusCode::FORBIDDEN);
     assert_eq!(
         first_analysis.failure_kind.as_deref(),
-        Some(FAILURE_KIND_UPSTREAM_UNKNOWN_403),
+        Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED),
     );
     assert_eq!(first_resp.key_effect_code, KEY_EFFECT_TRANSIENT_BACKOFF_SET);
 
@@ -1784,7 +1784,7 @@ async fn unknown_403_api_rebalance_cools_key_and_next_request_avoids_it() {
     );
     assert_eq!(
         first_analysis.failure_kind.as_deref(),
-        Some(FAILURE_KIND_UPSTREAM_UNKNOWN_403),
+        Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED),
     );
     assert_eq!(first_resp.key_effect_code, KEY_EFFECT_TRANSIENT_BACKOFF_SET);
 
@@ -2514,6 +2514,202 @@ async fn mcp_session_init_uses_least_bad_key_even_when_every_pool_candidate_is_c
     assert_eq!(
         selection.key_effect.code,
         KEY_EFFECT_MCP_SESSION_INIT_COOLDOWN_AVOIDED,
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+/// End-to-end pin for plan provider-key-429-retry todo 2: a bare Tavily 403
+/// (auth-block family, plan todo 1) carrying a long upstream Retry-After arms
+/// the FULL hint instead of the old 300s truncation, stays a transient cooldown
+/// rather than a quarantine, and a later quota-sync success clears the row even
+/// though it is written with the new reason literal.
+#[tokio::test]
+async fn unknown_403_auth_block_retry_after_600_arms_full_hint_and_success_clears_it() {
+    let db_path = temp_db_path("auth-block-retry-after-600");
+    let db_str = db_path.to_string_lossy().to_string();
+    let proxy = TavilyProxy::with_endpoint(
+        vec![
+            "tvly-auth-block-ra600-a".to_string(),
+            "tvly-auth-block-ra600-b".to_string(),
+        ],
+        DEFAULT_UPSTREAM,
+        &db_str,
+    )
+    .await
+    .expect("proxy created");
+    proxy
+        .set_mcp_session_affinity_key_count(2)
+        .await
+        .expect("set stable pool size");
+    let token = proxy
+        .create_access_token(Some("auth-block-ra600"))
+        .await
+        .expect("create token");
+    let project_id = "auth-block-ra600-project";
+    let project_hash = sha256_hex(project_id);
+    let subject = format!("token:{}:route:{}", token.id, project_hash);
+    let ranked = rank_mcp_affinity_key_ids(
+        &subject,
+        fetch_all_api_key_ids(&proxy.key_store.pool).await,
+        2,
+    );
+    let blocked_key_id = ranked[0].clone();
+    let key_rows =
+        sqlx::query_as::<_, (String, String)>("SELECT id, api_key FROM api_keys ORDER BY id ASC")
+            .fetch_all(&proxy.key_store.pool)
+            .await
+            .expect("fetch key rows");
+    let blocked_secret = key_rows
+        .iter()
+        .find(|(id, _)| id == &blocked_key_id)
+        .map(|(_, secret)| secret.clone())
+        .expect("blocked key secret");
+    proxy
+        .key_store
+        .set_api_route_api_key_affinity(
+            &format!("token:{}", token.id),
+            &project_hash,
+            &blocked_key_id,
+        )
+        .await
+        .expect("seed project binding");
+
+    let app = Router::new()
+        .route(
+            "/search",
+            post(move |Json(body): Json<Value>| {
+                let blocked_secret = blocked_secret.clone();
+                async move {
+                    let api_key = body
+                        .get("api_key")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if api_key == blocked_secret {
+                        (
+                            StatusCode::FORBIDDEN,
+                            [(axum::http::header::RETRY_AFTER, "600")],
+                            Json(serde_json::json!({ "error": "Forbidden" })),
+                        )
+                            .into_response()
+                    } else {
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "status": 200,
+                                "results": [],
+                            })),
+                        )
+                            .into_response()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/usage",
+            get(move || async move {
+                Json(serde_json::json!({
+                    "key": { "limit": 1000, "usage": 1 },
+                    "account": { "plan_limit": 1000, "usage": 1 },
+                }))
+            }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .await
+            .unwrap();
+    });
+
+    let usage_base = format!("http://{}", addr);
+    let mut headers = HeaderMap::new();
+    headers.insert("content-type", HeaderValue::from_static("application/json"));
+    headers.insert("x-project-id", HeaderValue::from_static(project_id));
+    let options = serde_json::json!({ "query": "auth block retry-after" });
+    let now_before = Utc::now().timestamp();
+
+    let (first_resp, first_analysis) = proxy
+        .proxy_http_json_endpoint(
+            &usage_base,
+            "/search",
+            Some(&token.id),
+            true,
+            Some(project_id),
+            Some(project_id),
+            &Method::POST,
+            "/api/tavily/search",
+            options.clone(),
+            &headers,
+            true,
+            None,
+        )
+        .await
+        .expect("auth-block request should complete");
+    let now_after = Utc::now().timestamp();
+    assert_eq!(first_resp.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        first_analysis.failure_kind.as_deref(),
+        Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED),
+    );
+    assert_eq!(first_resp.key_effect_code, KEY_EFFECT_TRANSIENT_BACKOFF_SET);
+
+    let armed = proxy
+        .key_store
+        .list_active_api_key_transient_backoffs(
+            std::slice::from_ref(&blocked_key_id),
+            API_REBALANCE_HTTP_BACKOFF_SCOPE,
+            now_after,
+        )
+        .await
+        .expect("load armed auth-block cooldowns");
+    let state = armed
+        .get(&blocked_key_id)
+        .expect("auth-block cooldown armed for the blocked key");
+    // Before todo 2 this clamped to MCP_SESSION_INIT_BACKOFF_MAX_SECS (300).
+    assert_eq!(state.retry_after_secs, 600);
+    assert!(
+        state.cooldown_until >= now_before + 600 && state.cooldown_until <= now_after + 600,
+        "cooldown_until {} must be the arm time plus the full 600s hint",
+        state.cooldown_until
+    );
+    let reason: Option<String> = sqlx::query_scalar(
+        "SELECT reason_code FROM api_key_transient_backoffs WHERE key_id = ? AND scope = ?",
+    )
+    .bind(&blocked_key_id)
+    .bind(API_REBALANCE_HTTP_BACKOFF_SCOPE)
+    .fetch_optional(&proxy.key_store.pool)
+    .await
+    .expect("read armed reason code");
+    assert_eq!(reason.as_deref(), Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED));
+
+    let quarantine_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM api_key_quarantines WHERE key_id = ? AND cleared_at IS NULL",
+    )
+    .bind(&blocked_key_id)
+    .fetch_one(&proxy.key_store.pool)
+    .await
+    .expect("count quarantine rows");
+    assert_eq!(quarantine_count, 0);
+
+    let (limit, remaining) = proxy
+        .sync_key_quota(&blocked_key_id, &usage_base, "test-quota-sync")
+        .await
+        .expect("quota sync should clear the auth-block cooldown");
+    assert_eq!((limit, remaining), (1000, 999));
+    let still_cooled = proxy
+        .key_store
+        .list_active_api_key_transient_backoffs(
+            std::slice::from_ref(&blocked_key_id),
+            API_REBALANCE_HTTP_BACKOFF_SCOPE,
+            Utc::now().timestamp(),
+        )
+        .await
+        .expect("reload auth-block cooldowns");
+    assert!(
+        !still_cooled.contains_key(&blocked_key_id),
+        "a success must clear the new-literal auth-block row"
     );
 
     let _ = std::fs::remove_file(db_path);

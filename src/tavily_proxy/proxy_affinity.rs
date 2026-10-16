@@ -13,6 +13,18 @@ const BRAVE_RATE_LIMITED_BACKOFF_MAX_SECS: i64 = 30;
 /// SerpApi's dual 429 is exhaustion, never this lane.
 const SERPAPI_RATE_LIMITED_BACKOFF_DEFAULT_SECS: i64 = 3600;
 const SERPAPI_RATE_LIMITED_BACKOFF_MAX_SECS: i64 = 3600;
+/// Auth-block family transient backoff range (plan provider-key-429-retry todo
+/// 2): a bare 401/403 block is key-scoped and outlives the minute-scale
+/// rate-limit ladder, so the family keeps its 120s no-Retry-After base
+/// (`UNKNOWN_403_TRANSIENT_BACKOFF_DEFAULT_SECS`, historical name) but honors a
+/// parsed Retry-After up to a 900s ceiling instead of the ladder's 300s cap,
+/// which truncated an upstream RA=600 to 300. The floor stays the shared
+/// minute-ladder floor, and the store's MAX(cooldown_until) upsert keeps
+/// repeated arms extending - never shortening - an already armed cooldown.
+/// Only this family moves: the rate-limited ladder and the Brave/SerpApi
+/// provider ranges above keep their pinned values.
+const AUTH_BLOCK_TRANSIENT_BACKOFF_MIN_SECS: i64 = MCP_SESSION_INIT_BACKOFF_MIN_SECS;
+const AUTH_BLOCK_TRANSIENT_BACKOFF_MAX_SECS: i64 = 900;
 
 impl TavilyProxy {
     pub async fn lock_mcp_session_init(
@@ -262,23 +274,42 @@ impl TavilyProxy {
             Some(FAILURE_KIND_UPSTREAM_RATE_LIMITED_429) => {
                 Some(FAILURE_KIND_UPSTREAM_RATE_LIMITED_429)
             }
+            // Plan todo 1: bare 401/403 now classify as the dedicated auth-block
+            // family. `upstream_unknown_403` stays mapped because retained rows
+            // and the legacy read models still carry it.
+            Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED) => Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED),
             Some(FAILURE_KIND_UPSTREAM_UNKNOWN_403) => Some(FAILURE_KIND_UPSTREAM_UNKNOWN_403),
             _ => None,
         }
     }
 
-    fn transient_backoff_retry_after_secs(
+    /// True for the auth-block family: the dedicated `upstream_auth_blocked`
+    /// code (plan todo 1) plus the `upstream_unknown_403` it replaced, which
+    /// retained rows and the legacy read models still arm with.
+    fn is_auth_block_transient_backoff_reason(reason_code: &str) -> bool {
+        reason_code == FAILURE_KIND_UPSTREAM_AUTH_BLOCKED
+            || reason_code == FAILURE_KIND_UPSTREAM_UNKNOWN_403
+    }
+
+    /// Auth-block sizing (plan todo 2): 120s base when the upstream sends no
+    /// Retry-After, parsed values clamped to [30, 900] so a long upstream hint
+    /// such as RA=600 survives instead of being truncated to the ladder's 300s.
+    fn auth_block_transient_backoff_secs(headers: &HeaderMap, now: i64) -> i64 {
+        Self::parse_retry_after_secs(headers, now)
+            .unwrap_or(UNKNOWN_403_TRANSIENT_BACKOFF_DEFAULT_SECS)
+            .clamp(
+                AUTH_BLOCK_TRANSIENT_BACKOFF_MIN_SECS,
+                AUTH_BLOCK_TRANSIENT_BACKOFF_MAX_SECS,
+            )
+    }
+
+    pub(crate) fn transient_backoff_retry_after_secs(
         headers: &HeaderMap,
         now: i64,
         reason_code: &str,
     ) -> i64 {
-        if reason_code == FAILURE_KIND_UPSTREAM_UNKNOWN_403 {
-            return Self::parse_retry_after_secs(headers, now)
-                .unwrap_or(UNKNOWN_403_TRANSIENT_BACKOFF_DEFAULT_SECS)
-                .clamp(
-                    MCP_SESSION_INIT_BACKOFF_MIN_SECS,
-                    MCP_SESSION_INIT_BACKOFF_MAX_SECS,
-                );
+        if Self::is_auth_block_transient_backoff_reason(reason_code) {
+            return Self::auth_block_transient_backoff_secs(headers, now);
         }
         Self::mcp_session_init_retry_after_secs(headers, now)
     }
@@ -1603,18 +1634,27 @@ impl TavilyProxy {
     ) -> Result<KeyEffect, ProxyError> {
         let now = self.backend_time.now_ts();
         let before = self.key_store.fetch_key_state_snapshot(key_id).await?;
+        let scopes = [
+            MCP_SESSION_INIT_BACKOFF_SCOPE,
+            HTTP_PROJECT_AFFINITY_BACKOFF_SCOPE,
+            HTTP_GLOBAL_BACKOFF_SCOPE,
+            API_REBALANCE_HTTP_BACKOFF_SCOPE,
+            REBALANCE_MCP_HTTP_BACKOFF_SCOPE,
+        ];
+        // The auth-block family carries two reason literals (plan todo 1 renamed
+        // bare 401/403; retained rows still hold the old one), so a success
+        // clears both in one statement. Otherwise the longer ceiling armed by
+        // this lane would outlive the recovery that lifts it and the key would
+        // stay cooled until the cooldown expired on its own.
         let cleared = self
             .key_store
             .clear_api_key_transient_backoffs(
                 key_id,
+                &scopes,
                 &[
-                    MCP_SESSION_INIT_BACKOFF_SCOPE,
-                    HTTP_PROJECT_AFFINITY_BACKOFF_SCOPE,
-                    HTTP_GLOBAL_BACKOFF_SCOPE,
-                    API_REBALANCE_HTTP_BACKOFF_SCOPE,
-                    REBALANCE_MCP_HTTP_BACKOFF_SCOPE,
+                    FAILURE_KIND_UPSTREAM_AUTH_BLOCKED,
+                    FAILURE_KIND_UPSTREAM_UNKNOWN_403,
                 ],
-                FAILURE_KIND_UPSTREAM_UNKNOWN_403,
                 now,
             )
             .await?;
