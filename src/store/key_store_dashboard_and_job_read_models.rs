@@ -370,6 +370,10 @@ impl KeyStore {
         .fetch_one(&mut **tx)
         .await?;
 
+        // `temporary_isolated_keys` counts the whole auth-block family (plan
+        // provider-key-429-retry todo 20): the live `upstream_auth_blocked`
+        // code plus the retired `upstream_unknown_403` that historical rows
+        // still carry. One `IN (...)` predicate keeps the grouped scan single.
         let key_counts_row = sqlx::query(
             r#"
             SELECT
@@ -384,7 +388,7 @@ impl KeyStore {
                 SELECT key_id, MAX(cooldown_until) AS cooldown_until
                 FROM api_key_transient_backoffs
                 WHERE cooldown_until > strftime('%s', 'now')
-                  AND reason_code = 'upstream_unknown_403'
+                  AND reason_code IN ('upstream_auth_blocked', 'upstream_unknown_403')
                 GROUP BY key_id
             ) AS tb
               ON tb.key_id = ak.id

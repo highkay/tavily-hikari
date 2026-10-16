@@ -1372,6 +1372,243 @@ async fn unknown_403_transient_backoff_is_reported_as_temporary_isolated_key() {
     let _ = std::fs::remove_file(db_path);
 }
 
+/// Plan provider-key-429-retry todo 20: both store read models must recognize
+/// the whole auth-block family. Seeds the live `upstream_auth_blocked` code, the
+/// retired `upstream_unknown_403` code, one key holding both literals on
+/// different scopes, and an unrelated `upstream_rate_limited_429` arm that must
+/// stay out; then pins /api/summary plus the admin key-metrics facet, filter and
+/// detail to exactly the family rows, each reporting the reason it armed with.
+#[tokio::test]
+async fn summary_auth_block_family_transient_backoff_is_reported_as_temporary_isolated_key() {
+    let db_path = temp_db_path("temporary-isolated-key-auth-block-family");
+    let db_str = db_path.to_string_lossy().to_string();
+
+    let proxy = TavilyProxy::with_endpoint(
+        vec![
+            "tvly-auth-block-new".to_string(),
+            "tvly-auth-block-legacy".to_string(),
+            "tvly-auth-block-both".to_string(),
+            "tvly-rate-limited-only".to_string(),
+        ],
+        DEFAULT_UPSTREAM,
+        &db_str,
+    )
+    .await
+    .expect("proxy created");
+
+    let rows = sqlx::query_as::<_, (String, String)>(
+        "SELECT id, api_key FROM api_keys ORDER BY api_key ASC",
+    )
+    .fetch_all(&proxy.key_store.pool)
+    .await
+    .expect("fetch keys");
+    let id_of = |secret: &str| -> String {
+        rows.iter()
+            .find_map(|(id, api_key)| (api_key == secret).then(|| id.clone()))
+            .unwrap_or_else(|| panic!("key {secret} exists"))
+    };
+    let new_id = id_of("tvly-auth-block-new");
+    let legacy_id = id_of("tvly-auth-block-legacy");
+    let both_id = id_of("tvly-auth-block-both");
+    let rate_limited_id = id_of("tvly-rate-limited-only");
+    let now = Utc::now().timestamp();
+
+    for (key_id, scope, reason_code, cooldown_until, retry_after_secs) in [
+        (
+            new_id.as_str(),
+            HTTP_GLOBAL_BACKOFF_SCOPE,
+            FAILURE_KIND_UPSTREAM_AUTH_BLOCKED,
+            now + 120,
+            120,
+        ),
+        (
+            legacy_id.as_str(),
+            HTTP_GLOBAL_BACKOFF_SCOPE,
+            FAILURE_KIND_UPSTREAM_UNKNOWN_403,
+            now + 600,
+            600,
+        ),
+        // One key, two scopes, one literal each: the family read merges them
+        // into a single `temporary_isolated` row.
+        (
+            both_id.as_str(),
+            HTTP_GLOBAL_BACKOFF_SCOPE,
+            FAILURE_KIND_UPSTREAM_UNKNOWN_403,
+            now + 900,
+            900,
+        ),
+        (
+            both_id.as_str(),
+            HTTP_PROJECT_AFFINITY_BACKOFF_SCOPE,
+            FAILURE_KIND_UPSTREAM_AUTH_BLOCKED,
+            now + 300,
+            300,
+        ),
+        // Not an auth-block code: it must never reach the family read models.
+        (
+            rate_limited_id.as_str(),
+            HTTP_GLOBAL_BACKOFF_SCOPE,
+            FAILURE_KIND_UPSTREAM_RATE_LIMITED_429,
+            now + 300,
+            300,
+        ),
+    ] {
+        let _ = proxy
+            .key_store
+            .arm_api_key_transient_backoff(ApiKeyTransientBackoffArm {
+                key_id,
+                scope,
+                cooldown_until,
+                retry_after_secs,
+                reason_code: Some(reason_code),
+                source_request_log_id: None,
+                now,
+            })
+            .await
+            .expect("arm transient backoff");
+    }
+
+    let summary = proxy.summary().await.expect("summary");
+    assert_eq!(summary.temporary_isolated_keys, 3);
+    assert_eq!(summary.active_keys, 1);
+    assert_eq!(summary.quarantined_keys, 0);
+
+    let page = proxy
+        .list_api_key_metrics_paged(1, 20, &[], &[], None, &[])
+        .await
+        .expect("list key metrics");
+    assert_eq!(
+        page.facets
+            .statuses
+            .iter()
+            .find(|facet| facet.value == "temporary_isolated")
+            .map(|facet| facet.count)
+            .unwrap_or_default(),
+        3
+    );
+    assert_eq!(
+        page.facets
+            .statuses
+            .iter()
+            .find(|facet| facet.value == STATUS_ACTIVE)
+            .map(|facet| facet.count)
+            .unwrap_or_default(),
+        1
+    );
+
+    let temporary_statuses = vec!["temporary_isolated".to_string()];
+    let temporary = proxy
+        .list_api_key_metrics_paged(1, 20, &[], &temporary_statuses, None, &[])
+        .await
+        .expect("filter temporary isolated keys");
+    assert_eq!(temporary.items.len(), 3);
+    assert!(
+        temporary
+            .items
+            .iter()
+            .all(|item| item.id != rate_limited_id),
+        "a non auth-block backoff reason must not join the temporary_isolated family"
+    );
+    let reported_reason = |id: &str| -> Option<String> {
+        temporary
+            .items
+            .iter()
+            .find(|item| item.id == id)
+            .and_then(|item| {
+                item.transient_backoff
+                    .as_ref()
+                    .map(|backoff| backoff.reason_code.clone())
+            })
+    };
+    assert_eq!(
+        reported_reason(&new_id).as_deref(),
+        Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED)
+    );
+    assert_eq!(
+        reported_reason(&legacy_id).as_deref(),
+        Some(FAILURE_KIND_UPSTREAM_UNKNOWN_403)
+    );
+    assert_eq!(
+        reported_reason(&both_id).as_deref(),
+        Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED),
+        "the live literal wins when a key holds both"
+    );
+
+    let both_item = temporary
+        .items
+        .iter()
+        .find(|item| item.id == both_id)
+        .expect("both-literal key listed");
+    let both_backoff = both_item
+        .transient_backoff
+        .as_ref()
+        .expect("both-literal backoff reported");
+    assert_eq!(
+        both_backoff.cooldown_until,
+        now + 900,
+        "the merged family row keeps the longest armed cooldown"
+    );
+    let mut scopes = both_backoff.scopes.clone();
+    scopes.sort();
+    let mut expected_scopes = vec![
+        HTTP_GLOBAL_BACKOFF_SCOPE.to_string(),
+        HTTP_PROJECT_AFFINITY_BACKOFF_SCOPE.to_string(),
+    ];
+    expected_scopes.sort();
+    assert_eq!(scopes, expected_scopes);
+
+    let active_statuses = vec![STATUS_ACTIVE.to_string()];
+    let active = proxy
+        .list_api_key_metrics_paged(1, 20, &[], &active_statuses, None, &[])
+        .await
+        .expect("filter active keys");
+    assert_eq!(active.items.len(), 1);
+    assert_eq!(
+        active.items.first().map(|item| item.id.as_str()),
+        Some(rate_limited_id.as_str()),
+        "only the non auth-block key stays plain active"
+    );
+
+    let detail = proxy
+        .get_api_key_metric(&new_id)
+        .await
+        .expect("fetch detail")
+        .expect("detail exists");
+    assert_eq!(
+        detail
+            .transient_backoff
+            .as_ref()
+            .map(|backoff| backoff.reason_code.as_str()),
+        Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED)
+    );
+
+    // Manual-QA channel (run with `-- --nocapture`): the summary and the admin
+    // key-metrics payloads with the new-literal row beside the legacy one.
+    // `std::eprintln!` on purpose - lib.rs mounts runtime_logging with
+    // #[macro_use], so a bare `eprintln!` inside this crate routes to a
+    // tracing event and never reaches the console.
+    std::eprintln!("[task-20][manual-qa] /api/summary = {summary:?}");
+    std::eprintln!(
+        "[task-20][manual-qa] status facets = {:?}",
+        page.facets.statuses
+    );
+    for item in &temporary.items {
+        std::eprintln!(
+            "[task-20][manual-qa] temporary_isolated item id={} status={} backoff={:?}",
+            item.id,
+            item.status,
+            item.transient_backoff
+        );
+    }
+    std::eprintln!(
+        "[task-20][manual-qa] detail id={} backoff={:?}",
+        detail.id,
+        detail.transient_backoff
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
 #[tokio::test]
 async fn quarantine_key_by_id_is_safe_under_concurrent_calls() {
     let db_path = temp_db_path("quarantine-concurrent");

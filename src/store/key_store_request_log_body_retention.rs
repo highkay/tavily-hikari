@@ -655,6 +655,16 @@ impl KeyStore {
         Ok(receipts)
     }
 
+    /// Shared FROM clause for every admin key-metrics read (list, detail,
+    /// facets, count). The `tb` subquery matches the whole auth-block family
+    /// (plan provider-key-429-retry todo 20): the live `upstream_auth_blocked`
+    /// code plus the retired `upstream_unknown_403` that historical rows still
+    /// carry, so a key armed with either reports as `temporary_isolated`.
+    /// `transient_backoff_reason_codes` keeps the family's distinct literals so
+    /// the mapper can report which one is armed instead of assuming the legacy
+    /// spelling; it stays inside the same grouped scan. The separator argument
+    /// is omitted on purpose: SQLite forbids it on a DISTINCT aggregate and the
+    /// built-in `,` is exactly what the mapper splits on.
     pub(crate) fn api_key_metrics_from_clause() -> &'static str {
         r#"
             FROM api_keys ak
@@ -677,10 +687,11 @@ impl KeyStore {
                     key_id,
                     MAX(cooldown_until) AS transient_backoff_cooldown_until,
                     MAX(retry_after_secs) AS transient_backoff_retry_after_secs,
-                    GROUP_CONCAT(scope, ',') AS transient_backoff_scopes
+                    GROUP_CONCAT(scope, ',') AS transient_backoff_scopes,
+                    GROUP_CONCAT(DISTINCT reason_code) AS transient_backoff_reason_codes
                 FROM api_key_transient_backoffs
                 WHERE cooldown_until > strftime('%s', 'now')
-                  AND reason_code = 'upstream_unknown_403'
+                  AND reason_code IN ('upstream_auth_blocked', 'upstream_unknown_403')
                 GROUP BY key_id
             ) AS tb
             ON tb.key_id = ak.id
@@ -718,6 +729,7 @@ impl KeyStore {
                 tb.transient_backoff_cooldown_until,
                 tb.transient_backoff_retry_after_secs,
                 tb.transient_backoff_scopes,
+                tb.transient_backoff_reason_codes,
                 COALESCE(stats.total_requests, 0) AS total_requests,
                 COALESCE(stats.success_count, 0) AS success_count,
                 COALESCE(stats.error_count, 0) AS error_count,
@@ -765,6 +777,8 @@ impl KeyStore {
         let transient_backoff_retry_after_secs: Option<i64> =
             row.try_get("transient_backoff_retry_after_secs")?;
         let transient_backoff_scopes: Option<String> = row.try_get("transient_backoff_scopes")?;
+        let transient_backoff_reason_codes: Option<String> =
+            row.try_get("transient_backoff_reason_codes")?;
         let is_temporary_isolated = status == STATUS_ACTIVE
             && quarantine_source.is_none()
             && transient_backoff_cooldown_until.is_some();
@@ -795,7 +809,9 @@ impl KeyStore {
                 created_at: quarantine_created_at.unwrap_or_default(),
             }),
             transient_backoff: is_temporary_isolated.then(|| ApiKeyTransientBackoff {
-                reason_code: FAILURE_KIND_UPSTREAM_UNKNOWN_403.to_string(),
+                reason_code: Self::reported_transient_backoff_reason_code(
+                    transient_backoff_reason_codes.as_deref(),
+                ),
                 cooldown_until: transient_backoff_cooldown_until.unwrap_or_default(),
                 retry_after_secs: transient_backoff_retry_after_secs.unwrap_or_default(),
                 scopes: transient_backoff_scopes
@@ -807,6 +823,25 @@ impl KeyStore {
                     .collect(),
             }),
         })
+    }
+
+    /// Reason code reported for a temporarily isolated key (plan
+    /// provider-key-429-retry todo 20). `api_key_transient_backoffs` is keyed
+    /// per scope, so one key can hold both auth-block literals at once and the
+    /// FROM clause hands over their distinct set. Report the live
+    /// `upstream_auth_blocked` whenever it is armed and fall back to the
+    /// retired `upstream_unknown_403` otherwise, which keeps legacy-only rows
+    /// byte-identical to the pre-todo-20 payload.
+    pub(crate) fn reported_transient_backoff_reason_code(reason_codes: Option<&str>) -> String {
+        let armed = reason_codes.unwrap_or_default();
+        if armed
+            .split(',')
+            .map(str::trim)
+            .any(|code| code == FAILURE_KIND_UPSTREAM_AUTH_BLOCKED)
+        {
+            return FAILURE_KIND_UPSTREAM_AUTH_BLOCKED.to_string();
+        }
+        FAILURE_KIND_UPSTREAM_UNKNOWN_403.to_string()
     }
 
     pub(crate) fn normalize_api_key_groups(groups: &[String]) -> Vec<String> {
