@@ -468,7 +468,8 @@ fn tavily_live_pipeline_outputs_stay_exact() {
         Some(FAILURE_KIND_UPSTREAM_RATE_LIMITED_429)
     );
 
-    // Given an unrecognized Tavily 403, Then the kind stays upstream_unknown_403
+    // Given a keyword-free Tavily 403, Then the kind is the auth-block family
+    // code (plan provider-key-429-retry todo 1 replaced upstream_unknown_403)
     assert_eq!(
         classify_failure_kind(
             "/mcp",
@@ -478,7 +479,275 @@ fn tavily_live_pipeline_outputs_stay_exact() {
             br#"{"error":"Forbidden"}"#
         )
         .as_deref(),
-        Some(FAILURE_KIND_UPSTREAM_UNKNOWN_403)
+        Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Plan provider-key-429-retry todo 1: Tavily bare 401/403 join a dedicated
+// auth-block family reason code so the cooldown lane (todo 2) can size it apart
+// from the generic `upstream_unknown_403` short backoff. 429/432 and the
+// keyword-bearing 401/403 quarantine path stay byte-identical.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tavily_bare_401_classifies_into_auth_block_family() {
+    // Given a 401 with NO quarantine keyword on both live call shapes, When
+    // classified, Then each lands on the auth-block family code
+    for (path, http_status) in [("/api/tavily/search", Some(401)), ("/mcp", Some(401))] {
+        assert_eq!(
+            classify_failure_kind(
+                path,
+                http_status,
+                Some(401),
+                None,
+                br#"{"error":"Unauthorized"}"#
+            )
+            .as_deref(),
+            Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED),
+            "path {path}"
+        );
+    }
+
+    // Given an EMPTY 401 body (no keyword can be present), Then it still
+    // classifies into the family instead of the generic `other` fallback
+    assert_eq!(
+        classify_failure_kind("/api/tavily/search", Some(401), Some(401), None, b"").as_deref(),
+        Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED)
+    );
+
+    // And the quarantine lane is untouched: no keyword means no decision
+    assert!(classify_quarantine_reason(Some(401), br#"{"error":"Unauthorized"}"#).is_none());
+
+    // And the provider-signal layer is byte-identical (401 was already AuthFailed)
+    assert_eq!(
+        classify(ProviderId::Tavily, 401, br#"{"error":"Unauthorized"}"#),
+        ProviderFailureSignal::AuthFailed
+    );
+}
+
+#[test]
+fn tavily_bare_403_classifies_into_auth_block_family() {
+    // Given a keyword-free 403 on the live HTTP path
+    let body = br#"{"detail":"Forbidden"}"#;
+
+    // When the attempt is analyzed, Then the reason code is the auth-block
+    // family and the reconcile action is NOT a quarantine (that needs a keyword)
+    let analysis = analyze_http_attempt(StatusCode::FORBIDDEN, body);
+    assert_eq!(
+        analysis.failure_kind.as_deref(),
+        Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED)
+    );
+    assert_eq!(analysis.key_health_action, KeyHealthAction::None);
+    assert_eq!(analysis.status, OUTCOME_ERROR);
+    assert_eq!(analysis.tavily_status_code, Some(403));
+
+    // And the MCP-shaped call (body-level 403 under HTTP 200) agrees
+    assert_eq!(
+        classify_failure_kind("/mcp", Some(200), Some(403), None, body).as_deref(),
+        Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED)
+    );
+
+    // And a NON-JSON 403 body classifies the same way (the branch never parses)
+    assert_eq!(
+        classify_failure_kind(
+            "/api/tavily/search",
+            Some(403),
+            Some(403),
+            None,
+            b"<html><head><title>403 Forbidden</title></head></html>"
+        )
+        .as_deref(),
+        Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED)
+    );
+
+    // And the provider-signal layer is byte-identical (403 was already AuthFailed)
+    assert_eq!(
+        classify(ProviderId::Tavily, 403, body),
+        ProviderFailureSignal::AuthFailed
+    );
+}
+
+#[test]
+fn tavily_keyword_403_stays_quarantine_not_auth_block_family() {
+    // Given a 403 whose body carries a quarantine keyword
+    let body = br#"{"detail":"Account deactivated"}"#;
+
+    // When classified, Then the quarantine literal wins, never the new family
+    assert_eq!(
+        classify_failure_kind("/api/tavily/search", Some(403), Some(403), None, body).as_deref(),
+        Some(FAILURE_KIND_UPSTREAM_ACCOUNT_DEACTIVATED_401)
+    );
+
+    // And the reconcile action QUARANTINES the key instead of cooling it: this
+    // row carries no transient-backoff reason code, so no cooldown is armed
+    let analysis = analyze_http_attempt(StatusCode::FORBIDDEN, body);
+    match &analysis.key_health_action {
+        KeyHealthAction::Quarantine(decision) => {
+            assert_eq!(decision.reason_code, BLOCKED_KEY_REASON_ACCOUNT_DEACTIVATED);
+        }
+        other => panic!("expected quarantine, got {other:?}"),
+    }
+    assert_ne!(
+        analysis.failure_kind.as_deref(),
+        Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED)
+    );
+}
+
+#[test]
+fn tavily_432_stays_exhausted_not_auth_block_family() {
+    // Given the Tavily exhaustion status
+    let body = b"{}";
+
+    // When analyzed, Then 432 keeps MarkExhausted and carries NO failure kind,
+    // so the Tavily-432-only depletion semantics never see the auth family
+    let analysis = analyze_http_attempt(StatusCode::from_u16(432).expect("432 status"), body);
+    assert_eq!(analysis.status, OUTCOME_QUOTA_EXHAUSTED);
+    assert_eq!(analysis.key_health_action, KeyHealthAction::MarkExhausted);
+    assert_eq!(analysis.failure_kind, None);
+    assert_eq!(analysis.key_effect.code, KEY_EFFECT_MARKED_EXHAUSTED);
+    assert!(low_quota_depletion_applies(
+        ProviderId::Tavily,
+        analysis.tavily_status_code
+    ));
+
+    // And the signal layer still reports Exhausted (todo 1 touched no signal)
+    assert_eq!(
+        classify(ProviderId::Tavily, 432, body),
+        ProviderFailureSignal::Exhausted
+    );
+
+    // And 429 keeps RateLimited with its Retry-After hint and reason code
+    assert_eq!(
+        classify(ProviderId::Tavily, 429, body),
+        ProviderFailureSignal::RateLimited {
+            retry_after_secs: None
+        }
+    );
+    assert_eq!(
+        classify_failure_kind("/mcp", Some(429), Some(429), None, body).as_deref(),
+        Some(FAILURE_KIND_UPSTREAM_RATE_LIMITED_429)
+    );
+}
+
+#[test]
+fn tavily_auth_block_family_keeps_precise_client_error_kinds() {
+    // Given a 401 whose body carries a precise CLIENT-side diagnosis, Then the
+    // diagnosis wins: the auth-block branch is matched last on purpose, so a
+    // client mistake never penalizes (and cools) an otherwise healthy key
+    assert_eq!(
+        classify_failure_kind(
+            "/mcp",
+            Some(401),
+            Some(401),
+            None,
+            b"must accept both application/json and text/event-stream"
+        )
+        .as_deref(),
+        Some(FAILURE_KIND_MCP_ACCEPT_406)
+    );
+    assert_eq!(
+        classify_failure_kind(
+            "/mcp",
+            Some(401),
+            Some(401),
+            None,
+            br#"{"error":"Unknown tool: tavily-extract"}"#
+        )
+        .as_deref(),
+        Some(FAILURE_KIND_UNKNOWN_TOOL_NAME)
+    );
+
+    // Given the SAME text under a 403, Then the auth family still wins: the 403
+    // branch keeps its historical early position (only its literal changed), so
+    // no 403 row is reclassified into a client-error kind
+    assert_eq!(
+        classify_failure_kind(
+            "/mcp",
+            Some(403),
+            Some(403),
+            None,
+            b"must accept both application/json and text/event-stream"
+        )
+        .as_deref(),
+        Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED)
+    );
+
+    // And the family stays an UPSTREAM error class in BOTH the Rust and the
+    // composed-SQL surfaces, so dashboards never degrade these rows to
+    // system_error after the literal swap
+    assert_eq!(
+        operational_class_for_request_kind(
+            "api:search",
+            OUTCOME_ERROR,
+            Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED)
+        ),
+        OPERATIONAL_CLASS_UPSTREAM_ERROR
+    );
+    let operational_class_sql = token_log_operational_class_case_sql("k", "b", "r", "f");
+    assert!(operational_class_sql.contains(&format!("'{FAILURE_KIND_UPSTREAM_AUTH_BLOCKED}'")));
+}
+
+#[test]
+fn tavily_keyword_in_unrelated_field_keeps_substring_quarantine() {
+    // Given a 403 whose only keyword mention sits in an unrelated payload field
+    let body =
+        br#"{"results":[{"title":"What to do when your key is revoked"}],"error":"Forbidden"}"#;
+
+    // When classified, Then the pre-existing body-substring scan still routes it
+    // to the quarantine literal. Todo 1 deliberately does NOT touch the keyword
+    // table, so this pins today's over-broad scan instead of changing it.
+    assert_eq!(
+        classify_failure_kind("/api/tavily/search", Some(403), Some(403), None, body).as_deref(),
+        Some(FAILURE_KIND_UPSTREAM_ACCOUNT_DEACTIVATED_401)
+    );
+    let decision = classify_quarantine_reason(Some(403), body).expect("quarantine decision");
+    assert_eq!(decision.reason_code, BLOCKED_KEY_REASON_KEY_REVOKED);
+}
+
+#[test]
+fn tavily_auth_block_family_manual_qa_reports_decided_reason_code() {
+    // Manual-QA channel (plan todo 1): run with `-- --nocapture` to see the
+    // decided reason code and cooldown disposition per fixture. The assertions
+    // repeat the pins above, so this test cannot pass while printing a stale
+    // decision.
+    let bare_403 = br#"{"detail":"Forbidden"}"#;
+    let keyword_403 = br#"{"detail":"Account deactivated"}"#;
+
+    let bare = analyze_http_attempt(StatusCode::FORBIDDEN, bare_403);
+    let keyword = analyze_http_attempt(StatusCode::FORBIDDEN, keyword_403);
+    assert_eq!(
+        bare.failure_kind.as_deref(),
+        Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED)
+    );
+    assert_eq!(bare.key_health_action, KeyHealthAction::None);
+    assert_eq!(
+        keyword.failure_kind.as_deref(),
+        Some(FAILURE_KIND_UPSTREAM_ACCOUNT_DEACTIVATED_401)
+    );
+    assert!(matches!(
+        keyword.key_health_action,
+        KeyHealthAction::Quarantine(_)
+    ));
+
+    // `std::println!` on purpose: lib.rs mounts runtime_logging with
+    // #[macro_use], so a bare `println!` inside this crate routes to the
+    // legacy-stdio tracing event and never reaches the captured test stdout.
+    std::println!(
+        "[task-1 manual QA] fixture=bare-403 -> reason_code={} key_health_action={:?} \
+         cooldown_secs=transient-backoff lane (arm path sizes it; pre-todo-2 sizing was \
+         default {}s clamped {}..={})",
+        bare.failure_kind.clone().unwrap_or_default(),
+        bare.key_health_action,
+        UNKNOWN_403_TRANSIENT_BACKOFF_DEFAULT_SECS,
+        MCP_SESSION_INIT_BACKOFF_MIN_SECS,
+        MCP_SESSION_INIT_BACKOFF_MAX_SECS,
+    );
+    std::println!(
+        "[task-1 manual QA] fixture=keyword-403 -> reason_code={} key_health_action={:?} \
+         cooldown_secs=0 (quarantined, never a transient cooldown)",
+        keyword.failure_kind.clone().unwrap_or_default(),
+        keyword.key_health_action,
     );
 }
 

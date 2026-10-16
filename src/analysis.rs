@@ -222,6 +222,15 @@ fn combined_failure_text(error_message: Option<&str>, body: &[u8]) -> String {
     combined
 }
 
+/// Tavily bare 401/403 auth-block reason code (plan provider-key-429-retry
+/// todo 1). Joins the `FAILURE_KIND_*` literal taxonomy declared in `lib.rs`;
+/// it is declared beside the classifier that emits it because that const block
+/// sits within ten lines of its 3300-line budget. Distinct from
+/// `upstream_account_deactivated_401`, which still requires a quarantine
+/// keyword in the body, and from `upstream_unknown_403`, which the live
+/// pipeline no longer emits and now only survives on historical rows.
+pub(crate) const FAILURE_KIND_UPSTREAM_AUTH_BLOCKED: &str = "upstream_auth_blocked";
+
 pub(crate) fn classify_failure_kind(
     path: &str,
     http_status: Option<i64>,
@@ -261,8 +270,13 @@ pub(crate) fn classify_failure_kind(
         return Some(FAILURE_KIND_UPSTREAM_ACCOUNT_DEACTIVATED_401.to_string());
     }
 
+    // A Tavily 403 with no quarantine keyword above is an upstream auth block,
+    // not an unexplained 403: the auth family owns the longer cooldown lane
+    // (plan todo 1-2). The branch keeps its historical position, so a 403 still
+    // pre-empts the text-shaped client-error branches below exactly as
+    // `upstream_unknown_403` did.
     if effective_status == Some(403) {
-        return Some(FAILURE_KIND_UPSTREAM_UNKNOWN_403.to_string());
+        return Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED.to_string());
     }
 
     if http_status == Some(406)
@@ -309,6 +323,15 @@ pub(crate) fn classify_failure_kind(
 
     if normalized.contains("max query length is") || normalized.contains("query is too long") {
         return Some(FAILURE_KIND_QUERY_TOO_LONG.to_string());
+    }
+
+    // A 401 that no branch above explained is the same upstream auth block as a
+    // bare 403 (plan todo 1). It is matched LAST on purpose: unlike 403, a 401
+    // body can still carry a precise client-side diagnosis (the MCP `Accept`
+    // negotiation text, unknown-tool and validation payloads) that must keep
+    // its own kind instead of penalizing an otherwise healthy key.
+    if effective_status == Some(401) {
+        return Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED.to_string());
     }
 
     if effective_status.is_some() || !normalized.is_empty() {
@@ -1796,6 +1819,7 @@ fn is_upstream_error_failure_kind(kind: &str) -> bool {
         kind.trim(),
         FAILURE_KIND_UPSTREAM_RATE_LIMITED_429
             | FAILURE_KIND_UPSTREAM_UNKNOWN_403
+            | FAILURE_KIND_UPSTREAM_AUTH_BLOCKED
             | FAILURE_KIND_UPSTREAM_GATEWAY_5XX
             | FAILURE_KIND_UPSTREAM_ACCOUNT_DEACTIVATED_401
     )
@@ -2125,6 +2149,7 @@ pub(crate) fn token_log_operational_class_case_sql(
             WHEN {result_status_expr} = 'error' AND {failure_kind_expr} IN (
                 '{upstream_rate_limited_429}',
                 '{upstream_unknown_403}',
+                '{upstream_auth_blocked}',
                 '{upstream_gateway_5xx}',
                 '{upstream_account_deactivated_401}'
             ) THEN '{upstream_error}'
@@ -2153,6 +2178,7 @@ pub(crate) fn token_log_operational_class_case_sql(
         mcp_path_404 = FAILURE_KIND_MCP_PATH_404,
         upstream_rate_limited_429 = FAILURE_KIND_UPSTREAM_RATE_LIMITED_429,
         upstream_unknown_403 = FAILURE_KIND_UPSTREAM_UNKNOWN_403,
+        upstream_auth_blocked = FAILURE_KIND_UPSTREAM_AUTH_BLOCKED,
         upstream_gateway_5xx = FAILURE_KIND_UPSTREAM_GATEWAY_5XX,
         upstream_account_deactivated_401 = FAILURE_KIND_UPSTREAM_ACCOUNT_DEACTIVATED_401,
     )
@@ -2682,12 +2708,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unknown_403_is_classified_without_quarantine_reason() {
+    fn bare_403_is_classified_as_auth_block_without_quarantine_reason() {
         let body = br#"{"error":"Forbidden"}"#;
 
+        // Plan provider-key-429-retry todo 1: a keyword-free 403 is an upstream
+        // auth block, not the generic `upstream_unknown_403`, and it still
+        // carries no quarantine reason (that needs a keyword).
         assert_eq!(
             classify_failure_kind("/mcp", Some(200), Some(403), None, body).as_deref(),
-            Some(FAILURE_KIND_UPSTREAM_UNKNOWN_403)
+            Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED)
         );
         assert!(classify_quarantine_reason(Some(403), body).is_none());
     }
