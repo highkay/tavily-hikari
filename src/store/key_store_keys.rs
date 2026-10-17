@@ -646,6 +646,218 @@ impl KeyStore {
         }
     }
 
+    /// Strict cross-key-retry acquisition (plan provider-key-429-retry todo 5):
+    /// the "hand me a DIFFERENT, provably usable key or nothing" primitive the
+    /// bounded cross-key retry uses after upstream explicitly rejected the key
+    /// in flight.
+    ///
+    /// Strict predicate - a key is selectable only when ALL of these hold:
+    /// - `status = active`, not soft-deleted, in the REQUESTED provider (no
+    ///   cross-provider fallback, hard rule);
+    /// - not present in `excluded` (the first-hit key plus every key this
+    ///   logical request already judged dead);
+    /// - no low-quota depletion row for the CURRENT UTC month;
+    /// - no open quarantine row;
+    /// - no transient backoff in `scope` with `cooldown_until > now`.
+    ///
+    /// Exhausted keys become selectable ONLY after their recovery window
+    /// expired, and that expiry is decided by the very policy sweep every
+    /// other acquire path runs first ([`Self::reset_monthly`]: UtcMonth flip
+    /// for Tavily/Brave, `quota_renews_at` revival for SerpApi, success-only
+    /// for Exa). A key that is still `exhausted` after the sweep is inside its
+    /// window and is skipped, so there is NO tier-2/tier-3 exhausted fallback
+    /// and NO reuse of a cooling key: when nothing qualifies the caller gets
+    /// `Ok(None)` and serves the first-hit response byte-for-byte instead of
+    /// burning another guaranteed-reject upstream call.
+    ///
+    /// Candidate hierarchy and ordering are the existing ones: the read-only
+    /// token/user primary affinity list first (mirrors the candidates
+    /// `TavilyProxy::acquire_key_for_provider` builds), then the provider pool
+    /// by `last_used_at ASC, id ASC`. The affinity lookups are reads only -
+    /// this never calls `acquire_key_for_provider`, whose affinity miss
+    /// rebinds the primary key and revokes MCP sessions.
+    ///
+    /// Writes: the LRU [`Self::touch_key`] of the leased key, plus the shared
+    /// provider-scoped renewal sweep above (recovery, not marking). NO marking
+    /// of any kind - no backoff arming, quarantine, exhaustion flip,
+    /// maintenance row or affinity write; marking stays the caller's job.
+    ///
+    /// `Ok(None)` is the "no eligible key" signal; a database failure stays
+    /// `Err` so a broken store is never mistaken for an empty pool.
+    // Wired by plan todo 6 (Tavily HTTP executor), todo 9 (provider facades)
+    // and todo 13 (MCP session rebind); until then only the test surface calls
+    // it, hence the same staged-seam allow this module already uses.
+    #[allow(dead_code)]
+    pub(crate) async fn acquire_key_for_cross_key_retry(
+        &self,
+        provider: crate::providers::ProviderId,
+        auth_token_id: Option<&str>,
+        scope: &str,
+        excluded: &[String],
+    ) -> Result<Option<ApiKeyLease>, ProxyError> {
+        self.reset_monthly(provider).await?;
+
+        // One clock read for the whole selection so the affinity pass and the
+        // pool pass cannot disagree about `now` / the month window.
+        let now = self.backend_time.now_ts();
+        let month_start = start_of_month(self.backend_time.now_utc()).timestamp();
+
+        for key_id in self
+            .cross_key_retry_affinity_candidates(auth_token_id)
+            .await?
+        {
+            if let Some(lease) = self
+                .select_cross_key_retry_key(
+                    provider,
+                    Some(key_id.as_str()),
+                    scope,
+                    excluded,
+                    now,
+                    month_start,
+                )
+                .await?
+            {
+                return Ok(Some(lease));
+            }
+        }
+
+        self.select_cross_key_retry_key(provider, None, scope, excluded, now, month_start)
+            .await
+    }
+
+    /// Read-only affinity candidates for [`Self::acquire_key_for_cross_key_retry`],
+    /// in the existing hierarchy order: user primary -> token primary (when it
+    /// belongs to the same user) -> legacy binding, or the bare token primary
+    /// when the token has no user binding. None of the affinity writes the
+    /// proxy-layer equivalent performs (sync/rebind/revoke) happen here.
+    #[allow(dead_code)]
+    async fn cross_key_retry_affinity_candidates(
+        &self,
+        auth_token_id: Option<&str>,
+    ) -> Result<Vec<String>, ProxyError> {
+        let Some(token_id) = auth_token_id else {
+            return Ok(Vec::new());
+        };
+
+        let token_primary = self.get_token_primary_api_key_affinity(token_id).await?;
+        let Some(user_id) = self.find_user_id_by_token(token_id).await? else {
+            return Ok(token_primary
+                .into_iter()
+                .map(|affinity| affinity.api_key_id)
+                .collect());
+        };
+
+        let user_primary = self.get_user_primary_api_key_affinity(&user_id).await?;
+        let legacy_primary = if user_primary.is_none() && token_primary.is_none() {
+            self.find_recent_primary_candidate_for_user(&user_id)
+                .await?
+        } else {
+            None
+        };
+
+        let mut candidates = Vec::new();
+        if let Some(user_primary) = user_primary {
+            candidates.push(user_primary);
+        }
+        if let Some(token_primary) = token_primary
+            && token_primary.user_id.as_deref() == Some(user_id.as_str())
+            && !candidates.contains(&token_primary.api_key_id)
+        {
+            candidates.push(token_primary.api_key_id);
+        }
+        if let Some(legacy_primary) = legacy_primary
+            && !candidates.contains(&legacy_primary)
+        {
+            candidates.push(legacy_primary);
+        }
+        Ok(candidates)
+    }
+
+    /// One strict-predicate selection: `key_id = Some` pins the query to a
+    /// single affinity candidate, `None` runs the pool-wide LRU pick. Both go
+    /// through the SAME SQL predicate so an affinity candidate can never be
+    /// held to a laxer rule than the pool.
+    #[allow(dead_code)]
+    async fn select_cross_key_retry_key(
+        &self,
+        provider: crate::providers::ProviderId,
+        key_id: Option<&str>,
+        scope: &str,
+        excluded: &[String],
+        now: i64,
+        month_start: i64,
+    ) -> Result<Option<ApiKeyLease>, ProxyError> {
+        let mut builder = QueryBuilder::<Sqlite>::new(
+            r#"
+            SELECT id, api_key
+            FROM api_keys
+            WHERE status = "#,
+        );
+        builder.push_bind(STATUS_ACTIVE);
+        builder.push(" AND deleted_at IS NULL AND provider = ");
+        builder.push_bind(provider.as_str());
+        if let Some(key_id) = key_id {
+            builder.push(" AND id = ");
+            builder.push_bind(key_id);
+        }
+        if !excluded.is_empty() {
+            builder.push(" AND id NOT IN (");
+            {
+                let mut separated = builder.separated(", ");
+                for excluded_key_id in excluded {
+                    separated.push_bind(excluded_key_id);
+                }
+            }
+            builder.push(")");
+        }
+        builder.push(
+            r#"
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM api_key_low_quota_depletions d
+                  WHERE d.key_id = api_keys.id AND d.month_start = "#,
+        );
+        builder.push_bind(month_start);
+        builder.push(
+            r#"
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM api_key_quarantines q
+                  WHERE q.key_id = api_keys.id AND q.cleared_at IS NULL
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM api_key_transient_backoffs b
+                  WHERE b.key_id = api_keys.id
+                    AND b.scope = "#,
+        );
+        builder.push_bind(scope);
+        builder.push(" AND b.cooldown_until > ");
+        builder.push_bind(now);
+        builder.push(
+            r#"
+              )
+            ORDER BY last_used_at ASC, id ASC
+            LIMIT 1
+            "#,
+        );
+
+        let Some((id, api_key)) = builder
+            .build_query_as::<(String, String)>()
+            .fetch_optional(&self.pool)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        self.touch_key(&api_key, now).await?;
+        Ok(Some(ApiKeyLease {
+            id,
+            secret: api_key,
+        }))
+    }
+
     pub(crate) async fn list_mcp_session_candidate_key_ids(
         &self,
         provider: crate::providers::ProviderId,
