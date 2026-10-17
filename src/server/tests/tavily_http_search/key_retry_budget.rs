@@ -15,10 +15,11 @@
     // refuses the chain with its header preserved. This battery pins the BUDGET that
     // shape runs inside:
     // * zero sleep - RA=0, RA absent, a bare 401 (which arms a >=120s auth-block
-    //   cooldown) and a 432 (which flips the key to exhausted) all finish their
-    //   rotation inside a generous bound, and the cases whose rejection arms a
-    //   cooldown additionally prove the cooldown was still pending when the chain had
-    //   already returned, which no wait-based implementation can fake;
+    //   cooldown) and a 432 (which flips the key to exhausted) all rotate within a
+    //   generous bound on the mock-stamped GAP between their two upstream attempts,
+    //   and the cases whose rejection arms a cooldown additionally prove that cooldown
+    //   was still pending when the chain had already returned - two pins no wait-based
+    //   implementation can fake, and neither one hostage to how loaded the host is;
     // * the 5s deadline is a gate, not a comment - a first hit that only answers after
     //   the deadline is served byte-for-byte and never triggers a second upstream call,
     //   with an eligible second key sitting untouched in the pool;
@@ -39,14 +40,26 @@
     // pure instead - `proxy_key_retry`'s
     // `cross_key_retry_budget_env_parsing_clamps_and_falls_back`.
 
-    /// Generous wall-clock bound for a chain that must not sleep. Every mock below
-    /// answers in microseconds, so a healthy rotation completes far inside a second;
-    /// 15s stays an order of magnitude above that while remaining 2x below the
-    /// SHORTEST wait a sleep-based implementation would have to sit out (an RA=0
-    /// rejection is clamped up to a 30s cooldown, a Retry-After-less 429 to 60s, a
-    /// bare 401 to >=120s). Waiting is therefore impossible to hide, and a merely slow
-    /// host still passes.
-    const RETRY_BUDGET_IMMEDIATE_BOUND: Duration = Duration::from_secs(15);
+    /// Upper bound for the time BETWEEN the two upstream attempts of one chain,
+    /// measured from `std::time::Instant` stamps taken INSIDE the mock. The number
+    /// therefore contains the executor's own between-attempt work (classify, reconcile,
+    /// arm, log, strict acquire, re-send) plus the second attempt's trip to the mock,
+    /// and nothing else.
+    ///
+    /// Why the gap and not the whole request: the client-visible duration also contains
+    /// the client hop, the host HTTP proxy this suite's mock traffic traverses, the
+    /// shared host's contention under 68 parallel tests, and the billing settlement
+    /// around the chain - none of which the retry policy controls. The first
+    /// flaky-check run of this battery proved it: one case inflated past 47s of wall
+    /// clock while its own chain stayed idle-free. The gap is the quantity the
+    /// zero-sleep contract is about.
+    ///
+    /// Why 20s is still a hard pin: the SHORTEST wait a sleep-based implementation
+    /// would have to sit out is 30s (an RA=0 rejection is clamped up to the 30s cooldown
+    /// ladder floor, a Retry-After-less 429 to 60s, a bare 401 to >=120s), so anything
+    /// that waits for what it armed lands far outside this bound, while a healthy chain
+    /// measures in tens of milliseconds.
+    const RETRY_BUDGET_RETRY_GAP_BOUND: Duration = Duration::from_secs(20);
 
     /// The kernel's default deadline (`KEY_RETRY_DEADLINE_SECS_DEFAULT`), which the
     /// executor resolves through `KeyRetryBudget::from_env`. A slow first hit must
@@ -72,6 +85,92 @@
     /// The two logical requests of the concurrency case, identified by their query.
     const RETRY_BUDGET_CONCURRENT_QUERY_A: &str = "retry-budget-concurrent-a";
     const RETRY_BUDGET_CONCURRENT_QUERY_B: &str = "retry-budget-concurrent-b";
+
+    /// One upstream attempt with the instant the mock received it.
+    #[derive(Debug, Clone)]
+    struct RetryBudgetTimedAttempt {
+        api_key: String,
+        arrived: std::time::Instant,
+    }
+
+    /// The upstream keys a timed recorder saw, in arrival order.
+    fn retry_budget_timed_keys(attempts: &[RetryBudgetTimedAttempt]) -> Vec<String> {
+        attempts
+            .iter()
+            .map(|attempt| attempt.api_key.clone())
+            .collect()
+    }
+
+    /// Mock for the zero-sleep battery: the same plan-driven behaviour as the sibling
+    /// fragment's router (the first attempt on `/search` rejects, every later attempt
+    /// succeeds), but it stamps each attempt's arrival so a case can bound the gap
+    /// BETWEEN the two attempts instead of the whole request's wall clock.
+    async fn spawn_http_retry_budget_timed_mock(
+        plan: CrossKeyRetryMockPlan,
+    ) -> (SocketAddr, Arc<Mutex<Vec<RetryBudgetTimedAttempt>>>) {
+        let attempts = Arc::new(Mutex::new(Vec::<RetryBudgetTimedAttempt>::new()));
+        let per_path_attempts = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
+
+        let search_route = {
+            let attempts = attempts.clone();
+            let per_path_attempts = per_path_attempts.clone();
+            move |uri: Uri, headers: HeaderMap, Json(body): Json<Value>| {
+                let attempts = attempts.clone();
+                let per_path_attempts = per_path_attempts.clone();
+                async move {
+                    let api_key = body
+                        .get("api_key")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    assert_eq!(
+                        api_key,
+                        cross_key_retry_upstream_bearer(&headers),
+                        "body api_key and upstream bearer must carry the same key on /search"
+                    );
+                    assert!(
+                        !api_key.is_empty(),
+                        "upstream /search must receive an injected Tavily key"
+                    );
+                    let path = uri.path().to_string();
+                    // Stamped BEFORE any mock-side bookkeeping, so the recorded gap is
+                    // the executor's and not this handler's.
+                    let arrived = std::time::Instant::now();
+                    let attempt = {
+                        let mut counts = per_path_attempts
+                            .lock()
+                            .expect("per-path attempt lock poisoned");
+                        let entry = counts.entry(path.clone()).or_insert(0);
+                        *entry += 1;
+                        *entry
+                    };
+                    attempts
+                        .lock()
+                        .expect("attempts lock poisoned")
+                        .push(RetryBudgetTimedAttempt { api_key, arrived });
+                    plan.response_for(&path, attempt)
+                }
+            }
+        };
+
+        // A usage probe is not a business attempt: it answers but is never recorded.
+        let usage_route = || async {
+            cross_key_retry_json_response(StatusCode::OK, None, CROSS_KEY_RETRY_USAGE_BODY)
+        };
+
+        let app = Router::new()
+            .route("/search", post(search_route))
+            .route("/usage", get(usage_route));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        (addr, attempts)
+    }
 
     /// Mock for the deadline gate: the FIRST attempt on `/search` is held for
     /// `first_hit_delay` before it answers 429 with `Retry-After: 0`, and every later
@@ -439,18 +538,23 @@
 
     /// Shared body of the zero-sleep battery. Every case here has a willing second key,
     /// an eligible pool and a Retry-After inside (or absent from) the kernel's fast-path
-    /// window, so the only thing under test is that the rotation costs no wait: the
-    /// client is served the retry's bytes inside [`RETRY_BUDGET_IMMEDIATE_BOUND`], and
-    /// when the rejection arms a cooldown that cooldown is still pending by at least the
-    /// same bound once the chain has returned - a sleep-based implementation would have
-    /// to sit out 30s/60s/120s and cannot fake either half.
+    /// window, so the only thing under test is that the rotation costs no wait. Two
+    /// independent pins carry that, and neither depends on how slow the host or the
+    /// shared HTTP proxy is:
+    /// * the mock-stamped gap between the two upstream attempts stays inside
+    ///   [`RETRY_BUDGET_RETRY_GAP_BOUND`], while the shortest cooldown a wait-based
+    ///   implementation would sit out is 30s;
+    /// * when the rejection arms a cooldown, that cooldown is STILL pending once the
+    ///   chain has returned - had the executor waited out what it armed, it would have
+    ///   expired (a 432 arms none and flips the key to `exhausted` instead, whose
+    ///   renewal window is a month away, so waiting is not an option there either).
     async fn assert_first_hit_rotates_without_sleeping(case: RetryBudgetImmediateCase) {
         let db_path = temp_db_path(case.db_prefix);
         let db_str = db_path.to_string_lossy().to_string();
 
         let first_key = format!("tvly-{}-a", case.db_prefix);
         let retry_key = format!("tvly-{}-b", case.db_prefix);
-        let (upstream_addr, attempts) = spawn_http_cross_key_retry_mock(
+        let (upstream_addr, attempts) = spawn_http_retry_budget_timed_mock(
             CrossKeyRetryMockPlan::rotating_after_rejection(
                 CrossKeyRetryRejectedRoute::JsonPost("/search"),
                 case.first_status,
@@ -474,9 +578,10 @@
             .expect("create token");
         let proxy_addr = spawn_proxy_server(proxy, usage_base).await;
 
-        // Timed with `std::time::Instant` on purpose: the bound is about real wall
-        // clock spent on the client's request, not about the executor's own deadline
-        // instant (which is a `tokio::time::Instant`).
+        // Reported, never asserted: this duration also contains the client hop, the host
+        // HTTP proxy this suite's mock traffic traverses, the shared host's contention
+        // and the settlement around the chain - none of which the retry policy controls.
+        // The zero-sleep contract is pinned on the mock-stamped gap below instead.
         let started = std::time::Instant::now();
         let resp = Client::new()
             .post(format!("http://{proxy_addr}/api/tavily/search"))
@@ -503,25 +608,10 @@
             "{}: the client must see the retry, never the buffered rejection",
             case.label
         );
-        assert!(
-            elapsed < RETRY_BUDGET_IMMEDIATE_BOUND,
-            "{}: the chain must not sleep, yet it took {elapsed:?} (bound {:?})",
-            case.label,
-            RETRY_BUDGET_IMMEDIATE_BOUND
-        );
-        // `std::println!` on purpose: `runtime_logging` shadows the bare macro
-        // crate-wide, so only this form reaches a `--nocapture` QA transcript.
-        std::println!(
-            "[task-8][manual-qa] {} rotated in {elapsed:?} (bound {:?}) first_status={} retry_after={:?}",
-            case.label,
-            RETRY_BUDGET_IMMEDIATE_BOUND,
-            case.first_status,
-            case.first_retry_after,
-        );
 
         // One retry, never more, on a different key of the seeded pool.
         let seen = attempts.lock().expect("attempts lock poisoned").clone();
-        let keys = cross_key_retry_seen_keys(&seen);
+        let keys = retry_budget_timed_keys(&seen);
         assert_eq!(
             keys.len(),
             2,
@@ -532,6 +622,29 @@
             keys[0], keys[1],
             "{}: the retry must rotate to another key",
             case.label
+        );
+
+        // THE zero-sleep pin: how long the executor spent between the first attempt
+        // arriving upstream and the retry arriving upstream. `saturating_` because a
+        // stamp inversion would mean a broken recorder, not a slept chain, and must not
+        // panic the case before its own assertion reports it.
+        let retry_gap = seen[1]
+            .arrived
+            .saturating_duration_since(seen[0].arrived);
+        assert!(
+            retry_gap < RETRY_BUDGET_RETRY_GAP_BOUND,
+            "{}: the executor spent {retry_gap:?} between the two upstream attempts (bound {:?}), which is waiting for something it had armed rather than rotating",
+            case.label,
+            RETRY_BUDGET_RETRY_GAP_BOUND
+        );
+        // `std::println!` on purpose: `runtime_logging` shadows the bare macro
+        // crate-wide, so only this form reaches a `--nocapture` QA transcript.
+        std::println!(
+            "[task-8][manual-qa] {} retry_gap={retry_gap:?} (bound {:?}) whole_request={elapsed:?} first_status={} retry_after={:?}",
+            case.label,
+            RETRY_BUDGET_RETRY_GAP_BOUND,
+            case.first_status,
+            case.first_retry_after,
         );
 
         let pool = connect_sqlite_test_pool(&db_str).await;
@@ -597,13 +710,12 @@
                     case.label
                 );
                 assert!(
-                    pending_secs >= i64::try_from(RETRY_BUDGET_IMMEDIATE_BOUND.as_secs())
-                        .expect("bound fits i64"),
-                    "{}: the chain returned with {pending_secs}s of cooldown still pending, so nothing waited it out",
+                    pending_secs > 0,
+                    "{}: the {reason} cooldown it armed was already expired ({pending_secs}s) when the chain returned, so the executor waited it out instead of rotating",
                     case.label
                 );
                 std::println!(
-                    "[task-8][manual-qa] {} left {pending_secs}s of {reason} cooldown pending after {elapsed:?}",
+                    "[task-8][manual-qa] {} left {pending_secs}s of {reason} cooldown pending (retry_gap={retry_gap:?}, whole_request={elapsed:?})",
                     case.label,
                 );
             }
@@ -882,9 +994,10 @@
         let rendezvous_met = Arc::new(AtomicUsize::new(0));
         let (upstream_addr, attempts) = spawn_http_retry_budget_concurrent_rejection_mock(
             rendezvous.clone(),
-            // Bounded so a request that never reaches upstream fails the case instead of
-            // hanging the suite.
-            Duration::from_secs(30),
+            // Generous and bounded: under 68 parallel tests the second request can take a
+            // while to reach the mock, and the wait must neither fire early (which would
+            // silently degrade the case to sequential) nor hang the suite.
+            Duration::from_secs(120),
             rendezvous_met.clone(),
         )
         .await;
