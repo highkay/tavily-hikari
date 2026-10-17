@@ -231,7 +231,9 @@ impl TavilyProxy {
                 proxy_session_id: None,
                 routing_subject_hash: None,
                 upstream_operation: Some(ctx.request.upstream_operation),
-                fallback_reason: None,
+                fallback_reason: ctx
+                    .retry_marker
+                    .fallback_reason(analysis.status == OUTCOME_SUCCESS),
                 forwarded_headers: &ctx.sanitized_headers.forwarded,
                 dropped_headers: &ctx.sanitized_headers.dropped,
                 client_ip: ctx.request.client_ip.as_ref(),
@@ -272,13 +274,16 @@ impl TavilyProxy {
 
     /// Transport-failure audit row for the Exa REST facade (mirrors the
     /// SerpApi transport-error row; the T11 boundary applies to the other
-    /// non-Exa providers).
+    /// non-Exa providers). `fallback_reason` is the todo-9 retry-chain marker
+    /// of this dead attempt; the Exa LOCAL MCP facade stays single-attempt and
+    /// passes `None`.
     pub(crate) async fn log_exa_rest_facade_transport_error(
         &self,
         request: &ProviderRestFacadeRequest,
         lease: &ApiKeyLease,
         sanitized_headers: &SanitizedHeaders,
         err: &ProxyError,
+        fallback_reason: Option<&'static str>,
     ) -> Result<(), ProxyError> {
         if request.provider != providers::ProviderId::Exa {
             return Ok(());
@@ -312,7 +317,7 @@ impl TavilyProxy {
                 proxy_session_id: None,
                 routing_subject_hash: None,
                 upstream_operation: Some(request.upstream_operation),
-                fallback_reason: None,
+                fallback_reason,
                 forwarded_headers: &sanitized_headers.forwarded,
                 dropped_headers: &sanitized_headers.dropped,
                 client_ip: request.client_ip.as_ref(),
@@ -333,11 +338,14 @@ mod exa_facade_translation_tests {
         assert_eq!(ok.result_status, OUTCOME_SUCCESS);
         assert_eq!(ok.failure_kind, None);
 
-        // 402 exhaustion tags (todo-3 classifier vocabulary).
+        // 402 exhaustion tags (todo-3 classifier vocabulary). The literals
+        // come from the classifier constants (plan todo 10 made it the single
+        // source of truth), so this pin cannot drift from the parser the retry
+        // veto reads.
         for tag in [
-            "NO_MORE_CREDITS",
-            "API_KEY_BUDGET_EXCEEDED",
-            "TEAM_BUDGET_EXCEEDED",
+            EXA_BUDGET_TAG_NO_MORE_CREDITS,
+            EXA_BUDGET_TAG_API_KEY_BUDGET_EXCEEDED,
+            EXA_BUDGET_TAG_TEAM_BUDGET_EXCEEDED,
         ] {
             let body = format!(r#"{{"requestId":"mock","error":"out","tag":"{tag}"}}"#);
             let exhausted = exa_facade_outcome(StatusCode::PAYMENT_REQUIRED, body.as_bytes());

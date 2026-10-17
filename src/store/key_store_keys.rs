@@ -684,10 +684,11 @@ impl KeyStore {
     ///
     /// `Ok(None)` is the "no eligible key" signal; a database failure stays
     /// `Err` so a broken store is never mistaken for an empty pool.
-    // Production consumer: the plan todo-6 Tavily HTTP executor
-    // (`proxy_http_and_logs.rs`) probes it once per eligible first hit. Todo 9
-    // (provider facades) and todo 13 (MCP session rebind) reuse the same
-    // primitive, so the staged-seam allow is gone.
+    // Production consumers: the plan todo-6 Tavily HTTP executor
+    // (`proxy_http_and_logs.rs`) and the todo-9 provider REST facade executor
+    // (`proxy_provider_facade.rs`) each probe it once per eligible first hit.
+    // Todo 13 (MCP session rebind) reuses the same primitive, so the
+    // staged-seam allow is gone.
     pub(crate) async fn acquire_key_for_cross_key_retry(
         &self,
         provider: crate::providers::ProviderId,

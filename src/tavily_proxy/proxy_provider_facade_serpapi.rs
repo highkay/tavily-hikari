@@ -126,6 +126,63 @@ impl ProviderFacadeAttemptRecord {
     }
 }
 
+/// Where one buffered provider-facade attempt sits inside a bounded cross-key
+/// retry chain (plan provider-key-429-retry todo 9).
+///
+/// The marker rides into THIS attempt's own `request_logs` row through
+/// `fallback_reason`, so every attempt of one logical request stays visible and
+/// an operator can read the chain off the rows exactly as on the Tavily HTTP
+/// seam (todo 6): the loser is `attempted`, the attempt that ends the chain is
+/// `succeeded` or `rejected`, and a first hit whose pool probe came back empty
+/// is `skipped_no_eligible_key`.
+///
+/// The terminal variant resolves INSIDE the record path from the very
+/// `analysis.status` that row persists, so `succeeded` can never disagree with
+/// `result_status`. The Exa/Brave LOCAL MCP facades construct `NotInChain`: they
+/// stay single-attempt in v1 (plan todo 9 Must-NOT) and the todo-13 MCP ladder
+/// owns session rebind. The SerpApi hosted MCP passthrough and the rebalance
+/// executors never reach a record path at all, so they are excluded
+/// structurally.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ProviderFacadeRetryMarker {
+    /// Single-attempt surface, or an attempt the kernel serves unchanged: the
+    /// row keeps today's `fallback_reason: None`.
+    NotInChain,
+    /// This attempt lost and the chain replayed on another key.
+    Attempted,
+    /// The pool probe found no eligible key, so the buffered attempt is served
+    /// to the client byte-for-byte.
+    SkippedNoEligibleKey,
+    /// This attempt ends a chain of `attempts_used` upstream calls.
+    Terminal { attempts_used: u32 },
+}
+
+impl ProviderFacadeRetryMarker {
+    /// Terminal marker of a chain that ran `attempts_used` attempts. A
+    /// single-attempt budget (`KEY_RETRY_MAX_ATTEMPTS=1`) has no chain, so the
+    /// row stays unmarked.
+    pub(crate) fn terminal(attempts_used: u32) -> Self {
+        if attempts_used <= 1 {
+            Self::NotInChain
+        } else {
+            Self::Terminal { attempts_used }
+        }
+    }
+
+    /// `fallback_reason` of the row this attempt persists. `client_success` is
+    /// the record path's own outcome (`analysis.status == OUTCOME_SUCCESS`).
+    pub(crate) fn fallback_reason(self, client_success: bool) -> Option<&'static str> {
+        match self {
+            Self::NotInChain => None,
+            Self::Attempted => Some(UPSTREAM_KEY_RETRY_ATTEMPTED),
+            Self::SkippedNoEligibleKey => Some(UPSTREAM_KEY_RETRY_SKIPPED_NO_ELIGIBLE_KEY),
+            Self::Terminal { attempts_used } => {
+                upstream_key_retry_terminal_marker(attempts_used, client_success)
+            }
+        }
+    }
+}
+
 /// Everything the post-response bookkeeping needs; grouped so the executor
 /// signature stays readable and the todo 13/14 extension is mechanical.
 pub(crate) struct ProviderFacadeAttemptContext<'a> {
@@ -135,6 +192,8 @@ pub(crate) struct ProviderFacadeAttemptContext<'a> {
     pub(crate) status: StatusCode,
     pub(crate) body_bytes: &'a [u8],
     pub(crate) signal: ProviderFailureSignal,
+    /// Position of this attempt in a bounded cross-key retry chain.
+    pub(crate) retry_marker: ProviderFacadeRetryMarker,
 }
 
 impl TavilyProxy {
@@ -247,7 +306,9 @@ impl TavilyProxy {
                 proxy_session_id: None,
                 routing_subject_hash: None,
                 upstream_operation: Some(ctx.request.upstream_operation),
-                fallback_reason: None,
+                fallback_reason: ctx
+                    .retry_marker
+                    .fallback_reason(analysis.status == OUTCOME_SUCCESS),
                 forwarded_headers: &ctx.sanitized_headers.forwarded,
                 dropped_headers: &ctx.sanitized_headers.dropped,
                 client_ip: ctx.request.client_ip.as_ref(),
@@ -288,12 +349,18 @@ impl TavilyProxy {
 
     /// Transport-failure audit row for provider REST facades (mirrors the
     /// Tavily executors' Err-arm `log_attempt`); same todo-12 provider gate.
+    ///
+    /// `fallback_reason` is the retry-chain marker of this dead attempt (todo
+    /// 9); a transport failure has no outcome to resolve, so the executor
+    /// passes the already-resolved marker and single-attempt surfaces pass
+    /// `None`.
     pub(crate) async fn log_provider_rest_facade_transport_error(
         &self,
         request: &ProviderRestFacadeRequest,
         lease: &ApiKeyLease,
         sanitized_headers: &SanitizedHeaders,
         err: &ProxyError,
+        fallback_reason: Option<&'static str>,
     ) -> Result<(), ProxyError> {
         if request.provider != providers::ProviderId::Serpapi {
             return Ok(());
@@ -327,7 +394,7 @@ impl TavilyProxy {
                 proxy_session_id: None,
                 routing_subject_hash: None,
                 upstream_operation: Some(request.upstream_operation),
-                fallback_reason: None,
+                fallback_reason,
                 forwarded_headers: &sanitized_headers.forwarded,
                 dropped_headers: &sanitized_headers.dropped,
                 client_ip: request.client_ip.as_ref(),

@@ -34,15 +34,17 @@
 //   keeps settling once on the final response and the caller marks the retry
 //   chain through `fallback_reason`.
 //
-// Consumers: the todo-6 Tavily HTTP executor (`proxy_http_and_logs.rs`) calls
+// Consumers: the todo-6 Tavily HTTP executor (`proxy_http_and_logs.rs`) and the
+// todo-9 provider REST facade executor (`proxy_provider_facade.rs`) call
 // `decide_cross_key_retry` / `KeyRetryBudget::from_env` in production, so the
-// staged-seam `allow`s are gone from everything that path consumes. Still
-// staged (allow kept, named at each item): `is_retry_eligible` /
-// `key_retry_ineligibility` (the default-window predicate the table tests pin),
-// `KeyRetryAttemptEvidence::exa_budget` and
-// `KeyRetryRequestKind::ProviderRestRead` - they land with todo 9 (provider
-// REST facades), which fills the Exa budget-tag evidence todo 10 moved into
-// the classifier (`crate::analysis::exa_budget_tag_evidence`).
+// staged-seam `allow`s are gone from everything those paths consume - including
+// `KeyRetryRequestKind::ProviderRestRead` and
+// `KeyRetryAttemptEvidence::exa_budget`, which todo 9 wires and fills from the
+// Exa budget-tag evidence todo 10 moved into the classifier
+// (`crate::analysis::exa_budget_tag_evidence`). Still staged (allow kept, named
+// at each item): `is_retry_eligible` / `key_retry_ineligibility` - the
+// default-window predicate the table tests pin, which no production caller uses
+// because both seams resolve the *configured* budget.
 
 /// Attempt ceiling default: the first upstream attempt plus ONE cross-key
 /// retry. The plan freezes "at most one retry", so this is also the ceiling
@@ -83,10 +85,9 @@ pub(crate) const KEY_RETRY_RATE_LIMIT_FAST_PATH_SECS_ENV: &str =
 pub(crate) enum KeyRetryRequestKind {
     /// Tavily HTTP read endpoints (search/extract/map/usage): replay-safe.
     HttpRead,
-    /// Provider REST facade read endpoints (serpapi/exa/brave search).
-    /// Staged for plan todo 9: the todo-6 Tavily HTTP seam never maps a path
-    /// onto this surface, so no production code constructs it yet.
-    #[allow(dead_code)]
+    /// Provider REST facade read endpoints (serpapi/exa/brave search, exa
+    /// contents+answer, brave web/news/llm-context). Mapped by the todo-9
+    /// facade executor; the MCP surfaces never enter this kernel.
     ProviderRestRead,
     /// `/research` POST + GET: a research task is never replayed.
     Research,
@@ -145,9 +146,8 @@ impl KeyRetryAttemptEvidence {
         }
     }
 
-    /// Staged for plan todo 9: the Exa facade builds this from the todo-10
+    /// Exa veto evidence: the todo-9 Exa facade builds this from the todo-10
     /// classifier evidence.
-    #[allow(dead_code)]
     pub(crate) const fn exa_budget(tag: ExaBudgetTag) -> Self {
         Self {
             exa_budget_tag: Some(tag),

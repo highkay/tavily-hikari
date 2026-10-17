@@ -556,6 +556,30 @@ impl HealthHarness {
             .collect()
     }
 
+    /// Same scan, but carrying the plan todo-9 cross-key retry marker instead of
+    /// the path: `(leased key id, status_code, fallback_reason)` per attempt, in
+    /// attempt order. A single-attempt request keeps `None`.
+    async fn request_log_chain(&self) -> Vec<(String, i64, Option<String>)> {
+        let pool = self.pool().await;
+        let rows = sqlx::query(
+            "SELECT COALESCE(api_key_id, '') AS leased_key_id, status_code, fallback_reason \
+             FROM observability.request_logs ORDER BY id ASC",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("request log chain scan");
+        pool.close().await;
+        rows.into_iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("leased_key_id"),
+                    row.get::<Option<i64>, _>("status_code").unwrap_or(-1),
+                    row.get::<Option<String>, _>("fallback_reason"),
+                )
+            })
+            .collect()
+    }
+
     async fn depletion_rows(&self) -> i64 {
         let pool = self.pool().await;
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_key_low_quota_depletions")
@@ -615,18 +639,24 @@ impl HealthHarness {
 /// Given a two-key serpapi pool where the LRU-first key is the mock's hourly
 /// 429 knob; When request 1 hits the hourly throttle and request 2 follows;
 /// Then request 1 arms an HOUR-scale backoff on the shared http_global scope
-/// (D6 "hour scope") and request 2 leases the DIFFERENT healthy key (200).
+/// (D6 "hour scope") and - because a healthy key is still eligible - the bounded
+/// cross-key retry (plan provider-key-429-retry, 2026-10-16 amendment) ABSORBS
+/// the 429 inside the same request: the client sees 200 and two marked rows,
+/// after which request 2 leases the healthy key directly because the throttled
+/// one is cooling.
 #[tokio::test]
-async fn serpapi_hourly_429_arms_hour_scale_backoff_and_next_request_leases_a_different_key() {
+async fn serpapi_hourly_429_arms_hour_scale_backoff_and_rotates_within_the_request() {
     let harness = spawn_harness("health-serpapi-hourly", &[SERPAPI_CFG_THROTTLED]).await;
     harness.make_lru_first("key-throttled").await;
 
-    let (status, body) = harness.get_serpapi("q=throttle-probe").await;
-    assert_eq!(status, reqwest::StatusCode::TOO_MANY_REQUESTS);
+    // Amended contract: an eligible 429 no longer reaches the client while
+    // another pooled key can serve it. The rejection is still fully marked -
+    // only its client-visible effect moved inside the request.
+    let (status, _body) = harness.get_serpapi("q=throttle-probe").await;
     assert_eq!(
-        body,
-        json!({ "error": "Your account has exceeded its hourly throughput limit." }),
-        "hourly 429 body verbatim"
+        status,
+        reqwest::StatusCode::OK,
+        "the bounded retry absorbs the hourly 429"
     );
 
     let (scope, reason, retry_after) = harness
@@ -641,38 +671,64 @@ async fn serpapi_hourly_429_arms_hour_scale_backoff_and_next_request_leases_a_di
     );
     assert_eq!(harness.key_status("key-throttled").await, "active");
 
+    // Request 1 is a TWO-attempt chain: the throttled key's 429 marked
+    // `attempted`, then the healthy key's 200 marked `succeeded`.
+    let throttled_id = harness.key_id("key-throttled").await;
+    let live_id = harness.key_id("sp-live").await;
+    let chain = harness.request_log_chain().await;
+    assert_eq!(chain.len(), 2, "one row per attempt: {chain:?}");
+    assert_eq!(
+        chain[0].0, throttled_id,
+        "attempt 1 leased the throttled key"
+    );
+    assert_eq!(chain[0].1, 429);
+    assert_eq!(
+        chain[0].2.as_deref(),
+        Some("upstream_key_retry:attempted"),
+        "the losing attempt is marked: {chain:?}"
+    );
+    assert_eq!(chain[1].0, live_id, "the retry rotated to the healthy key");
+    assert_eq!(chain[1].1, 200);
+    assert_eq!(
+        chain[1].2.as_deref(),
+        Some("upstream_key_retry:succeeded"),
+        "the winning attempt is marked: {chain:?}"
+    );
+
     let (status2, _) = harness.get_serpapi("q=throttle-probe-2").await;
     assert_eq!(status2, reqwest::StatusCode::OK, "next request succeeds");
     let rows = harness.request_log_key_ids().await;
-    assert_eq!(rows.len(), 2, "both attempts logged");
-    let throttled_id = harness.key_id("key-throttled").await;
-    let live_id = harness.key_id("sp-live").await;
+    assert_eq!(rows.len(), 3, "request 2 adds exactly one row: {rows:?}");
     assert_eq!(
-        rows[0].0, throttled_id,
-        "request 1 leased the throttled key"
+        rows[2].0, live_id,
+        "request 2 leases the healthy key directly (the throttled one cools)"
     );
-    assert_eq!(
-        rows[1].0, live_id,
-        "request 2 leased the DIFFERENT healthy key"
+    assert_eq!(rows[2].1, 200);
+    let chain = harness.request_log_chain().await;
+    assert!(
+        chain[2].2.is_none(),
+        "a single-attempt request keeps no chain marker: {chain:?}"
     );
-    assert_eq!(rows[1].1, 200);
 }
 
 /// Given a two-key brave pool with the mock's 429 knob LRU-first; When
 /// request 1 is rate limited and request 2 follows; Then request 1 arms a
-/// ≤2s-scale backoff (retry_after_secs=2 on scope http_global) and request 2
-/// leases the DIFFERENT key successfully (plan L232 QA happy mirror).
+/// ≤2s-scale backoff (retry_after_secs=2 on scope http_global) and the bounded
+/// cross-key retry absorbs the 429 inside the same request (plan
+/// provider-key-429-retry, 2026-10-16 amendment), so request 2 leases the
+/// healthy key directly (plan L232 QA happy mirror).
 #[tokio::test]
-async fn brave_429_arms_second_scale_backoff_and_next_request_leases_a_different_key() {
+async fn brave_429_arms_second_scale_backoff_and_rotates_within_the_request() {
     let harness = spawn_harness("health-brave-second", &[BRAVE_CFG_THROTTLED]).await;
     harness.make_lru_first("key-throttled").await;
 
-    let (status, body) = harness.get_brave_web("q=brave-throttle-probe").await;
-    assert_eq!(status, reqwest::StatusCode::TOO_MANY_REQUESTS);
+    // Amended contract: with an eligible second key the 429 is absorbed
+    // in-request instead of reaching the client; the marking is unchanged.
+    let (status, _body) = harness.get_brave_web("q=brave-throttle-probe").await;
     assert_eq!(
-        body.get("error").and_then(|error| error.get("code")),
-        Some(&json!("RATE_LIMITED")),
-        "brave 429 envelope verbatim"
+        status,
+        reqwest::StatusCode::OK,
+        "the bounded retry absorbs the brave 429"
     );
 
     let (scope, reason, retry_after) = harness
@@ -687,18 +743,31 @@ async fn brave_429_arms_second_scale_backoff_and_next_request_leases_a_different
     );
     assert_eq!(harness.key_status("key-throttled").await, "active");
 
-    let (status2, _) = harness.get_brave_web("q=brave-throttle-probe-2").await;
-    assert_eq!(status2, reqwest::StatusCode::OK, "next request succeeds");
-    let rows = harness.request_log_key_ids().await;
-    assert_eq!(rows.len(), 2);
     let throttled_id = harness.key_id("key-throttled").await;
     let live_id = harness.key_id("br-live").await;
-    assert_eq!(rows[0].0, throttled_id);
+    let chain = harness.request_log_chain().await;
+    assert_eq!(chain.len(), 2, "one row per attempt: {chain:?}");
+    assert_eq!(chain[0].0, throttled_id);
+    assert_eq!(chain[0].1, 429);
+    assert_eq!(chain[0].2.as_deref(), Some("upstream_key_retry:attempted"));
+    assert_eq!(chain[1].0, live_id, "the retry rotated to the healthy key");
+    assert_eq!(chain[1].1, 200);
+    assert_eq!(chain[1].2.as_deref(), Some("upstream_key_retry:succeeded"));
+
+    let (status2, _) = harness.get_brave_web("q=brave-throttle-probe-2").await;
+    assert_eq!(status2, reqwest::StatusCode::OK, "next request succeeds");
+    // Brave's backoff is second-scale, so request 2 may or may not still find
+    // the throttled key cooling; either way it must END on the healthy key and
+    // add at least one row. (The serpapi leg above keeps the strict single-row
+    // pin because its hour-scale cooldown cannot expire inside the test.)
+    let rows = harness.request_log_key_ids().await;
+    assert!(rows.len() >= 3, "request 2 adds at least one row: {rows:?}");
+    let last = rows.last().expect("at least one row");
     assert_eq!(
-        rows[1].0, live_id,
-        "request 2 leased the DIFFERENT healthy key"
+        last.0, live_id,
+        "request 2 ends on the healthy key (the throttled one cools)"
     );
-    assert_eq!(rows[1].1, 200);
+    assert_eq!(last.1, 200);
 }
 
 /// Given a pooled serpapi key the mock rejects as invalid; When a search
@@ -817,7 +886,9 @@ async fn exa_402_exhausts_without_depletion_rows() {
 /// M8 binding negative, Brave leg incl. the passive-harvest flow: request 1
 /// succeeds against the live key and harvests the month window (samples
 /// written, quota fields updated — depletion table still untouched), then
-/// request 2 exhausts via the 402 knob with zero depletion rows.
+/// request 2 exhausts via the 402 knob with zero depletion rows. Under the
+/// amended retry contract the 402 is absorbed in-request by the healthy key,
+/// so the exhaustion marking - not the client status - is what this leg pins.
 #[tokio::test]
 async fn brave_harvest_then_exhaustion_writes_zero_depletion_rows() {
     let harness = spawn_harness("health-brave-m8", &[BRAVE_CFG_HARVEST_EXHAUST]).await;
@@ -846,17 +917,19 @@ async fn brave_harvest_then_exhaustion_writes_zero_depletion_rows() {
     assert_eq!(harness.depletion_rows().await, 0, "M8 after harvest");
 
     // Second token: a fresh token has no primary affinity, so the LRU-first
-    // exhausted knob is leased by tier 1/2 and its 402 lands (the first
-    // token's primary affinity would re-lease br-live instead).
+    // exhausted knob is leased by tier 1/2 and its 402 lands. Under the amended
+    // contract (plan provider-key-429-retry) the 402 is absorbed in-request by
+    // the bounded cross-key retry because br-live is still eligible, so the
+    // client sees 200 while the exhausted knob is still fully marked.
     let exhaust_token = create_test_token(&harness.base_url).await;
     harness.make_lru_first("key-exhausted").await;
-    let (status2, body2) = harness
+    let (status2, _body2) = harness
         .get_brave_web_with_token("q=exhaust-probe", &exhaust_token)
         .await;
-    assert_eq!(status2, reqwest::StatusCode::PAYMENT_REQUIRED);
     assert_eq!(
-        body2.get("error").and_then(|error| error.get("code")),
-        Some(&json!("QUOTA_LIMITED"))
+        status2,
+        reqwest::StatusCode::OK,
+        "the bounded retry absorbs the brave 402"
     );
     assert_eq!(harness.key_status("key-exhausted").await, "exhausted");
     assert_eq!(

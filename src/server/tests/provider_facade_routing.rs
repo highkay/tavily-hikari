@@ -968,3 +968,695 @@ use super::*;
         let captures = harness.rest_captures.lock().expect("captures lock");
         assert_eq!(captures.len(), 1);
     }
+
+    // ---------------------------------------------------------------------
+    // Bounded cross-key retry seam coverage (plan provider-key-429-retry todo 9).
+    //
+    // The provider REST facades share the todo-6 Tavily HTTP retry contract: at
+    // most ONE extra upstream attempt per logical request, zero sleep, one
+    // visible `request_logs` row per attempt marked through `fallback_reason`,
+    // one billing settlement on whatever the chain returns, and a byte-for-byte
+    // passthrough of the buffered attempt whenever the kernel says
+    // `ServeOriginal`. What this battery adds is the PROVIDER dimension: the two
+    // Exa vetoes (429 and team-scoped 402 keep a single attempt even with a
+    // willing second key and a willing mock) against a KEY-scoped Exa 402, which
+    // does rotate.
+    //
+    // Every case seeds a TWO-key pool and a mock that would happily serve a
+    // second attempt, so a single-attempt outcome can only be explained by
+    // policy - never by an empty pool or an unwilling upstream.
+    //
+    // rustfmt never visits this file (it is declared from an `include!`d
+    // `tests.rs`), so the four-space module indentation below is kept by hand.
+    // ---------------------------------------------------------------------
+
+    /// SerpApi's hourly-flavor 429 body: classifies `RateLimited`, never
+    /// `Exhausted` (the run-out flavor is the todo-11 battery's row).
+    const FACADE_RETRY_SERPAPI_HOURLY_BODY: &str =
+        r#"{"error":"Your account has exceeded its hourly throughput limit."}"#;
+    /// Exa 429 body. `RATE_LIMIT_EXCEEDED` is NOT a budget tag, so this veto
+    /// comes from the rate-limit family, not from tag evidence.
+    const FACADE_RETRY_EXA_RATE_LIMITED_BODY: &str =
+        r#"{"requestId":"mock","error":"Rate limit exceeded","tag":"RATE_LIMIT_EXCEEDED"}"#;
+    /// Exa team-scoped 402: another key cannot lift a team budget, so the kernel
+    /// vetoes the rotation.
+    const FACADE_RETRY_EXA_TEAM_BUDGET_BODY: &str =
+        r#"{"requestId":"mock","error":"team budget spent","tag":"TEAM_BUDGET_EXCEEDED"}"#;
+    /// Exa KEY-scoped 402: this key's own prepaid credits ran out, so another key
+    /// can serve the request.
+    const FACADE_RETRY_EXA_KEY_BUDGET_BODY: &str =
+        r#"{"requestId":"mock","error":"no more credits","tag":"NO_MORE_CREDITS"}"#;
+    /// Body the mock returns on every attempt after a rejected first one.
+    /// Distinct from each rejection body so the client-visible bytes prove WHICH
+    /// attempt was served.
+    const FACADE_RETRY_SECOND_HIT_BODY: &str =
+        r#"{"organic_results":[{"title":"second key hit"}],"requestId":"mock"}"#;
+
+    /// One provider REST upstream attempt as the mock saw it: the upstream path,
+    /// the pooled key that reached it, and the raw query. Recording the query is
+    /// what lets a case prove the per-attempt URL rebuild injected the native key
+    /// slot exactly ONCE.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct FacadeRetryAttempt {
+        path: String,
+        api_key: String,
+        query: Option<String>,
+    }
+
+    /// Mock behaviour: which upstream path rejects on its first attempt, and
+    /// with what response. Later attempts on that path always succeed.
+    #[derive(Debug, Clone, Copy)]
+    struct FacadeRetryMockPlan {
+        path: &'static str,
+        first_status: u16,
+        first_retry_after: Option<&'static str>,
+        first_body: &'static str,
+    }
+
+    impl FacadeRetryMockPlan {
+        /// The rotation shape: the first attempt on `path` answers the rejection
+        /// and every later attempt succeeds, so ONLY the retry policy explains
+        /// what the client ends up seeing.
+        fn rotating_after_rejection(
+            path: &'static str,
+            first_status: u16,
+            first_retry_after: Option<&'static str>,
+            first_body: &'static str,
+        ) -> Self {
+            Self {
+                path,
+                first_status,
+                first_retry_after,
+                first_body,
+            }
+        }
+    }
+
+    /// JSON response with an optional Retry-After header.
+    fn facade_retry_json_response(status: u16, retry_after: Option<&str>, body: &str) -> Response {
+        let mut builder =
+            Response::builder().status(status).header(CONTENT_TYPE, "application/json");
+        if let Some(retry_after) = retry_after {
+            builder = builder.header(axum::http::header::RETRY_AFTER, retry_after);
+        }
+        builder
+            .body(Body::from(body.to_string()))
+            .expect("build mock response")
+    }
+
+    /// The pooled key an upstream attempt carried, read out of whichever native
+    /// slot its provider uses: SerpApi's `api_key` query slot, Exa's `x-api-key`
+    /// header, Brave's `x-subscription-token` header. The seeded mock keys are
+    /// URL-safe, so the raw query pair is the exact value the executor appended.
+    fn facade_retry_upstream_key(query: Option<&str>, headers: &HeaderMap) -> String {
+        if let Some(query) = query {
+            for pair in query.split('&') {
+                if let Some(value) = pair.strip_prefix("api_key=") {
+                    return value.to_string();
+                }
+            }
+        }
+        for name in ["x-api-key", "x-subscription-token"] {
+            if let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) {
+                return value.to_string();
+            }
+        }
+        String::new()
+    }
+
+    /// Router serving every provider REST upstream path under `plan` and
+    /// recording each attempt. One mock covers SerpApi (`/search` GET), Exa
+    /// (`/search` POST) and Brave (`/res/v1/*` GET) alike, so a case only names
+    /// the upstream path it rejects on.
+    fn facade_retry_mock_router(
+        plan: FacadeRetryMockPlan,
+        attempts: Arc<Mutex<Vec<FacadeRetryAttempt>>>,
+    ) -> Router {
+        Router::new().fallback(move |req: Request<Body>| {
+            let attempts = attempts.clone();
+            async move {
+                let (parts, body) = req.into_parts();
+                let _ = body::to_bytes(body, BODY_LIMIT).await.unwrap_or_default();
+                let path = parts.uri.path().to_string();
+                let query = parts.uri.query().map(str::to_string);
+                let api_key = facade_retry_upstream_key(parts.uri.query(), &parts.headers);
+                let attempt = {
+                    let mut seen = attempts.lock().expect("attempts lock poisoned");
+                    let attempt = seen.iter().filter(|entry| entry.path == path).count() + 1;
+                    seen.push(FacadeRetryAttempt {
+                        path: path.clone(),
+                        api_key,
+                        query,
+                    });
+                    attempt
+                };
+                if path == plan.path && attempt == 1 {
+                    return facade_retry_json_response(
+                        plan.first_status,
+                        plan.first_retry_after,
+                        plan.first_body,
+                    );
+                }
+                facade_retry_json_response(200, None, FACADE_RETRY_SECOND_HIT_BODY)
+            }
+        })
+    }
+
+    struct ProviderFacadeRetryHarness {
+        addr: SocketAddr,
+        attempts: Arc<Mutex<Vec<FacadeRetryAttempt>>>,
+        token: String,
+        token_id: String,
+        db_str: String,
+        db_path: PathBuf,
+    }
+
+    impl Drop for ProviderFacadeRetryHarness {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.db_path);
+        }
+    }
+
+    /// Two-key-per-provider pool in front of a plan-driven mock upstream. The
+    /// second key is what makes a rotation possible at all, so a single-attempt
+    /// outcome is always a policy verdict and never an empty pool.
+    async fn spawn_provider_facade_retry_harness(
+        prefix: &str,
+        plan: FacadeRetryMockPlan,
+    ) -> ProviderFacadeRetryHarness {
+        let db_path = temp_db_path(prefix);
+        let db_str = db_path.to_string_lossy().to_string();
+        let attempts: Arc<Mutex<Vec<FacadeRetryAttempt>>> = Arc::new(Mutex::new(Vec::new()));
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = facade_retry_mock_router(plan, attempts.clone());
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app.into_make_service())
+                .await
+                .unwrap();
+        });
+        let upstream = format!("http://{upstream_addr}");
+        let providers = tavily_hikari::ProviderBootstrap {
+            serpapi_upstream: upstream.clone(),
+            // Path-prefixed MCP upstream, as in the routing harness: the retry
+            // seam must never touch it.
+            serpapi_mcp_upstream: format!("{upstream}/gw/mcp"),
+            exa_upstream: upstream.clone(),
+            brave_upstream: upstream.clone(),
+            serpapi_keys: vec![
+                "mock-serpapi-key-a".to_string(),
+                "mock-serpapi-key-b".to_string(),
+            ],
+            exa_keys: vec![
+                "mock-exa-key-a".to_string(),
+                "mock-exa-key-b".to_string(),
+            ],
+            brave_keys: vec![
+                "mock-brave-key-a".to_string(),
+                "mock-brave-key-b".to_string(),
+            ],
+        };
+        let proxy = TavilyProxy::with_providers_in_ha_mode(
+            vec!["tvly-facade-retry-key".to_string()],
+            &format!("{upstream}/mcp"),
+            &db_str,
+            tavily_hikari::TavilyProxyOptions::from_database_path(&db_str),
+            providers,
+            tavily_hikari::HaMode::Single,
+        )
+        .await
+        .expect("proxy created");
+        let access_token = proxy
+            .create_access_token(Some(prefix))
+            .await
+            .expect("create access token");
+        let state = Arc::new(AppState {
+            proxy,
+            static_dir: None,
+            forward_auth: ForwardAuthConfig::new(None, None, None, None),
+            forward_auth_enabled: true,
+            builtin_admin: BuiltinAdminAuth::new(false, None, None),
+            admin_passkey: AdminPasskeyOptions::disabled(),
+            linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+            linuxdo_credit: LinuxDoCreditOptions::disabled(),
+            ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+            dev_open_admin: false,
+            usage_base: upstream.clone(),
+            api_key_ip_geo_origin: "https://api.country.is".to_string(),
+            dashboard_overview_cache: new_dashboard_overview_cache(),
+            remote_attempt_admission: new_remote_attempt_admission(),
+        });
+        let app = Router::new()
+            .merge(provider_facade::provider_facade_routes())
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service()).await.unwrap();
+        });
+        ProviderFacadeRetryHarness {
+            addr,
+            attempts,
+            token: access_token.token,
+            token_id: access_token.id,
+            db_str,
+            db_path,
+        }
+    }
+
+    /// One `observability.request_logs` row of a provider facade attempt, in the
+    /// order the attempts ran.
+    #[derive(Debug)]
+    struct FacadeRetryLogRow {
+        provider: Option<String>,
+        status_code: Option<i64>,
+        result_status: String,
+        fallback_reason: Option<String>,
+        api_key_id: Option<String>,
+    }
+
+    async fn fetch_facade_retry_request_log_rows(
+        pool: &sqlx::SqlitePool,
+    ) -> Vec<FacadeRetryLogRow> {
+        let rows = sqlx::query(
+            r#"
+            SELECT provider, status_code, result_status, fallback_reason, api_key_id
+            FROM observability.request_logs
+            ORDER BY id ASC
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+        .expect("fetch request log rows");
+        rows.iter()
+            .map(|row| FacadeRetryLogRow {
+                provider: row.try_get::<Option<String>, _>("provider").unwrap(),
+                status_code: row.try_get::<Option<i64>, _>("status_code").unwrap(),
+                result_status: row.try_get::<String, _>("result_status").unwrap(),
+                fallback_reason: row
+                    .try_get::<Option<String>, _>("fallback_reason")
+                    .unwrap(),
+                api_key_id: row.try_get::<Option<String>, _>("api_key_id").unwrap(),
+            })
+            .collect()
+    }
+
+    /// One `auth_token_logs` row. Billing settles once per logical request, so a
+    /// retry chain must never produce more than one - and it must describe the
+    /// FINAL attempt.
+    #[derive(Debug)]
+    struct FacadeRetryTokenLog {
+        result_status: String,
+        business_credits: Option<i64>,
+        http_status: Option<i64>,
+    }
+
+    async fn fetch_facade_retry_token_logs(
+        pool: &sqlx::SqlitePool,
+        token_id: &str,
+    ) -> Vec<FacadeRetryTokenLog> {
+        let rows = sqlx::query(
+            r#"
+            SELECT result_status, business_credits, http_status
+            FROM auth_token_logs
+            WHERE token_id = ?
+            ORDER BY id ASC
+            "#,
+        )
+        .bind(token_id)
+        .fetch_all(pool)
+        .await
+        .expect("fetch token log rows");
+        rows.iter()
+            .map(|row| FacadeRetryTokenLog {
+                result_status: row.try_get::<String, _>("result_status").unwrap(),
+                business_credits: row.try_get::<Option<i64>, _>("business_credits").unwrap(),
+                http_status: row.try_get::<Option<i64>, _>("http_status").unwrap(),
+            })
+            .collect()
+    }
+
+    /// `api_keys.status` of one key.
+    async fn fetch_facade_retry_key_status(pool: &sqlx::SqlitePool, key_id: &str) -> String {
+        sqlx::query_scalar("SELECT status FROM api_keys WHERE id = ?")
+            .bind(key_id)
+            .fetch_one(pool)
+            .await
+            .expect("fetch api key status")
+    }
+
+    /// Transient backoffs armed for one key as `(scope, reason_code)`. Empty
+    /// means the key was never cooled.
+    async fn fetch_facade_retry_armed_backoffs(
+        pool: &sqlx::SqlitePool,
+        key_id: &str,
+    ) -> Vec<(String, Option<String>)> {
+        let rows = sqlx::query(
+            r#"
+            SELECT scope, reason_code
+            FROM api_key_transient_backoffs
+            WHERE key_id = ?
+            ORDER BY scope ASC
+            "#,
+        )
+        .bind(key_id)
+        .fetch_all(pool)
+        .await
+        .expect("fetch transient backoff rows");
+        rows.iter()
+            .map(|row| {
+                (
+                    row.try_get::<String, _>("scope").unwrap(),
+                    row.try_get::<Option<String>, _>("reason_code").unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// The recorded upstream attempts, in order.
+    fn facade_retry_seen(harness: &ProviderFacadeRetryHarness) -> Vec<FacadeRetryAttempt> {
+        harness.attempts.lock().expect("attempts lock poisoned").clone()
+    }
+
+    /// Asserts the two-attempt rotation shape shared by the happy cases: the
+    /// mock saw exactly two attempts on `path`, on two DIFFERENT keys of the
+    /// seeded pool, each with the native key slot injected exactly once.
+    fn assert_facade_retry_rotated(seen: &[FacadeRetryAttempt], path: &str, pool_keys: [&str; 2]) {
+        assert_eq!(seen.len(), 2, "one retry, never more: {seen:?}");
+        assert!(
+            seen.iter().all(|entry| entry.path == path),
+            "every attempt must target {path}: {seen:?}"
+        );
+        assert_ne!(
+            seen[0].api_key, seen[1].api_key,
+            "the retry must rotate to another key: {seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .all(|entry| pool_keys.contains(&entry.api_key.as_str())),
+            "only seeded pool keys may reach upstream: {seen:?}"
+        );
+        for entry in seen {
+            let query = entry.query.clone().unwrap_or_default();
+            // SerpApi carries the pooled key in its native `api_key` query slot;
+            // Exa and Brave carry it in a header, so their query has none. Either
+            // way the per-attempt URL rebuild must inject the slot at most once.
+            assert!(
+                query.matches("api_key=").count() <= 1,
+                "the per-attempt URL rebuild must never stack native key slots: {query}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn serpapi_facade_429_rotates_to_a_second_key_and_settles_once() {
+        // Retry-After: 0 sits inside the kernel's 2s fast-path window, so the
+        // retry is immediate and the chain never sleeps.
+        let harness = spawn_provider_facade_retry_harness(
+            "provider-facade-retry-serpapi-429",
+            FacadeRetryMockPlan::rotating_after_rejection(
+                "/search",
+                429,
+                Some("0"),
+                FACADE_RETRY_SERPAPI_HOURLY_BODY,
+            ),
+        )
+        .await;
+
+        let resp = Client::new()
+            .get(format!(
+                "http://{}/api/serpapi/search?q=rust&engine=google",
+                harness.addr
+            ))
+            .header("authorization", format!("Bearer {}", harness.token))
+            .send()
+            .await
+            .expect("serpapi request");
+
+        // The client sees the RETRY's response byte-for-byte; the buffered 429
+        // never reaches it.
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.bytes().await.expect("read response body");
+        assert_eq!(body.as_ref(), FACADE_RETRY_SECOND_HIT_BODY.as_bytes());
+
+        assert_facade_retry_rotated(
+            &facade_retry_seen(&harness),
+            "/search",
+            ["mock-serpapi-key-a", "mock-serpapi-key-b"],
+        );
+
+        let pool = connect_sqlite_test_pool(&harness.db_str).await;
+
+        // One visible request_logs row per attempt, marked attempted ->
+        // succeeded, each naming the key that actually served it.
+        let rows = fetch_facade_retry_request_log_rows(&pool).await;
+        assert_eq!(rows.len(), 2, "one request_logs row per attempt: {rows:?}");
+        assert_eq!(rows[0].provider.as_deref(), Some("serpapi"));
+        assert_eq!(rows[1].provider.as_deref(), Some("serpapi"));
+        assert_eq!(rows[0].status_code, Some(429), "first hit row keeps the 429");
+        assert_eq!(
+            rows[0].result_status, "error",
+            "the hourly 429 flavor is an error, never exhaustion"
+        );
+        assert_eq!(
+            rows[0].fallback_reason.as_deref(),
+            Some("upstream_key_retry:attempted"),
+            "the losing first hit is marked attempted"
+        );
+        assert_eq!(rows[1].status_code, Some(200), "second hit row is the success");
+        assert_eq!(rows[1].result_status, "success");
+        assert_eq!(
+            rows[1].fallback_reason.as_deref(),
+            Some("upstream_key_retry:succeeded"),
+            "the winning retry is marked succeeded"
+        );
+        assert_ne!(
+            rows[0].api_key_id, rows[1].api_key_id,
+            "the two rows must name two different pool keys: {rows:?}"
+        );
+
+        // Billing settles ONCE, on the final response: a single auth_token_logs
+        // row charging the retry's single search credit.
+        let token_logs = fetch_facade_retry_token_logs(&pool, &harness.token_id).await;
+        assert_eq!(
+            token_logs.len(),
+            1,
+            "one settlement per logical request, never one per attempt: {token_logs:?}"
+        );
+        assert_eq!(token_logs[0].result_status, "success");
+        assert_eq!(token_logs[0].http_status, Some(200));
+        assert_eq!(
+            token_logs[0].business_credits,
+            Some(1),
+            "the retry is not billed twice"
+        );
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn exa_facade_429_is_vetoed_into_a_single_unmarked_attempt() {
+        // Retry-After: 1 stays INSIDE the 2s fast-path window and the pool holds
+        // a second key the mock would serve, so the ONLY thing that can explain a
+        // single attempt is the Exa 429 veto (a team-level limit another key
+        // cannot lift).
+        let harness = spawn_provider_facade_retry_harness(
+            "provider-facade-retry-exa-429-veto",
+            FacadeRetryMockPlan::rotating_after_rejection(
+                "/search",
+                429,
+                Some("1"),
+                FACADE_RETRY_EXA_RATE_LIMITED_BODY,
+            ),
+        )
+        .await;
+
+        let resp = Client::new()
+            .post(format!("http://{}/api/exa/search", harness.addr))
+            .header("x-api-key", harness.token.clone())
+            .header("content-type", "application/json")
+            .body(r#"{"query":"rust"}"#)
+            .send()
+            .await
+            .expect("exa request");
+
+        // Byte-for-byte passthrough of the vetoed first hit: status, the upstream
+        // Retry-After and the body all survive, and the 502 path is never reused.
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1"),
+            "the upstream Retry-After header must be preserved"
+        );
+        let body = resp.bytes().await.expect("read response body");
+        assert_eq!(body.as_ref(), FACADE_RETRY_EXA_RATE_LIMITED_BODY.as_bytes());
+
+        let seen = facade_retry_seen(&harness);
+        assert_eq!(seen.len(), 1, "a vetoed 429 never replays: {seen:?}");
+        assert_eq!(seen[0].path, "/search");
+
+        let pool = connect_sqlite_test_pool(&harness.db_str).await;
+        let rows = fetch_facade_retry_request_log_rows(&pool).await;
+        assert_eq!(rows.len(), 1, "the rejected attempt stays visible: {rows:?}");
+        assert_eq!(rows[0].provider.as_deref(), Some("exa"));
+        assert_eq!(rows[0].status_code, Some(429));
+        assert!(
+            rows[0].fallback_reason.is_none(),
+            "a veto is not a chain, so the row stays unmarked: {rows:?}"
+        );
+
+        // The veto stops ROTATION, not marking: the 429 still arms the shared
+        // HTTP backoff scope on the key that was rejected.
+        let key_id = rows[0].api_key_id.clone().expect("row names its key");
+        let armed = fetch_facade_retry_armed_backoffs(&pool, &key_id).await;
+        assert!(
+            armed.iter().any(|(scope, _)| scope == "http_global"),
+            "the vetoed 429 must still cool its key: {armed:?}"
+        );
+
+        // One logical request still settles exactly once (as an error).
+        let token_logs = fetch_facade_retry_token_logs(&pool, &harness.token_id).await;
+        assert_eq!(
+            token_logs.len(),
+            1,
+            "one settlement per logical request: {token_logs:?}"
+        );
+        assert_eq!(token_logs[0].http_status, Some(429));
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn exa_facade_team_budget_402_is_vetoed_into_a_single_attempt() {
+        // TEAM_BUDGET_EXCEEDED is team-scoped: no other key in the pool can serve
+        // the request, so the kernel vetoes the rotation even though the second
+        // key is active and the mock would have answered it.
+        let harness = spawn_provider_facade_retry_harness(
+            "provider-facade-retry-exa-team-402-veto",
+            FacadeRetryMockPlan::rotating_after_rejection(
+                "/search",
+                402,
+                None,
+                FACADE_RETRY_EXA_TEAM_BUDGET_BODY,
+            ),
+        )
+        .await;
+
+        let resp = Client::new()
+            .post(format!("http://{}/api/exa/search", harness.addr))
+            .header("x-api-key", harness.token.clone())
+            .header("content-type", "application/json")
+            .body(r#"{"query":"rust"}"#)
+            .send()
+            .await
+            .expect("exa request");
+
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        let body = resp.bytes().await.expect("read response body");
+        assert_eq!(body.as_ref(), FACADE_RETRY_EXA_TEAM_BUDGET_BODY.as_bytes());
+
+        let seen = facade_retry_seen(&harness);
+        assert_eq!(
+            seen.len(),
+            1,
+            "a team-scoped 402 never rotates a key: {seen:?}"
+        );
+
+        let pool = connect_sqlite_test_pool(&harness.db_str).await;
+        let rows = fetch_facade_retry_request_log_rows(&pool).await;
+        assert_eq!(rows.len(), 1, "the rejected attempt stays visible: {rows:?}");
+        assert_eq!(rows[0].status_code, Some(402));
+        assert_eq!(rows[0].result_status, "quota_exhausted");
+        assert!(
+            rows[0].fallback_reason.is_none(),
+            "a veto is not a chain, so the row stays unmarked: {rows:?}"
+        );
+        // Marking is untouched by the veto: the key is still flipped exhausted.
+        let key_id = rows[0].api_key_id.clone().expect("row names its key");
+        assert_eq!(
+            fetch_facade_retry_key_status(&pool, &key_id).await,
+            "exhausted",
+            "the team-budget key is still marked exhausted"
+        );
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn exa_facade_key_scoped_402_rotates_to_a_second_key() {
+        // NO_MORE_CREDITS is KEY-scoped: this key's own prepaid credits ran out,
+        // so another key CAN serve the request and the veto must not fire.
+        let harness = spawn_provider_facade_retry_harness(
+            "provider-facade-retry-exa-key-402",
+            FacadeRetryMockPlan::rotating_after_rejection(
+                "/search",
+                402,
+                None,
+                FACADE_RETRY_EXA_KEY_BUDGET_BODY,
+            ),
+        )
+        .await;
+
+        let resp = Client::new()
+            .post(format!("http://{}/api/exa/search", harness.addr))
+            .header("x-api-key", harness.token.clone())
+            .header("content-type", "application/json")
+            .body(r#"{"query":"rust"}"#)
+            .send()
+            .await
+            .expect("exa request");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.bytes().await.expect("read response body");
+        assert_eq!(body.as_ref(), FACADE_RETRY_SECOND_HIT_BODY.as_bytes());
+
+        assert_facade_retry_rotated(
+            &facade_retry_seen(&harness),
+            "/search",
+            ["mock-exa-key-a", "mock-exa-key-b"],
+        );
+
+        let pool = connect_sqlite_test_pool(&harness.db_str).await;
+        let rows = fetch_facade_retry_request_log_rows(&pool).await;
+        assert_eq!(rows.len(), 2, "one request_logs row per attempt: {rows:?}");
+        assert_eq!(rows[0].provider.as_deref(), Some("exa"));
+        assert_eq!(rows[0].status_code, Some(402));
+        assert_eq!(rows[0].result_status, "quota_exhausted");
+        assert_eq!(
+            rows[0].fallback_reason.as_deref(),
+            Some("upstream_key_retry:attempted"),
+            "the exhausted first hit is marked attempted"
+        );
+        assert_eq!(rows[1].status_code, Some(200));
+        assert_eq!(rows[1].result_status, "success");
+        assert_eq!(
+            rows[1].fallback_reason.as_deref(),
+            Some("upstream_key_retry:succeeded"),
+            "the winning retry is marked succeeded"
+        );
+        assert_ne!(
+            rows[0].api_key_id, rows[1].api_key_id,
+            "the two rows must name two different pool keys: {rows:?}"
+        );
+        // The exhausted key stays exhausted: Exa recovery is success-only, so the
+        // rotation was the ONLY way this request could have been served.
+        let first_key_id = rows[0].api_key_id.clone().expect("row names its key");
+        assert_eq!(
+            fetch_facade_retry_key_status(&pool, &first_key_id).await,
+            "exhausted"
+        );
+
+        let token_logs = fetch_facade_retry_token_logs(&pool, &harness.token_id).await;
+        assert_eq!(
+            token_logs.len(),
+            1,
+            "one settlement per logical request, never one per attempt: {token_logs:?}"
+        );
+        assert_eq!(token_logs[0].result_status, "success");
+        assert_eq!(token_logs[0].http_status, Some(200));
+        assert_eq!(
+            token_logs[0].business_credits,
+            Some(1),
+            "exa search is one credit and the retry is not billed twice"
+        );
+        pool.close().await;
+    }

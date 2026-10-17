@@ -183,6 +183,76 @@ async fn create_test_token(base_url: &str) -> (String, String) {
     (token, token_id)
 }
 
+/// One `observability.request_logs` row of a provider facade attempt, joined
+/// with the leased key's secret so a case can name the pool entry instead of an
+/// opaque id. Ordered by attempt, which is what makes a bounded cross-key retry
+/// chain (plan provider-key-429-retry, 2026-10-16 amendment) readable: the loser
+/// carries `upstream_key_retry:attempted`, the attempt that ends the chain
+/// `:succeeded` or `:rejected`, and a single-attempt request keeps `None`.
+#[derive(Debug)]
+struct FacadeChainRow {
+    api_key_id: Option<String>,
+    api_key: Option<String>,
+    status_code: Option<i64>,
+    result_status: String,
+    key_effect_code: String,
+    failure_kind: Option<String>,
+    tavily_status_code: Option<i64>,
+    fallback_reason: Option<String>,
+    response_body: Option<String>,
+}
+
+async fn facade_chain_rows(pool: &sqlx::SqlitePool, token_id: &str) -> Vec<FacadeChainRow> {
+    let rows = sqlx::query(
+        "SELECT rl.api_key_id, ak.api_key, rl.status_code, rl.result_status, \
+                rl.key_effect_code, rl.failure_kind, rl.tavily_status_code, \
+                rl.fallback_reason, CAST(rl.response_body AS TEXT) AS response_body_text \
+         FROM observability.request_logs rl \
+         LEFT JOIN api_keys ak ON ak.id = rl.api_key_id \
+         WHERE rl.auth_token_id = ? ORDER BY rl.id ASC",
+    )
+    .bind(token_id)
+    .fetch_all(pool)
+    .await
+    .expect("facade chain row scan");
+    rows.iter()
+        .map(|row| FacadeChainRow {
+            api_key_id: row.try_get::<Option<String>, _>("api_key_id").unwrap(),
+            api_key: row.try_get::<Option<String>, _>("api_key").unwrap(),
+            status_code: row.try_get::<Option<i64>, _>("status_code").unwrap(),
+            result_status: row.try_get::<String, _>("result_status").unwrap(),
+            key_effect_code: row.try_get::<String, _>("key_effect_code").unwrap(),
+            failure_kind: row.try_get::<Option<String>, _>("failure_kind").unwrap(),
+            tavily_status_code: row.try_get::<Option<i64>, _>("tavily_status_code").unwrap(),
+            fallback_reason: row.try_get::<Option<String>, _>("fallback_reason").unwrap(),
+            response_body: row
+                .try_get::<Option<String>, _>("response_body_text")
+                .unwrap(),
+        })
+        .collect()
+}
+
+/// True when one token's attempt chain contains an upstream `status` - i.e. the
+/// special mock key really was leased, whether or not the bounded cross-key
+/// retry absorbed the rejection before it could reach the client.
+async fn chain_reached_status(pool: &sqlx::SqlitePool, token_id: &str, status: i64) -> bool {
+    facade_chain_rows(pool, token_id)
+        .await
+        .iter()
+        .any(|row| row.status_code == Some(status))
+}
+
+/// The upstream body one attempt persisted, decoded. The retry serves the
+/// client the winning attempt's bytes, so the loser's row is the only place the
+/// rejection body survives - and it must survive verbatim.
+fn persisted_response_json(row: &FacadeChainRow) -> Value {
+    let text = row
+        .response_body
+        .as_deref()
+        .expect("the attempt row persists its upstream response body");
+    serde_json::from_str(text).expect("persisted response body is JSON")
+}
+
 // ---------------------------------------------------------------------------
 // SerpApi REST facade section (plan todo 12).
 // ---------------------------------------------------------------------------
@@ -655,10 +725,14 @@ mod serpapi {
         pool.close().await;
     }
 
-    /// 429 run-out passes through verbatim; the leased key is marked
-    /// exhausted; the next request leases the OTHER pooled key (200).
+    /// Amended contract (plan provider-key-429-retry, 2026-10-16): with a second
+    /// eligible key pooled, a run-out 429 no longer reaches the client - the
+    /// bounded cross-key retry absorbs it inside the same request. The leased key
+    /// is still marked exhausted, BOTH attempts keep their own marked row (the
+    /// loser still persisting the run-out body verbatim), the logical request
+    /// settles exactly once, and the next request leases the OTHER pooled key.
     #[tokio::test]
-    async fn serpapi_429_run_out_marks_exhausted_and_next_request_leases_next_key() {
+    async fn serpapi_429_run_out_marks_exhausted_and_rotates_to_the_next_key() {
         let harness = spawn_harness(
             "facades-serpapi-runout",
             &["key-exhausted", "sp-good-2"],
@@ -669,21 +743,33 @@ mod serpapi {
         // Fresh keys tie on last_used_at and the id tie-break is a random
         // nanoid, so drive the LRU deterministically: a fresh token has no
         // affinity, and once the good key has been leased (touched) the
-        // next fresh token MUST land on the untouched key-exhausted.
+        // next fresh token MUST land on the untouched key-exhausted. The
+        // rejection is now absorbed in-request, so the lease that hit the
+        // special key is detected off the attempt rows, not the client status.
         let mut run_out_token: Option<(String, String)> = None;
         for _ in 0..3 {
             let (token, token_id) = create_test_token(&harness.base_url).await;
             let (status, body) = harness.get_search_with_token(&token, "q=runout").await;
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                assert_eq!(body, mock_run_out_body(), "run-out body verbatim");
+            assert_eq!(
+                status,
+                reqwest::StatusCode::OK,
+                "an eligible pool absorbs the run-out 429"
+            );
+            assert_eq!(
+                body,
+                mock_success_body(),
+                "the client sees the retry's bytes"
+            );
+            let pool = harness.pool().await;
+            let leased_special_key = chain_reached_status(&pool, &token_id, 429).await;
+            pool.close().await;
+            if leased_special_key {
                 run_out_token = Some((token, token_id));
                 break;
             }
-            assert_eq!(status, reqwest::StatusCode::OK, "fresh key leases succeed");
-            assert_eq!(body, mock_success_body());
         }
         let Some((run_out_token, run_out_token_id)) = run_out_token else {
-            panic!("run-out 429 never observed while a special key is pooled");
+            panic!("run-out 429 never leased while a special key is pooled");
         };
 
         let pool = harness.pool().await;
@@ -694,55 +780,47 @@ mod serpapi {
                 .expect("exhausted key row");
         assert_eq!(exhausted_status, "exhausted");
 
-        let row = sqlx::query(
-            "SELECT api_key_id, result_status, key_effect_code, failure_kind, tavily_status_code \
-             FROM observability.request_logs WHERE auth_token_id = ? ORDER BY id DESC LIMIT 1",
-        )
-        .bind(&run_out_token_id)
-        .fetch_one(&pool)
-        .await
-        .expect("429 request log row");
-        assert_eq!(row.get::<String, _>("result_status"), "quota_exhausted");
-        assert_eq!(row.get::<String, _>("key_effect_code"), "marked_exhausted");
-        assert!(row.get::<Option<String>, _>("failure_kind").is_none());
-        assert_eq!(row.get::<i64, _>("tavily_status_code"), 429);
-        let exhausted_key_id = row.get::<Option<String>, _>("api_key_id");
-        assert!(exhausted_key_id.is_some());
-        // The 429 row belongs to the key-exhausted pool entry.
-        let exhausted_row_key: String =
-            sqlx::query_scalar("SELECT api_key FROM api_keys WHERE id = ?")
-                .bind(exhausted_key_id.clone().unwrap_or_default())
-                .fetch_one(&pool)
-                .await
-                .expect("exhausted row key");
-        assert_eq!(exhausted_row_key, "key-exhausted");
-        pool.close().await;
-
-        // Next request on the SAME token rebinds off the exhausted key and
-        // leases the other pooled key.
-        let (status2, body2) = harness
-            .get_search_with_token(&run_out_token, "q=runout")
-            .await;
-        assert_eq!(status2, reqwest::StatusCode::OK);
-        assert_eq!(body2, mock_success_body());
-
-        let pool = harness.pool().await;
-        let row2 = sqlx::query(
-            "SELECT api_key_id FROM observability.request_logs WHERE auth_token_id = ? \
-             ORDER BY id DESC LIMIT 1",
-        )
-        .bind(&run_out_token_id)
-        .fetch_one(&pool)
-        .await
-        .expect("follow-up request log row");
-        let next_key_id = row2.get::<Option<String>, _>("api_key_id");
-        assert!(next_key_id.is_some());
-        assert_ne!(
-            next_key_id, exhausted_key_id,
-            "next request must lease a different key"
+        // The chain: attempt 1 on the key-exhausted pool entry (429,
+        // quota_exhausted, marked_exhausted, no failure_kind, marker
+        // `attempted`), then attempt 2 on the good key (200, success, marker
+        // `succeeded`).
+        let chain = facade_chain_rows(&pool, &run_out_token_id).await;
+        assert_eq!(
+            chain.len(),
+            2,
+            "one request_logs row per attempt: {chain:?}"
         );
+        assert_eq!(
+            chain[0].api_key.as_deref(),
+            Some("key-exhausted"),
+            "the 429 row belongs to the key-exhausted pool entry"
+        );
+        assert_eq!(chain[0].status_code, Some(429));
+        assert_eq!(chain[0].result_status, "quota_exhausted");
+        assert_eq!(chain[0].key_effect_code, "marked_exhausted");
+        assert!(chain[0].failure_kind.is_none());
+        assert_eq!(chain[0].tavily_status_code, Some(429));
+        assert_eq!(
+            chain[0].fallback_reason.as_deref(),
+            Some("upstream_key_retry:attempted")
+        );
+        assert_eq!(
+            persisted_response_json(&chain[0]),
+            mock_run_out_body(),
+            "the loser row persists the run-out body verbatim"
+        );
+        assert_eq!(chain[1].api_key.as_deref(), Some("sp-good-2"));
+        assert_eq!(chain[1].status_code, Some(200));
+        assert_eq!(chain[1].result_status, "success");
+        assert_eq!(
+            chain[1].fallback_reason.as_deref(),
+            Some("upstream_key_retry:succeeded")
+        );
+        let exhausted_key_id = chain[0].api_key_id.clone();
+        assert!(exhausted_key_id.is_some());
 
-        // The run-out attempt billed nothing; the success billed 1.
+        // The run-out attempt billed nothing and the absorbing retry billed 1:
+        // ONE settlement for one logical request, never one per attempt.
         let charged: i64 = sqlx::query_scalar(
             "SELECT COALESCE(SUM(business_credits), 0) FROM billing_ledger \
              WHERE token_id = ? AND billing_state = 'charged'",
@@ -751,7 +829,47 @@ mod serpapi {
         .fetch_one(&pool)
         .await
         .expect("ledger sum");
-        assert_eq!(charged, 1);
+        assert_eq!(charged, 1, "the absorbed run-out attempt bills nothing");
+        let settlements: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM billing_ledger WHERE token_id = ? AND billing_state = 'charged'",
+        )
+        .bind(&run_out_token_id)
+        .fetch_one(&pool)
+        .await
+        .expect("ledger count");
+        assert_eq!(settlements, 1, "one settlement per logical request");
+        pool.close().await;
+
+        // Next request on the SAME token rebinds off the exhausted key and
+        // leases the other pooled key on a SINGLE attempt.
+        let (status2, body2) = harness
+            .get_search_with_token(&run_out_token, "q=runout")
+            .await;
+        assert_eq!(status2, reqwest::StatusCode::OK);
+        assert_eq!(body2, mock_success_body());
+
+        let pool = harness.pool().await;
+        let chain2 = facade_chain_rows(&pool, &run_out_token_id).await;
+        assert!(
+            chain2.len() >= 3,
+            "request 2 adds at least one row: {chain2:?}"
+        );
+        let last = chain2.last().expect("at least one row");
+        assert_ne!(
+            last.api_key_id, exhausted_key_id,
+            "next request must lease a different key"
+        );
+        assert_eq!(last.api_key.as_deref(), Some("sp-good-2"));
+        assert_eq!(last.status_code, Some(200));
+        let charged: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(business_credits), 0) FROM billing_ledger \
+             WHERE token_id = ? AND billing_state = 'charged'",
+        )
+        .bind(&run_out_token_id)
+        .fetch_one(&pool)
+        .await
+        .expect("ledger sum");
+        assert_eq!(charged, 2, "each successful logical request bills once");
         pool.close().await;
     }
 
@@ -1456,12 +1574,16 @@ mod exa {
         pool.close().await;
     }
 
-    /// 402 NO_MORE_CREDITS passes through verbatim and emits the exhausted
-    /// signal through reconcile_key_health (key flips to exhausted —
-    /// Exa's SuccessOnly recovery clears it on the next success, todo 18);
-    /// the next request leases the other pooled key and bills 1.
+    /// Amended contract (plan provider-key-429-retry, 2026-10-16): a 402
+    /// NO_MORE_CREDITS is KEY-scoped, so with another eligible key pooled the
+    /// bounded cross-key retry absorbs it inside the same request instead of
+    /// passing it through. The exhausted signal still fires through
+    /// reconcile_key_health (key flips to exhausted — Exa's SuccessOnly recovery
+    /// clears it on the next success, todo 18), both attempts keep their own
+    /// marked row, the logical request bills 1 once, and the next request leases
+    /// the other pooled key.
     #[tokio::test]
-    async fn exa_402_budget_tag_passes_through_and_marks_key_exhausted() {
+    async fn exa_402_budget_tag_marks_key_exhausted_and_rotates_to_the_next_key() {
         let harness = spawn_harness(
             "facades-exa-402",
             &["key-exhausted", "ex-good-2"],
@@ -1470,23 +1592,34 @@ mod exa {
         .await;
 
         // Same LRU-driving pattern as the serpapi run-out test: fresh tokens
-        // land on the untouched special key within a few leases.
+        // land on the untouched special key within a few leases. The 402 is now
+        // absorbed in-request, so that lease is detected off the attempt rows.
         let mut budget_token: Option<(String, String)> = None;
         for _ in 0..3 {
             let (token, token_id) = create_test_token(&harness.base_url).await;
             let (status, _headers, body) = harness
                 .post_facade_with_token("/api/exa/search", &token, &json!({ "query": "budget" }))
                 .await;
-            if status == reqwest::StatusCode::PAYMENT_REQUIRED {
-                assert_eq!(body, mock_no_more_credits_body(), "402 body verbatim");
+            assert_eq!(
+                status,
+                reqwest::StatusCode::OK,
+                "an eligible pool absorbs the key-scoped 402"
+            );
+            assert_eq!(
+                body,
+                mock_search_body(),
+                "the client sees the retry's bytes"
+            );
+            let pool = harness.pool().await;
+            let leased_special_key = chain_reached_status(&pool, &token_id, 402).await;
+            pool.close().await;
+            if leased_special_key {
                 budget_token = Some((token, token_id));
                 break;
             }
-            assert_eq!(status, reqwest::StatusCode::OK, "fresh key leases succeed");
-            assert_eq!(body, mock_search_body());
         }
         let Some((budget_token, budget_token_id)) = budget_token else {
-            panic!("budget-402 never observed while the special key is pooled");
+            panic!("budget-402 never leased while the special key is pooled");
         };
 
         let pool = harness.pool().await;
@@ -1500,24 +1633,38 @@ mod exa {
             "402 budget tag must emit the exhausted signal"
         );
 
-        let row = sqlx::query(
-            "SELECT api_key_id, result_status, key_effect_code, failure_kind, tavily_status_code \
-              FROM observability.request_logs WHERE auth_token_id = ? ORDER BY id DESC LIMIT 1",
-        )
-        .bind(&budget_token_id)
-        .fetch_one(&pool)
-        .await
-        .expect("402 request log row");
-        assert_eq!(row.get::<String, _>("result_status"), "quota_exhausted");
-        assert_eq!(row.get::<String, _>("key_effect_code"), "marked_exhausted");
-        assert!(row.get::<Option<String>, _>("failure_kind").is_none());
-        assert_eq!(row.get::<i64, _>("tavily_status_code"), 402);
-        let exhausted_key_id = row.get::<Option<String>, _>("api_key_id");
+        let chain = facade_chain_rows(&pool, &budget_token_id).await;
+        assert_eq!(
+            chain.len(),
+            2,
+            "one request_logs row per attempt: {chain:?}"
+        );
+        assert_eq!(chain[0].api_key.as_deref(), Some("key-exhausted"));
+        assert_eq!(chain[0].status_code, Some(402));
+        assert_eq!(chain[0].result_status, "quota_exhausted");
+        assert_eq!(chain[0].key_effect_code, "marked_exhausted");
+        assert!(chain[0].failure_kind.is_none());
+        assert_eq!(chain[0].tavily_status_code, Some(402));
+        assert_eq!(
+            chain[0].fallback_reason.as_deref(),
+            Some("upstream_key_retry:attempted")
+        );
+        assert_eq!(
+            persisted_response_json(&chain[0]),
+            mock_no_more_credits_body(),
+            "the loser row persists the 402 body verbatim"
+        );
+        assert_eq!(chain[1].api_key.as_deref(), Some("ex-good-2"));
+        assert_eq!(chain[1].status_code, Some(200));
+        assert_eq!(chain[1].result_status, "success");
+        assert_eq!(
+            chain[1].fallback_reason.as_deref(),
+            Some("upstream_key_retry:succeeded")
+        );
+        let exhausted_key_id = chain[0].api_key_id.clone();
         assert!(exhausted_key_id.is_some());
-        pool.close().await;
 
-        // The 402 attempt billed nothing.
-        let pool = harness.pool().await;
+        // The 402 attempt billed nothing; the absorbing retry billed exactly 1.
         let charged: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM billing_ledger WHERE token_id = ? AND billing_state = 'charged'",
         )
@@ -1525,7 +1672,7 @@ mod exa {
         .fetch_one(&pool)
         .await
         .expect("ledger scan");
-        assert_eq!(charged, 0, "exhausted attempt bills nothing");
+        assert_eq!(charged, 1, "one settlement per logical request");
         pool.close().await;
 
         // Next request on the SAME token rebinds off the exhausted key.
@@ -1540,19 +1687,18 @@ mod exa {
         assert_eq!(body2, mock_search_body());
 
         let pool = harness.pool().await;
-        let row2 = sqlx::query(
-            "SELECT api_key_id FROM observability.request_logs WHERE auth_token_id = ? \
-              ORDER BY id DESC LIMIT 1",
-        )
-        .bind(&budget_token_id)
-        .fetch_one(&pool)
-        .await
-        .expect("follow-up request log row");
+        let chain2 = facade_chain_rows(&pool, &budget_token_id).await;
+        assert!(
+            chain2.len() >= 3,
+            "request 2 adds at least one row: {chain2:?}"
+        );
+        let last = chain2.last().expect("at least one row");
         assert_ne!(
-            row2.get::<Option<String>, _>("api_key_id"),
-            exhausted_key_id,
+            last.api_key_id, exhausted_key_id,
             "next request must lease a different key"
         );
+        assert_eq!(last.api_key.as_deref(), Some("ex-good-2"));
+        assert_eq!(last.status_code, Some(200));
         let charged: i64 = sqlx::query_scalar(
             "SELECT COALESCE(SUM(business_credits), 0) FROM billing_ledger \
               WHERE token_id = ? AND billing_state = 'charged'",
@@ -1561,7 +1707,7 @@ mod exa {
         .fetch_one(&pool)
         .await
         .expect("ledger sum");
-        assert_eq!(charged, 1, "the successful retry bills exactly 1");
+        assert_eq!(charged, 2, "each successful logical request bills once");
         pool.close().await;
     }
 
@@ -2316,12 +2462,15 @@ mod brave {
         pool.close().await;
     }
 
-    /// 402 QUOTA_LIMITED passes through verbatim and marks the leased key
-    /// exhausted through the existing machinery; the next request leases the
-    /// OTHER pooled key (200). Exhausted Brave keys recover via T9's
-    /// reset_monthly RateLimitResetWindow — NOT duplicated here (todo-18 depth).
+    /// Amended contract (plan provider-key-429-retry, 2026-10-16): a 402
+    /// QUOTA_LIMITED still marks the leased key exhausted through the existing
+    /// machinery, but with another eligible key pooled the bounded cross-key
+    /// retry absorbs it inside the same request instead of passing it through;
+    /// the next request leases the OTHER pooled key (200) on a single attempt.
+    /// Exhausted Brave keys recover via T9's reset_monthly RateLimitResetWindow —
+    /// NOT duplicated here (todo-18 depth).
     #[tokio::test]
-    async fn brave_402_quota_limited_passes_through_and_marks_exhausted() {
+    async fn brave_402_quota_limited_marks_exhausted_and_rotates_to_the_next_key() {
         let harness = spawn_harness(
             "facades-brave-402",
             &["key-exhausted", "br-good-2"],
@@ -2330,23 +2479,30 @@ mod brave {
         .await;
 
         // Drive the LRU deterministically (serpapi/exa pattern): fresh tokens
-        // land on the untouched special key within a few leases.
+        // land on the untouched special key within a few leases. The 402 is now
+        // absorbed in-request, so that lease is detected off the attempt rows.
         let mut quota_token: Option<(String, String)> = None;
         for _ in 0..3 {
             let (token, token_id) = create_test_token(&harness.base_url).await;
             let (status, _headers, body) = harness
                 .get_facade_with_token(WEB_PATH, &token, "q=quota")
                 .await;
-            if status == reqwest::StatusCode::PAYMENT_REQUIRED {
-                assert_eq!(body, mock_quota_limited_body(), "402 body verbatim");
+            assert_eq!(
+                status,
+                reqwest::StatusCode::OK,
+                "an eligible pool absorbs the brave 402"
+            );
+            assert_eq!(body, mock_web_body(), "the client sees the retry's bytes");
+            let pool = harness.pool().await;
+            let leased_special_key = chain_reached_status(&pool, &token_id, 402).await;
+            pool.close().await;
+            if leased_special_key {
                 quota_token = Some((token, token_id));
                 break;
             }
-            assert_eq!(status, reqwest::StatusCode::OK, "fresh key leases succeed");
-            assert_eq!(body, mock_web_body());
         }
         let Some((quota_token, quota_token_id)) = quota_token else {
-            panic!("quota-402 never observed while the special key is pooled");
+            panic!("quota-402 never leased while the special key is pooled");
         };
 
         let pool = harness.pool().await;
@@ -2359,18 +2515,34 @@ mod brave {
             exhausted_status, "exhausted",
             "402 QUOTA_LIMITED must emit the exhausted signal"
         );
-        let row = sqlx::query(
-            "SELECT result_status, key_effect_code, failure_kind, tavily_status_code \
-               FROM observability.request_logs WHERE auth_token_id = ? ORDER BY id DESC LIMIT 1",
-        )
-        .bind(&quota_token_id)
-        .fetch_one(&pool)
-        .await
-        .expect("402 request log row");
-        assert_eq!(row.get::<String, _>("result_status"), "quota_exhausted");
-        assert_eq!(row.get::<String, _>("key_effect_code"), "marked_exhausted");
-        assert!(row.get::<Option<String>, _>("failure_kind").is_none());
-        assert_eq!(row.get::<i64, _>("tavily_status_code"), 402);
+        let chain = facade_chain_rows(&pool, &quota_token_id).await;
+        assert_eq!(
+            chain.len(),
+            2,
+            "one request_logs row per attempt: {chain:?}"
+        );
+        assert_eq!(chain[0].api_key.as_deref(), Some("key-exhausted"));
+        assert_eq!(chain[0].status_code, Some(402));
+        assert_eq!(chain[0].result_status, "quota_exhausted");
+        assert_eq!(chain[0].key_effect_code, "marked_exhausted");
+        assert!(chain[0].failure_kind.is_none());
+        assert_eq!(chain[0].tavily_status_code, Some(402));
+        assert_eq!(
+            chain[0].fallback_reason.as_deref(),
+            Some("upstream_key_retry:attempted")
+        );
+        assert_eq!(
+            persisted_response_json(&chain[0]),
+            mock_quota_limited_body(),
+            "the loser row persists the 402 body verbatim"
+        );
+        assert_eq!(chain[1].api_key.as_deref(), Some("br-good-2"));
+        assert_eq!(chain[1].status_code, Some(200));
+        assert_eq!(chain[1].result_status, "success");
+        assert_eq!(
+            chain[1].fallback_reason.as_deref(),
+            Some("upstream_key_retry:succeeded")
+        );
         let charged: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM billing_ledger WHERE token_id = ? AND billing_state = 'charged'",
         )
@@ -2378,15 +2550,34 @@ mod brave {
         .fetch_one(&pool)
         .await
         .expect("ledger scan");
-        assert_eq!(charged, 0, "exhausted attempt bills nothing");
+        assert_eq!(
+            charged, 1,
+            "the exhausted attempt bills nothing and the retry bills once"
+        );
         pool.close().await;
 
-        // Next request on the SAME token rebinds off the exhausted key.
+        // Next request on the SAME token rebinds off the exhausted key. Brave
+        // exhausted keys recover through reset_monthly's RateLimitResetWindow,
+        // so - exactly as before this lane - only the client-visible outcome is
+        // pinned here, not which key served it.
         let (status2, _headers2, body2) = harness
             .get_facade_with_token(WEB_PATH, &quota_token, "q=quota")
             .await;
         assert_eq!(status2, reqwest::StatusCode::OK);
         assert_eq!(body2, mock_web_body());
+
+        // Whatever request 2 needed to get there, its final attempt is a plain
+        // success row - and the client was never handed the 402.
+        let pool = harness.pool().await;
+        let chain2 = facade_chain_rows(&pool, &quota_token_id).await;
+        assert!(
+            chain2.len() >= 3,
+            "request 2 adds at least one row: {chain2:?}"
+        );
+        let last = chain2.last().expect("at least one row");
+        assert_eq!(last.status_code, Some(200));
+        assert_eq!(last.result_status, "success");
+        pool.close().await;
     }
 
     /// 429 RATE_LIMITED passes through verbatim and arms a SHORT second-scale

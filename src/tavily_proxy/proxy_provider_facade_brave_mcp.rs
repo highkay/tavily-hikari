@@ -146,6 +146,11 @@ impl TavilyProxy {
                     status,
                     body_bytes: &body_bytes,
                     signal,
+                    // Plan todo 9 exclusion: the Brave LOCAL MCP facade stays
+                    // SINGLE-ATTEMPT in v1 (the todo-13 MCP ladder owns session
+                    // rebind), so it never enters the cross-key retry chain and
+                    // its row keeps `fallback_reason: None`.
+                    retry_marker: ProviderFacadeRetryMarker::NotInChain,
                 };
                 let recorded = self
                     .record_brave_rest_facade_attempt(&attempt_ctx, &headers)
@@ -174,8 +179,16 @@ impl TavilyProxy {
                 );
                 // Transport failure persists an audit row (keyed on /brave/mcp +
                 // the MCP body) exactly like the REST facade transport path.
-                self.log_brave_rest_facade_transport_error(&request, &lease, &sanitized_headers, &err)
-                    .await?;
+                // Single-attempt surface (plan todo 9 exclusion): no chain
+                // marker.
+                self.log_brave_rest_facade_transport_error(
+                    &request,
+                    &lease,
+                    &sanitized_headers,
+                    &err,
+                    None,
+                )
+                .await?;
                 Err(err)
             }
         }

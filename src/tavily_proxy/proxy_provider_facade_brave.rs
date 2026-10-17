@@ -381,7 +381,9 @@ impl TavilyProxy {
                 proxy_session_id: None,
                 routing_subject_hash: None,
                 upstream_operation: Some(ctx.request.upstream_operation),
-                fallback_reason: None,
+                fallback_reason: ctx
+                    .retry_marker
+                    .fallback_reason(analysis.status == OUTCOME_SUCCESS),
                 forwarded_headers: &ctx.sanitized_headers.forwarded,
                 dropped_headers: &ctx.sanitized_headers.dropped,
                 client_ip: ctx.request.client_ip.as_ref(),
@@ -487,13 +489,16 @@ impl TavilyProxy {
     /// Transport-failure audit row for the Brave REST facade (mirrors the Exa
     /// transport-error row; the T11 boundary applies to Tavily only now that
     /// SerpApi/Exa/Brave each own their record path). No response headers exist
-    /// on a transport failure, so there is nothing to harvest.
+    /// on a transport failure, so there is nothing to harvest. `fallback_reason`
+    /// is the todo-9 retry-chain marker of this dead attempt; the Brave LOCAL
+    /// MCP facade stays single-attempt and passes `None`.
     pub(crate) async fn log_brave_rest_facade_transport_error(
         &self,
         request: &ProviderRestFacadeRequest,
         lease: &ApiKeyLease,
         sanitized_headers: &SanitizedHeaders,
         err: &ProxyError,
+        fallback_reason: Option<&'static str>,
     ) -> Result<(), ProxyError> {
         if request.provider != providers::ProviderId::Brave {
             return Ok(());
@@ -529,7 +534,7 @@ impl TavilyProxy {
                 proxy_session_id: None,
                 routing_subject_hash: None,
                 upstream_operation: Some(request.upstream_operation),
-                fallback_reason: None,
+                fallback_reason,
                 forwarded_headers: &sanitized_headers.forwarded,
                 dropped_headers: &sanitized_headers.dropped,
                 client_ip: request.client_ip.as_ref(),
