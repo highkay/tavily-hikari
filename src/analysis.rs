@@ -5,8 +5,10 @@ use crate::*;
 mod provider_failure_classification;
 #[allow(unused_imports)]
 pub(crate) use provider_failure_classification::{
-    ProviderFailureEvidence, ProviderFailureSignal, brave_rate_limit_reset_secs,
-    classify_provider_failure, extract_sse_json_messages, low_quota_depletion_applies,
+    EXA_BUDGET_TAG_API_KEY_BUDGET_EXCEEDED, EXA_BUDGET_TAG_NO_MORE_CREDITS,
+    EXA_BUDGET_TAG_TEAM_BUDGET_EXCEEDED, ExaBudgetTag, ProviderFailureEvidence,
+    ProviderFailureSignal, brave_rate_limit_reset_secs, classify_provider_failure,
+    exa_budget_tag_evidence, extract_sse_json_messages, low_quota_depletion_applies,
 };
 pub use provider_failure_classification::{
     mcp_response_has_any_error, mcp_response_has_any_success,

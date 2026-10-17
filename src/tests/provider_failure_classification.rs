@@ -4,6 +4,11 @@
 //! dual-429 discrimination raw + SSE, Brave 422 VALIDATION loc guard), the M7
 //! tool-name collision guard, the M8 Tavily-only depletion gate, the M9
 //! static-whitelist surfaces, and Tavily byte-stability pins.
+//!
+//! Plan todo 10 adds the Exa 402 budget-tag scope pins: the tag literals live
+//! only in the classifier constants, `Exhausted` keeps its single meaning for
+//! every mark/arm consumer, and the KEY-vs-TEAM scope is asserted both on its
+//! own and through the cross-key retry kernel veto that consumes it.
 
 use super::*;
 use crate::providers::ProviderId;
@@ -332,6 +337,154 @@ fn exa_429_parses_retry_after_header() {
         ProviderFailureSignal::RateLimited {
             retry_after_secs: None
         }
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Plan todo 10: the Exa 402 budget tag as STRUCTURED retry-veto evidence. The
+// signal keeps its single `Exhausted` meaning (no mark/arm change); the
+// KEY-vs-TEAM scope rides beside it for the cross-key retry kernel.
+// ---------------------------------------------------------------------------
+
+/// Exa 402 envelope built from a classifier constant, so no test restates a
+/// budget-tag literal.
+fn exa_402_body(tag: &str) -> Vec<u8> {
+    format!(r#"{{"requestId":"r1","error":"budget","tag":"{tag}"}}"#).into_bytes()
+}
+
+#[test]
+fn exa_402_budget_tags_surface_structured_scope_evidence() {
+    // Given the three documented Exa budget tags (docs §4.2)
+    let cases = [
+        (EXA_BUDGET_TAG_NO_MORE_CREDITS, ExaBudgetTag::NoMoreCredits),
+        (
+            EXA_BUDGET_TAG_API_KEY_BUDGET_EXCEEDED,
+            ExaBudgetTag::ApiKeyBudgetExceeded,
+        ),
+        (
+            EXA_BUDGET_TAG_TEAM_BUDGET_EXCEEDED,
+            ExaBudgetTag::TeamBudgetExceeded,
+        ),
+    ];
+
+    for (tag, expected) in cases {
+        let body = exa_402_body(tag);
+
+        // When the body is read as veto evidence, then the tag maps to its scope
+        assert_eq!(
+            exa_budget_tag_evidence(&body),
+            Some(expected),
+            "exa 402 tag {tag}"
+        );
+        // And the same literal parses case- and whitespace-insensitively
+        assert_eq!(
+            ExaBudgetTag::from_tag(&format!(" {} ", tag.to_ascii_lowercase())),
+            Some(expected),
+            "exa 402 tag {tag} case variant"
+        );
+
+        // Then the main class is untouched: every budget tag still exhausts
+        assert_eq!(
+            classify(ProviderId::Exa, 402, &body),
+            ProviderFailureSignal::Exhausted,
+            "exa 402 tag {tag} signal"
+        );
+    }
+}
+
+#[test]
+fn exa_402_team_budget_scope_is_not_key_scoped() {
+    // The veto-relevant distinction: a team budget cannot be escaped by
+    // rotating keys, a key budget can.
+    assert!(!ExaBudgetTag::TeamBudgetExceeded.is_key_scoped());
+    assert!(ExaBudgetTag::NoMoreCredits.is_key_scoped());
+    assert!(ExaBudgetTag::ApiKeyBudgetExceeded.is_key_scoped());
+
+    // And that distinction survives the trip through a real body.
+    let team = exa_402_body(EXA_BUDGET_TAG_TEAM_BUDGET_EXCEEDED);
+    assert_eq!(
+        exa_budget_tag_evidence(&team).map(ExaBudgetTag::is_key_scoped),
+        Some(false)
+    );
+    let key = exa_402_body(EXA_BUDGET_TAG_API_KEY_BUDGET_EXCEEDED);
+    assert_eq!(
+        exa_budget_tag_evidence(&key).map(ExaBudgetTag::is_key_scoped),
+        Some(true)
+    );
+}
+
+#[test]
+fn exa_402_without_budget_tag_yields_no_evidence_and_stays_client_error() {
+    // An unknown-tag / untagged / unparsable 402 hands the kernel no scope to
+    // replay on and never exhausts a key (pre-todo-10 behavior, unchanged).
+    for body in [
+        br#"{"requestId":"r1","error":"Payment required","tag":"OTHER"}"#.as_slice(),
+        br#"{"requestId":"r1","error":"Payment required"}"#.as_slice(),
+        b"{}".as_slice(),
+        b"not json".as_slice(),
+    ] {
+        assert_eq!(exa_budget_tag_evidence(body), None);
+        assert_eq!(
+            classify(ProviderId::Exa, 402, body),
+            ProviderFailureSignal::ClientError
+        );
+    }
+}
+
+/// Plan todo 10 QA (happy = team tag -> no retry, failure = key tag -> retry
+/// allowed): the classifier's structured evidence is exactly what the retry
+/// kernel's Exa veto consumes, with the signal itself unchanged.
+#[test]
+fn exa_budget_tag_evidence_drives_the_cross_key_retry_veto() {
+    let budget = KeyRetryBudget::defaults();
+    let context = KeyRetryContext {
+        attempts_used: 1,
+        elapsed: Duration::from_millis(120),
+        eligible_key_available: true,
+    };
+    let vetoed = RetryDecision::ServeOriginal(ServeOriginalReason::Ineligible(
+        KeyRetryIneligibleReason::ProviderVeto,
+    ));
+    let decide = |body: &[u8]| {
+        let signal = classify(ProviderId::Exa, 402, body);
+        let evidence = KeyRetryAttemptEvidence {
+            exa_budget_tag: exa_budget_tag_evidence(body),
+            transport_failure: None,
+        };
+        decide_cross_key_retry(
+            ProviderId::Exa,
+            KeyRetryRequestKind::ProviderRestRead,
+            signal,
+            Some(402),
+            &evidence,
+            None,
+            &context,
+            &budget,
+        )
+    };
+
+    // Happy scenario: a TEAM-scoped 402 is vetoed - another key cannot lift it.
+    assert_eq!(
+        decide(&exa_402_body(EXA_BUDGET_TAG_TEAM_BUDGET_EXCEEDED)),
+        vetoed
+    );
+
+    // Failure scenario: both KEY-scoped tags stay replayable on another key.
+    for tag in [
+        EXA_BUDGET_TAG_NO_MORE_CREDITS,
+        EXA_BUDGET_TAG_API_KEY_BUDGET_EXCEEDED,
+    ] {
+        assert_eq!(
+            decide(&exa_402_body(tag)),
+            RetryDecision::Retry,
+            "exa 402 tag {tag} must stay retryable"
+        );
+    }
+
+    // Missing evidence keeps the conservative veto, never a retry.
+    assert_eq!(
+        decide(br#"{"requestId":"r1","error":"Payment required"}"#),
+        vetoed
     );
 }
 

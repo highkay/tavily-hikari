@@ -39,8 +39,10 @@
 // staged-seam `allow`s are gone from everything that path consumes. Still
 // staged (allow kept, named at each item): `is_retry_eligible` /
 // `key_retry_ineligibility` (the default-window predicate the table tests pin),
-// `ExaBudgetTag` and `KeyRetryRequestKind::ProviderRestRead` - all of them
-// land with todo 9 (provider REST facades) and todo 10 (Exa budget tag).
+// `KeyRetryAttemptEvidence::exa_budget` and
+// `KeyRetryRequestKind::ProviderRestRead` - they land with todo 9 (provider
+// REST facades), which fills the Exa budget-tag evidence todo 10 moved into
+// the classifier (`crate::analysis::exa_budget_tag_evidence`).
 
 /// Attempt ceiling default: the first upstream attempt plus ONE cross-key
 /// retry. The plan freezes "at most one retry", so this is also the ceiling
@@ -98,34 +100,13 @@ impl KeyRetryRequestKind {
     }
 }
 
-/// Exa 402 budget-tag scope. Todo 10 surfaces the classifier `tag` on the
-/// failure signal; until then a facade caller can fill this from the same tag
-/// literals `classify_exa_failure` matches.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExaBudgetTag {
-    NoMoreCredits,
-    ApiKeyBudgetExceeded,
-    TeamBudgetExceeded,
-}
-
-#[allow(dead_code)]
-impl ExaBudgetTag {
-    pub(crate) fn from_tag(tag: &str) -> Option<Self> {
-        match tag.trim().to_ascii_uppercase().as_str() {
-            "NO_MORE_CREDITS" => Some(Self::NoMoreCredits),
-            "API_KEY_BUDGET_EXCEEDED" => Some(Self::ApiKeyBudgetExceeded),
-            "TEAM_BUDGET_EXCEEDED" => Some(Self::TeamBudgetExceeded),
-            _ => None,
-        }
-    }
-
-    /// True when the budget that ran out belongs to the KEY, so another key can
-    /// serve the request; a team-scoped budget cannot be escaped by switching.
-    pub(crate) fn is_key_scoped(self) -> bool {
-        !matches!(self, Self::TeamBudgetExceeded)
-    }
-}
+// The Exa 402 budget-tag scope lives in the CLASSIFIER
+// (`crate::analysis::ExaBudgetTag`, in scope here through the module-level
+// `use crate::analysis::*`), because that is where the upstream `tag` literals
+// are parsed - plan todo 10 made it the single source of truth. The kernel
+// only consumes the already-parsed scope as
+// `KeyRetryAttemptEvidence::exa_budget_tag`, which is what keeps this file
+// zero-I/O and the literals down to one definition.
 
 /// Transport-layer failure detail for an attempt that never produced an HTTP
 /// response. The caller derives it from its own `ProxyError` / `reqwest::Error`
@@ -148,7 +129,9 @@ pub(crate) enum KeyRetryTransportFailure {
 /// nor a body, so its detail rides here too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KeyRetryAttemptEvidence {
-    /// Exa 402 budget tag when the body carried one (todo 10 evidence field).
+    /// Exa 402 budget-tag scope when the body carried one. Filled from the
+    /// classifier's `exa_budget_tag_evidence(body)` (plan todo 10), which owns
+    /// the tag literals; `None` keeps an Exa 402 vetoed.
     pub(crate) exa_budget_tag: Option<ExaBudgetTag>,
     /// Set when the attempt died on the transport layer (send error/timeout).
     pub(crate) transport_failure: Option<KeyRetryTransportFailure>,
@@ -162,7 +145,8 @@ impl KeyRetryAttemptEvidence {
         }
     }
 
-    /// Staged for plan todo 9/10 (Exa facade budget-tag evidence).
+    /// Staged for plan todo 9: the Exa facade builds this from the todo-10
+    /// classifier evidence.
     #[allow(dead_code)]
     pub(crate) const fn exa_budget(tag: ExaBudgetTag) -> Self {
         Self {
@@ -1470,16 +1454,23 @@ mod proxy_key_retry_tests {
 
     #[test]
     fn exa_budget_tag_parsing_matches_the_classifier_literals() {
+        // Every literal below is the classifier constant itself (plan todo 10
+        // made `crate::analysis` the single source of truth), so this test
+        // cannot drift away from the tag vocabulary it claims to pin.
         assert_eq!(
-            ExaBudgetTag::from_tag("NO_MORE_CREDITS"),
+            ExaBudgetTag::from_tag(EXA_BUDGET_TAG_NO_MORE_CREDITS),
             Some(ExaBudgetTag::NoMoreCredits)
         );
+        let padded = format!(
+            " {} ",
+            EXA_BUDGET_TAG_API_KEY_BUDGET_EXCEEDED.to_ascii_lowercase()
+        );
         assert_eq!(
-            ExaBudgetTag::from_tag(" api_key_budget_exceeded "),
+            ExaBudgetTag::from_tag(&padded),
             Some(ExaBudgetTag::ApiKeyBudgetExceeded)
         );
         assert_eq!(
-            ExaBudgetTag::from_tag("TEAM_BUDGET_EXCEEDED"),
+            ExaBudgetTag::from_tag(EXA_BUDGET_TAG_TEAM_BUDGET_EXCEEDED),
             Some(ExaBudgetTag::TeamBudgetExceeded)
         );
         assert_eq!(ExaBudgetTag::from_tag("OTHER"), None);
@@ -1622,18 +1613,24 @@ mod proxy_key_retry_tests {
         use KeyRetryIneligibleReason as Reason;
 
         // Garbage tag text resolves to `None`, which keeps an Exa 402 vetoed;
-        // the two case-variants that DO parse are pinned as key-scoped.
+        // the two case-variants that DO parse are pinned as key-scoped. The
+        // tag-shaped values are derived from the classifier constants, so a
+        // renamed upstream tag cannot leave a stale literal behind here.
         let oversized = "T".repeat(4096);
+        let near_miss = format!("{EXA_BUDGET_TAG_NO_MORE_CREDITS}_X");
+        let json_wrapped = format!("{{\"tag\":\"{EXA_BUDGET_TAG_TEAM_BUDGET_EXCEEDED}\"}}");
+        let lower_team = EXA_BUDGET_TAG_TEAM_BUDGET_EXCEEDED.to_ascii_lowercase();
+        let lower_credits = EXA_BUDGET_TAG_NO_MORE_CREDITS.to_ascii_lowercase();
         let tags: [&str; 10] = [
             "",
             "   ",
             "\t\n",
             "\0\0nul-bytes",
             "429",
-            "NO_MORE_CREDITS_X",
-            "{\"tag\":\"TEAM_BUDGET_EXCEEDED\"}",
-            "team_budget_exceeded",
-            "no_more_credits",
+            near_miss.as_str(),
+            json_wrapped.as_str(),
+            lower_team.as_str(),
+            lower_credits.as_str(),
             oversized.as_str(),
         ];
         for tag in tags {

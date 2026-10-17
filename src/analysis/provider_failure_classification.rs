@@ -143,22 +143,68 @@ fn push_upstream_error_texts(value: &Value, out: &mut Vec<String>) {
     }
 }
 
+/// Exa 402 budget tags exactly as the upstream envelope spells them
+/// (`docs/multi-provider-search-proxy.md` §4.2). Single source of truth for
+/// these literals: the retry kernel and its tests reference the constants and
+/// [`ExaBudgetTag::from_tag`] instead of restating the strings.
+pub(crate) const EXA_BUDGET_TAG_NO_MORE_CREDITS: &str = "NO_MORE_CREDITS";
+pub(crate) const EXA_BUDGET_TAG_API_KEY_BUDGET_EXCEEDED: &str = "API_KEY_BUDGET_EXCEEDED";
+pub(crate) const EXA_BUDGET_TAG_TEAM_BUDGET_EXCEEDED: &str = "TEAM_BUDGET_EXCEEDED";
+
+/// Which budget an Exa 402 reports as spent (plan todo 10).
+///
+/// All three tags keep classifying as [`ProviderFailureSignal::Exhausted`], so
+/// every existing mark/arm consumer sees exactly what it saw before; the
+/// KEY-vs-TEAM *scope* rides beside the signal as structured evidence for the
+/// cross-key retry kernel, whose Exa veto replays a key-scoped budget on
+/// another key and never replays a team-scoped one (another key cannot lift a
+/// team budget).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExaBudgetTag {
+    /// Prepaid account credits ran out.
+    NoMoreCredits,
+    /// This key's own budget cap was hit.
+    ApiKeyBudgetExceeded,
+    /// The team-wide budget cap was hit: no other key can serve the request.
+    TeamBudgetExceeded,
+}
+
+impl ExaBudgetTag {
+    /// Parse an upstream `tag` value. Whitespace- and case-insensitive; any
+    /// other tag yields `None`, which never means exhaustion.
+    pub(crate) fn from_tag(tag: &str) -> Option<Self> {
+        match tag.trim().to_ascii_uppercase().as_str() {
+            EXA_BUDGET_TAG_NO_MORE_CREDITS => Some(Self::NoMoreCredits),
+            EXA_BUDGET_TAG_API_KEY_BUDGET_EXCEEDED => Some(Self::ApiKeyBudgetExceeded),
+            EXA_BUDGET_TAG_TEAM_BUDGET_EXCEEDED => Some(Self::TeamBudgetExceeded),
+            _ => None,
+        }
+    }
+
+    /// True when the budget that ran out belongs to the KEY, so another key can
+    /// serve the request; a team-scoped budget cannot be escaped by switching.
+    pub(crate) fn is_key_scoped(self) -> bool {
+        !matches!(self, Self::TeamBudgetExceeded)
+    }
+}
+
+/// Structured Exa 402 veto evidence: the budget tag the body carried, or `None`
+/// when it carried no parsable budget tag (an untagged 402 is a client error,
+/// and a missing tag keeps the kernel's conservative veto). A facade caller
+/// feeds this straight into `KeyRetryAttemptEvidence::exa_budget_tag`, which is
+/// what keeps the retry kernel zero-I/O - it never parses a body itself.
+pub(crate) fn exa_budget_tag_evidence(body: &[u8]) -> Option<ExaBudgetTag> {
+    json_string_field(body, &["tag"]).and_then(|tag| ExaBudgetTag::from_tag(&tag))
+}
+
 fn classify_exa_failure(evidence: &ProviderFailureEvidence<'_>) -> ProviderFailureSignal {
     match evidence.status {
         401 => ProviderFailureSignal::AuthFailed,
-        402 => {
-            let exhausted = json_string_field(evidence.body, &["tag"]).is_some_and(|tag| {
-                matches!(
-                    tag.to_ascii_uppercase().as_str(),
-                    "NO_MORE_CREDITS" | "API_KEY_BUDGET_EXCEEDED" | "TEAM_BUDGET_EXCEEDED"
-                )
-            });
-            if exhausted {
-                ProviderFailureSignal::Exhausted
-            } else {
-                ProviderFailureSignal::ClientError
-            }
-        }
+        // Any budget tag exhausts, exactly as before; the tag's KEY-vs-TEAM
+        // scope is surfaced separately by `exa_budget_tag_evidence` for the
+        // retry veto, so `Exhausted` keeps one meaning for existing consumers.
+        402 if exa_budget_tag_evidence(evidence.body).is_some() => ProviderFailureSignal::Exhausted,
+        402 => ProviderFailureSignal::ClientError,
         429 => ProviderFailureSignal::RateLimited {
             retry_after_secs: retry_after_header_secs(evidence.headers),
         },
