@@ -392,6 +392,30 @@ fn exa_402_budget_tags_surface_structured_scope_evidence() {
     }
 }
 
+// Regression pin (plan todo 10 gate review): BEFORE, the inline matcher compared
+// raw tag bytes, so surrounding whitespace made an Exa 402 budget tag miss and
+// classify ClientError. `from_tag` and `json_string_field` now trim, and the
+// fixed direction needs the pin: a padded KEY-scoped tag still exhausts a key
+// and still surfaces the scope the cross-key retry veto replays on.
+#[test]
+fn exa_402_padded_budget_tag_classifies_exhausted() {
+    // Given an Exa 402 whose NO_MORE_CREDITS tag carries surrounding whitespace
+    let body = exa_402_body(&format!("  {EXA_BUDGET_TAG_NO_MORE_CREDITS}  "));
+
+    // When classified, Then the spent-key signal is Exhausted, never the
+    // generic ClientError the pre-trim matcher demoted it to
+    assert_eq!(
+        classify(ProviderId::Exa, 402, &body),
+        ProviderFailureSignal::Exhausted
+    );
+
+    // And the structured evidence surfaces the SAME key-scoped tag (a team tag
+    // would forbid rotation instead of replaying the 402 on another key)
+    let evidence = exa_budget_tag_evidence(&body);
+    assert_eq!(evidence, Some(ExaBudgetTag::NoMoreCredits));
+    assert_eq!(evidence.map(ExaBudgetTag::is_key_scoped), Some(true));
+}
+
 #[test]
 fn exa_402_team_budget_scope_is_not_key_scoped() {
     // The veto-relevant distinction: a team budget cannot be escaped by
