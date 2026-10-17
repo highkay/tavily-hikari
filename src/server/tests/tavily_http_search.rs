@@ -3217,3 +3217,6 @@ use tower::ServiceExt;
     // forbids raising a budget). include! keeps the module path, so the CI manifest
     // prefix server::tests::tavily_http_search::tavily_ still covers the new tests.
     include!("tavily_http_search/key_retry.rs");
+    // plan provider-key-429-retry todo 8: the budget/deadline/concurrency gates, for the
+    // same line-budget reason and with the same manifest prefix inheritance.
+    include!("tavily_http_search/key_retry_budget.rs");
