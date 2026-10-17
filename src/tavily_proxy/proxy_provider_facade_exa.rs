@@ -384,9 +384,13 @@ mod exa_facade_translation_tests {
 
     #[test]
     fn exa_health_actions_split_exhaustion_auth_and_rate_limits() {
+        // The budget tag comes from the classifier constant (plan todo 10 made it
+        // the single source of truth), so this pin cannot drift from the parser
+        // the retry veto reads.
+        let exhausted_body = format!(r#"{{"tag":"{EXA_BUDGET_TAG_NO_MORE_CREDITS}"}}"#);
         let exhausted = exa_attempt_analysis(
             StatusCode::PAYMENT_REQUIRED,
-            br#"{"tag":"NO_MORE_CREDITS"}"#,
+            exhausted_body.as_bytes(),
             ProviderFailureSignal::Exhausted,
         );
         assert!(matches!(
