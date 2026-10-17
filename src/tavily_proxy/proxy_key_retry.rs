@@ -34,44 +34,39 @@
 //   keeps settling once on the final response and the caller marks the retry
 //   chain through `fallback_reason`.
 //
-// Staged kernel: todo 6 (Tavily HTTP executor) and todo 9 (provider REST
-// facades) are the production consumers; until they land only
-// `proxy_key_retry_tests` calls it, hence the same staged-seam `allow` the
-// store primitive (`acquire_key_for_cross_key_retry`) uses.
+// Consumers: the todo-6 Tavily HTTP executor (`proxy_http_and_logs.rs`) calls
+// `decide_cross_key_retry` / `KeyRetryBudget::from_env` in production, so the
+// staged-seam `allow`s are gone from everything that path consumes. Still
+// staged (allow kept, named at each item): `is_retry_eligible` /
+// `key_retry_ineligibility` (the default-window predicate the table tests pin),
+// `ExaBudgetTag` and `KeyRetryRequestKind::ProviderRestRead` - all of them
+// land with todo 9 (provider REST facades) and todo 10 (Exa budget tag).
 
 /// Attempt ceiling default: the first upstream attempt plus ONE cross-key
 /// retry. The plan freezes "at most one retry", so this is also the ceiling
 /// the env override is clamped to.
-#[allow(dead_code)]
 pub(crate) const KEY_RETRY_MAX_ATTEMPTS_DEFAULT: u32 = 2;
 
 /// Wall-clock budget default for the whole logical request. The kernel does
 /// not read a clock; the caller passes its own elapsed time.
-#[allow(dead_code)]
 pub(crate) const KEY_RETRY_DEADLINE_SECS_DEFAULT: u64 = 5;
 
 /// A rejection is only replayed immediately when the armed Retry-After fits
 /// inside this window; anything longer is served as-is. The gate spans both
 /// retry arms, because the kernel never sleeps.
-#[allow(dead_code)]
 pub(crate) const KEY_RETRY_RATE_LIMIT_FAST_PATH_SECS_DEFAULT: u64 = 2;
 
 /// Structural ceiling for the attempt budget: env may lower it to `1` (retry
 /// off) but never raise it past one retry, which is what keeps the
 /// single-billing and no-replay arguments local.
-#[allow(dead_code)]
 pub(crate) const KEY_RETRY_MAX_ATTEMPTS_CEILING: u32 = 2;
 
 /// Sanity bound for both second budgets; a typo falls back to the default
 /// with a startup-style warning instead of silently disabling the deadline.
-#[allow(dead_code)]
 pub(crate) const KEY_RETRY_SECS_CEILING: u64 = 60;
 
-#[allow(dead_code)]
 pub(crate) const KEY_RETRY_MAX_ATTEMPTS_ENV: &str = "KEY_RETRY_MAX_ATTEMPTS";
-#[allow(dead_code)]
 pub(crate) const KEY_RETRY_DEADLINE_SECS_ENV: &str = "KEY_RETRY_DEADLINE_SECS";
-#[allow(dead_code)]
 pub(crate) const KEY_RETRY_RATE_LIMIT_FAST_PATH_SECS_ENV: &str =
     "KEY_RETRY_RATE_LIMIT_FAST_PATH_SECS";
 
@@ -82,12 +77,14 @@ pub(crate) const KEY_RETRY_RATE_LIMIT_FAST_PATH_SECS_ENV: &str =
 /// the GET result poll. MCP tool surfaces are intentionally absent: the todo-13
 /// MCP ladder owns session rebind and never enters this kernel in v1 (Exa and
 /// Brave local MCP stay single-attempt).
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeyRetryRequestKind {
     /// Tavily HTTP read endpoints (search/extract/map/usage): replay-safe.
     HttpRead,
     /// Provider REST facade read endpoints (serpapi/exa/brave search).
+    /// Staged for plan todo 9: the todo-6 Tavily HTTP seam never maps a path
+    /// onto this surface, so no production code constructs it yet.
+    #[allow(dead_code)]
     ProviderRestRead,
     /// `/research` POST + GET: a research task is never replayed.
     Research,
@@ -95,7 +92,6 @@ pub(crate) enum KeyRetryRequestKind {
     Crawl,
 }
 
-#[allow(dead_code)]
 impl KeyRetryRequestKind {
     pub(crate) fn allows_cross_key_retry(self) -> bool {
         matches!(self, Self::HttpRead | Self::ProviderRestRead)
@@ -137,7 +133,6 @@ impl ExaBudgetTag {
 /// `FAILURE_KIND_TRANSPORT_SEND_ERROR` territory); the kernel never touches the
 /// error object, which is what keeps it zero-I/O. The variants mirror
 /// `TransportFailureKind` so a caller maps them one-to-one.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeyRetryTransportFailure {
     /// A deadline expired before the upstream answered.
@@ -151,7 +146,6 @@ pub(crate) enum KeyRetryTransportFailure {
 /// Caller-injected attempt evidence the eligibility predicate needs beyond the
 /// normalized signal. Not body-only: a transport failure has neither a status
 /// nor a body, so its detail rides here too.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KeyRetryAttemptEvidence {
     /// Exa 402 budget tag when the body carried one (todo 10 evidence field).
@@ -160,7 +154,6 @@ pub(crate) struct KeyRetryAttemptEvidence {
     pub(crate) transport_failure: Option<KeyRetryTransportFailure>,
 }
 
-#[allow(dead_code)]
 impl KeyRetryAttemptEvidence {
     pub(crate) const fn none() -> Self {
         Self {
@@ -169,6 +162,8 @@ impl KeyRetryAttemptEvidence {
         }
     }
 
+    /// Staged for plan todo 9/10 (Exa facade budget-tag evidence).
+    #[allow(dead_code)]
     pub(crate) const fn exa_budget(tag: ExaBudgetTag) -> Self {
         Self {
             exa_budget_tag: Some(tag),
@@ -185,7 +180,6 @@ impl KeyRetryAttemptEvidence {
 }
 
 /// The three explicit-rejection families the retry whitelist allows.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeyRetryRejectionFamily {
     RateLimit,
@@ -200,7 +194,6 @@ pub(crate) enum KeyRetryRejectionFamily {
 /// it is not caused by the request either, so one bounded try on another key is
 /// worth more than surfacing it. Replay safety comes from the request-surface
 /// exclusion (`/research`, `/crawl`), never from the trigger class.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeyRetryTrigger {
     /// Provably-unexecuted explicit rejection: 429 / 432 / 402 / 401-403.
@@ -211,7 +204,6 @@ pub(crate) enum KeyRetryTrigger {
 
 /// Resolved retry budget. Build it through [`KeyRetryBudget::from_env`] (the
 /// single override point) or [`KeyRetryBudget::defaults`].
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KeyRetryBudget {
     pub(crate) max_attempts: u32,
@@ -219,7 +211,6 @@ pub(crate) struct KeyRetryBudget {
     pub(crate) rate_limit_fast_path: std::time::Duration,
 }
 
-#[allow(dead_code)]
 impl KeyRetryBudget {
     /// Documented defaults with no env read: 2 attempts (1 retry), 5s deadline,
     /// 2s rate-limit fast path.
@@ -251,7 +242,6 @@ impl KeyRetryBudget {
 /// Pure budget parser behind [`KeyRetryBudget::from_env`]: empty or missing
 /// values keep the default, anything unparsable or out of range warns and
 /// keeps the default (mirrors `parse_low_quota_depletion_threshold`).
-#[allow(dead_code)]
 pub(crate) fn parse_key_retry_budget(
     max_attempts_raw: Option<&str>,
     deadline_secs_raw: Option<&str>,
@@ -283,7 +273,6 @@ pub(crate) fn parse_key_retry_budget(
     }
 }
 
-#[allow(dead_code)]
 fn parse_key_retry_bounded(
     raw: Option<&str>,
     source: &str,
@@ -308,7 +297,6 @@ fn parse_key_retry_bounded(
 
 /// Why a rejection is NOT replayable. `AttemptsExhausted` lives here because
 /// the signal itself stays non-retryable once the attempt budget is spent.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeyRetryIneligibleReason {
     /// Success, a redirect, or an attempt carrying neither a retryable status
@@ -331,7 +319,6 @@ pub(crate) enum KeyRetryIneligibleReason {
 }
 
 /// Why the buffered first-hit response goes back to the client byte-for-byte.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ServeOriginalReason {
     Ineligible(KeyRetryIneligibleReason),
@@ -341,7 +328,6 @@ pub(crate) enum ServeOriginalReason {
 
 /// Kernel verdict. `ServeOriginal` never reuses the 502 path: the caller
 /// returns the buffered first-hit response (status, Retry-After header, body).
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RetryDecision {
     Retry,
@@ -355,7 +341,6 @@ pub(crate) enum RetryDecision {
 /// todo-5 strict acquire probe (`Ok(None)` => false). A caller that acquires
 /// only after a positive verdict passes `true` here and maps the empty-pool
 /// outcome onto `ServeOriginal(ServeOriginalReason::NoEligibleKey)` itself.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KeyRetryContext {
     pub(crate) attempts_used: u32,
@@ -411,7 +396,6 @@ pub(crate) fn key_retry_ineligibility(
     )
 }
 
-#[allow(dead_code)]
 fn key_retry_ineligibility_within(
     provider: providers::ProviderId,
     request_kind: KeyRetryRequestKind,
@@ -462,7 +446,6 @@ fn key_retry_ineligibility_within(
 ///    rejection of its own. That is what makes an HTTP 200 whose body says
 ///    `status: 432` eligible (the caller passes `tavily_status.or(http_status)`)
 ///    and a bare 503 retryable without a signal.
-#[allow(dead_code)]
 pub(crate) fn key_retry_trigger(
     signal: ProviderFailureSignal,
     effective_status: Option<u16>,
@@ -494,7 +477,6 @@ pub(crate) fn key_retry_trigger(
 /// A 4xx the whitelist does not claim is request-shaped: 401/402/403/429/432
 /// are key-scoped and handled by the family table below, every other 4xx blames
 /// the request itself.
-#[allow(dead_code)]
 fn is_request_shaped_client_status(effective_status: Option<u16>) -> bool {
     matches!(
         effective_status,
@@ -502,7 +484,6 @@ fn is_request_shaped_client_status(effective_status: Option<u16>) -> bool {
     )
 }
 
-#[allow(dead_code)]
 fn key_retry_trigger_from_status(effective_status: u16) -> Option<KeyRetryTrigger> {
     use KeyRetryRejectionFamily as Family;
     use KeyRetryTrigger as Trigger;
@@ -516,7 +497,6 @@ fn key_retry_trigger_from_status(effective_status: u16) -> Option<KeyRetryTrigge
     }
 }
 
-#[allow(dead_code)]
 fn exa_cross_key_retry_vetoed(
     provider: providers::ProviderId,
     trigger: KeyRetryTrigger,
@@ -546,7 +526,6 @@ fn exa_cross_key_retry_vetoed(
 /// Conservative union of the armed Retry-After and the classifier's header
 /// parse: when they disagree the longer wait wins, so a long upstream wait is
 /// never replayed as an immediate retry.
-#[allow(dead_code)]
 fn effective_retry_after_secs(signal: ProviderFailureSignal, armed: Option<u64>) -> Option<u64> {
     let from_signal = match signal {
         ProviderFailureSignal::RateLimited { retry_after_secs } => retry_after_secs,
@@ -560,7 +539,6 @@ fn effective_retry_after_secs(signal: ProviderFailureSignal, armed: Option<u64>)
 
 /// Authoritative verdict: eligibility (with the *configured* fast-path window),
 /// then attempt budget, then deadline, then pool availability.
-#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn decide_cross_key_retry(
     provider: providers::ProviderId,

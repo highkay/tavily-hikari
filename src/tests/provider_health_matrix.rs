@@ -1296,14 +1296,22 @@ struct MatrixFamilyRow {
 /// LIVE family-boundary rows (plan todo 3, malformed_input + 防误扩 probes),
 /// table-driven over ONE shared proxy, ONE shared stub upstream and ONE token —
 /// the fixture count is the minimum that keeps the coverage:
-/// * what ENTERS the family: a bare 401 with an EMPTY body and a bare 403 with
-///   an invalid-UTF-8 body both classify as `upstream_auth_blocked`, never
-///   quarantine, and arm the sized cooldown (120s base with no Retry-After,
-///   900s for RA=1200 through the lifted ceiling). Family membership keys off
+/// * what ENTERS the family: a bare 403 with an invalid-UTF-8 body classifies as
+///   `upstream_auth_blocked`, never quarantines, and arms the sized cooldown
+///   (900s for RA=1200 through the lifted ceiling). Family membership keys off
 ///   the effective status, so every malformed-body shape shares one code path;
 ///   the 30s floor and the remaining Retry-After fixtures stay pinned by the
 ///   pure sizing table
 ///   `unknown_403_auth_block_backoff_honors_retry_after_up_to_the_900s_ceiling`.
+///   The family's OTHER entry shape - a bare 401, empty body, no Retry-After,
+///   sized at the 120s base - moved to
+///   `tavily_auth_block_bare_401_without_retry_after_cools_base_secs` when plan
+///   todo 6 wired the bounded cross-key retry: with no Retry-After nothing
+///   exceeds the kernel's 2s fast-path window, so a pool with a second eligible
+///   key now absorbs that 401 inside the same logical request instead of
+///   surfacing it. Every row left in THIS table carries a Retry-After of 600s or
+///   more, which the kernel refuses to replay, so the one-hit-per-row shape and
+///   every assertion below are unchanged.
 /// * what must NOT enter it: a keyword 403 quarantines with ZERO backoff rows
 ///   on any scope, a 500 arms nothing even with RA=600 on the wire, and a 429
 ///   keeps the rate-limit ladder (RA=600 clamps to 300, not the family's 900).
@@ -1315,17 +1323,6 @@ struct MatrixFamilyRow {
 #[tokio::test]
 async fn tavily_auth_block_family_boundary_live_rows() {
     let rows = [
-        MatrixFamilyRow {
-            label: "bare-401-empty-body",
-            status: StatusCode::UNAUTHORIZED,
-            retry_after: None,
-            body: b"",
-            expected_kind: FAILURE_KIND_UPSTREAM_AUTH_BLOCKED,
-            expected_effect: KEY_EFFECT_TRANSIENT_BACKOFF_SET,
-            expected_reason: Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED),
-            expected_secs: Some(120),
-            expect_quarantine: false,
-        },
         MatrixFamilyRow {
             label: "bare-403-invalid-utf8-ra-above-ceiling",
             status: StatusCode::FORBIDDEN,
@@ -1376,13 +1373,7 @@ async fn tavily_auth_block_family_boundary_live_rows() {
     ];
 
     let (proxy, _clock) = spawn_matrix_proxy("health-matrix-auth-block-boundary").await;
-    let secrets = [
-        "mtx-ab-b1",
-        "mtx-ab-b2",
-        "mtx-ab-b3",
-        "mtx-ab-b4",
-        "mtx-ab-b5",
-    ];
+    let secrets = ["mtx-ab-b2", "mtx-ab-b3", "mtx-ab-b4", "mtx-ab-b5"];
     let key_ids = seed_tavily_matrix_keys(&proxy, &secrets).await;
     let token_id = "hmx-ab-boundary-token";
     seed_matrix_auth_token(&proxy, token_id).await;
@@ -1494,6 +1485,99 @@ async fn tavily_auth_block_family_boundary_live_rows() {
         0,
         "neither the family nor its neighbours write depletion rows"
     );
+}
+
+/// LIVE single-key pin for the auth-block family's BASE sizing (plan todo 3,
+/// re-scoped by todo 6): a bare 401 with an empty body and NO Retry-After
+/// classifies as `upstream_auth_blocked`, never quarantines, keeps the key
+/// active, and arms the family's 120s base cooldown on `http_global`.
+///
+/// This row left `tavily_auth_block_family_boundary_live_rows` because it is the
+/// one family shape the bounded cross-key retry DOES replay: no Retry-After
+/// means nothing exceeds the kernel's 2s fast-path window, so with a second
+/// eligible key in the pool the 401 is absorbed inside the same logical request
+/// and the client never sees it. On a SINGLE-key pool the strict acquire has
+/// nothing left to offer, the kernel answers `ServeOriginal(NoEligibleKey)`, and
+/// the buffered 401 is served unchanged - the pre-retry behavior this row pins,
+/// plus the `skipped_no_eligible_key` marker on its request_logs row and proof
+/// that no second upstream call was made.
+#[tokio::test]
+async fn tavily_auth_block_bare_401_without_retry_after_cools_base_secs() {
+    let (proxy, _clock) = spawn_matrix_proxy("health-matrix-auth-block-bare-401").await;
+    let secrets = ["mtx-ab-bare-401"];
+    let key_ids = seed_tavily_matrix_keys(&proxy, &secrets).await;
+    let key_id = key_ids.first().expect("seeded key").clone();
+    let token_id = "hmx-ab-bare-401-token";
+    seed_matrix_auth_token(&proxy, token_id).await;
+    let hits = matrix_upstream_hits();
+    let addr = spawn_matrix_upstream(
+        vec![MatrixUpstreamRecipe {
+            status: StatusCode::UNAUTHORIZED,
+            retry_after: None,
+            body: b"",
+        }],
+        Arc::clone(&hits),
+    )
+    .await;
+    let usage_base = format!("http://{addr}");
+
+    let before = proxy.backend_time.now_ts();
+    let (resp, analysis) = matrix_live_search(&proxy, &usage_base, token_id).await;
+
+    assert_eq!(resp.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(analysis.status, OUTCOME_ERROR);
+    assert_eq!(
+        analysis.failure_kind.as_deref(),
+        Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED)
+    );
+    assert_eq!(resp.key_effect_code, KEY_EFFECT_TRANSIENT_BACKOFF_SET);
+    assert_eq!(
+        analysis.key_health_action,
+        KeyHealthAction::None,
+        "a bare 401 cools, it never quarantines"
+    );
+    assert_eq!(resp.api_key_id.as_deref(), Some(key_id.as_str()));
+
+    assert_eq!(
+        matrix_hits_seen(&hits).len(),
+        1,
+        "an empty pool means one upstream attempt, never a retry"
+    );
+
+    let (armed_reason, cooldown_until, sized) =
+        matrix_backoff_row(&proxy, &key_id, HTTP_GLOBAL_BACKOFF_SCOPE)
+            .await
+            .expect("backoff armed");
+    assert_eq!(armed_reason, FAILURE_KIND_UPSTREAM_AUTH_BLOCKED);
+    assert_eq!(sized, 120, "no Retry-After arms the family's 120s base");
+    assert_eq!(cooldown_until, before + 120);
+    assert!(active_quarantine_reason(&proxy, &key_id).await.is_none());
+    assert_eq!(key_status(&proxy, "mtx-ab-bare-401").await, "active");
+
+    assert_eq!(
+        matrix_request_log_rows(&proxy, &key_id).await,
+        vec![(
+            Some(401),
+            Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED.to_string()),
+            Some(KEY_EFFECT_TRANSIENT_BACKOFF_SET.to_string())
+        )],
+        "one visible row"
+    );
+    let markers: Vec<Option<String>> = sqlx::query_scalar(
+        "SELECT fallback_reason FROM request_logs WHERE api_key_id = ? ORDER BY id ASC",
+    )
+    .bind(&key_id)
+    .fetch_all(&proxy.key_store.pool)
+    .await
+    .expect("matrix fallback markers");
+    assert_eq!(
+        markers,
+        vec![Some(
+            "upstream_key_retry:skipped_no_eligible_key".to_string()
+        )],
+        "the empty-pool first hit is marked, not silently retried"
+    );
+    assert_eq!(depletion_rows(&proxy).await, 0);
 }
 
 /// LIVE repeat-arm row (plan todo 3b, stale-state probe): three consecutive

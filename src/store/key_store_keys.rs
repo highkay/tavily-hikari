@@ -684,10 +684,10 @@ impl KeyStore {
     ///
     /// `Ok(None)` is the "no eligible key" signal; a database failure stays
     /// `Err` so a broken store is never mistaken for an empty pool.
-    // Wired by plan todo 6 (Tavily HTTP executor), todo 9 (provider facades)
-    // and todo 13 (MCP session rebind); until then only the test surface calls
-    // it, hence the same staged-seam allow this module already uses.
-    #[allow(dead_code)]
+    // Production consumer: the plan todo-6 Tavily HTTP executor
+    // (`proxy_http_and_logs.rs`) probes it once per eligible first hit. Todo 9
+    // (provider facades) and todo 13 (MCP session rebind) reuse the same
+    // primitive, so the staged-seam allow is gone.
     pub(crate) async fn acquire_key_for_cross_key_retry(
         &self,
         provider: crate::providers::ProviderId,
@@ -730,7 +730,6 @@ impl KeyStore {
     /// belongs to the same user) -> legacy binding, or the bare token primary
     /// when the token has no user binding. None of the affinity writes the
     /// proxy-layer equivalent performs (sync/rebind/revoke) happen here.
-    #[allow(dead_code)]
     async fn cross_key_retry_affinity_candidates(
         &self,
         auth_token_id: Option<&str>,
@@ -777,7 +776,6 @@ impl KeyStore {
     /// single affinity candidate, `None` runs the pool-wide LRU pick. Both go
     /// through the SAME SQL predicate so an affinity candidate can never be
     /// held to a laxer rule than the pool.
-    #[allow(dead_code)]
     async fn select_cross_key_retry_key(
         &self,
         provider: crate::providers::ProviderId,
@@ -2161,7 +2159,6 @@ let lease_with_cooldown = if let Some(scope) = transient_backoff_scope {
         }))
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn find_user_id_by_token(
         &self,
         token_id: &str,

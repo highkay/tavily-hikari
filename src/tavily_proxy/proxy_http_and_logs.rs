@@ -11,6 +11,116 @@ fn http_upstream_operation(upstream_path: &str) -> Option<&'static str> {
     }
 }
 
+/// `fallback_reason` markers of a bounded cross-key retry chain (plan
+/// provider-key-429-retry todo 6). Every attempt of one logical request keeps
+/// its own visible `request_logs` row: the loser carries `attempted`, the final
+/// success `succeeded`, a final rejection `rejected`, and a first hit that found
+/// no eligible key left in the pool `skipped_no_eligible_key`.
+const UPSTREAM_KEY_RETRY_ATTEMPTED: &str = "upstream_key_retry:attempted";
+const UPSTREAM_KEY_RETRY_SUCCEEDED: &str = "upstream_key_retry:succeeded";
+const UPSTREAM_KEY_RETRY_REJECTED: &str = "upstream_key_retry:rejected";
+const UPSTREAM_KEY_RETRY_SKIPPED_NO_ELIGIBLE_KEY: &str = "upstream_key_retry:skipped_no_eligible_key";
+
+/// Request surface a Tavily HTTP JSON attempt belongs to (plan todo 6). The
+/// `/research` (POST *and* GET) and `/crawl` exclusions themselves are owned by
+/// the kernel (`KeyRetryRequestKind::allows_cross_key_retry`); this only maps the
+/// upstream path onto the surface the kernel asks about.
+fn key_retry_request_kind(upstream_path: &str) -> KeyRetryRequestKind {
+    // `/research` POST plus the `/research/{request_id}` GET shape: a research
+    // task is never replayed in either direction.
+    if upstream_path == "/research" || upstream_path.starts_with("/research/") {
+        return KeyRetryRequestKind::Research;
+    }
+    if upstream_path == "/crawl" {
+        return KeyRetryRequestKind::Crawl;
+    }
+    KeyRetryRequestKind::HttpRead
+}
+
+/// Transient-backoff scope the strict cross-key acquire must honor: the same
+/// scope this executor arms for the attempt, so a key that is already cooling
+/// for THIS request surface is never handed back as the retry key.
+fn http_json_retry_backoff_scope(
+    used_api_rebalance: bool,
+    used_http_project_affinity: bool,
+) -> &'static str {
+    if used_api_rebalance {
+        API_REBALANCE_HTTP_BACKOFF_SCOPE
+    } else if used_http_project_affinity {
+        HTTP_PROJECT_AFFINITY_BACKOFF_SCOPE
+    } else {
+        HTTP_GLOBAL_BACKOFF_SCOPE
+    }
+}
+
+/// Transport-layer evidence for an attempt that never produced a response. Only
+/// a `reqwest` failure is transport; a deferred admission or a store error
+/// carries no retryable evidence, which keeps the kernel on
+/// `NotRetryableOutcome` and the existing error path unchanged.
+fn key_retry_transport_evidence(err: &ProxyError) -> KeyRetryAttemptEvidence {
+    let ProxyError::Http(source) = err else {
+        return KeyRetryAttemptEvidence::none();
+    };
+    let kind = if source.is_timeout() {
+        KeyRetryTransportFailure::Timeout
+    } else if source.is_connect() {
+        KeyRetryTransportFailure::Connect
+    } else {
+        KeyRetryTransportFailure::Send
+    };
+    KeyRetryAttemptEvidence::transport(kind)
+}
+
+/// `fallback_reason` marker of the attempt that TERMINATES a retry chain:
+/// `succeeded` when the client gets a success, `rejected` when the retry failed
+/// too. `None` when there was no chain at all (single-attempt budget or a first
+/// attempt that ended the request), so the row keeps today's `fallback_reason`.
+fn upstream_key_retry_terminal_marker(
+    attempts_used: u32,
+    client_success: bool,
+) -> Option<&'static str> {
+    if attempts_used <= 1 {
+        return None;
+    }
+    Some(if client_success {
+        UPSTREAM_KEY_RETRY_SUCCEEDED
+    } else {
+        UPSTREAM_KEY_RETRY_REJECTED
+    })
+}
+
+/// Caller-injected observations of ONE Tavily HTTP attempt for
+/// [`TavilyProxy::decide_http_json_cross_key_retry`]. Every field is an
+/// observation the executor already has; the kernel stays zero-I/O and this
+/// struct is the only bridge between the seam and it.
+#[derive(Clone, Copy)]
+struct HttpJsonCrossKeyRetryProbe<'a> {
+    /// Request surface derived from `upstream_path`.
+    request_kind: KeyRetryRequestKind,
+    /// Normalized classification of the attempt.
+    signal: ProviderFailureSignal,
+    /// Structured body status when present, else the transport status.
+    effective_status: Option<u16>,
+    /// Exa-style budget tag (unused for Tavily) plus transport detail.
+    evidence: KeyRetryAttemptEvidence,
+    /// Armed Retry-After of this attempt's response headers, in seconds.
+    retry_after_secs: Option<u64>,
+    /// Upstream attempts already completed for this logical request.
+    attempts_used: u32,
+    /// Time spent on this logical request so far, measured by the caller.
+    elapsed: std::time::Duration,
+    /// Resolved budget (`KeyRetryBudget::from_env`, the single override point).
+    budget: &'a KeyRetryBudget,
+    /// Token whose affinity candidates the strict acquire may prefer.
+    auth_token_id: Option<&'a str>,
+    /// Backoff scope the strict acquire filters cooling keys by.
+    backoff_scope: &'a str,
+    /// The key this attempt just failed on: always excluded from the retry.
+    current_key_id: &'a str,
+    /// Keys this logical request already judged dead before this attempt.
+    excluded_key_ids: &'a [String],
+}
+
 impl TavilyProxy {
     async fn select_http_json_key(
         &self,
@@ -294,6 +404,14 @@ impl TavilyProxy {
     /// Generic helper to proxy a Tavily HTTP JSON endpoint (e.g. `/search`, `/extract`).
     /// It injects the Tavily key into the `api_key` field, performs header sanitization,
     /// records request logs with sensitive fields redacted, and updates key quota state.
+    ///
+    /// Bounded cross-key retry (plan provider-key-429-retry todo 6): when an
+    /// attempt fails on the KEY rather than on the request, the kernel verdict
+    /// may replay it ONCE on a different key leased by the strict store
+    /// primitive. Every attempt keeps its own visible `request_logs` row and
+    /// `fallback_reason` marker, the loop never sleeps, and billing stays a
+    /// single settlement on whatever this function returns - dispatch,
+    /// reservation and settlement belong to the caller and are never re-entered.
     #[allow(clippy::too_many_arguments)]
     pub async fn proxy_http_json_endpoint(
         &self,
@@ -344,8 +462,374 @@ impl TavilyProxy {
         )
         .await?;
 
-        // Build upstream request body by injecting Tavily key into api_key field.
-        let mut upstream_options = options;
+        // Retry bookkeeping for the whole logical request: the budget comes from
+        // the kernel's single env override point, the deadline is measured from
+        // here (before the first send), and `excluded_key_ids` accumulates every
+        // key this request already judged dead.
+        let retry_budget = KeyRetryBudget::from_env();
+        let retry_deadline_start = self.backend_time.instant_now();
+        let retry_request_kind = key_retry_request_kind(upstream_path);
+        let retry_backoff_scope =
+            http_json_retry_backoff_scope(used_api_rebalance, used_http_project_affinity);
+        let mut excluded_key_ids: Vec<String> = Vec::new();
+        let mut attempt_lease = lease;
+        let mut attempts_used: u32 = 0;
+
+        loop {
+            attempts_used += 1;
+            let attempt_key_id = attempt_lease.id.clone();
+
+            // Build upstream request body by injecting the leased Tavily key into
+            // the `api_key` field. A retry re-enters the SAME sanitization path,
+            // so the second body differs from the first one only by the key.
+            let (request_body, redacted_request_body) = Self::build_http_json_upstream_body(
+                &options,
+                upstream_path,
+                &attempt_lease.secret,
+            )?;
+
+            let request_method = method.clone();
+            let request_url = url.clone();
+            let upstream_secret = attempt_lease.secret.clone();
+            let response = self
+                .send_with_forward_proxy(
+                    &attempt_key_id,
+                    upstream_path.trim_start_matches('/'),
+                    |client| {
+                        let mut builder =
+                            client.request(request_method.clone(), request_url.clone());
+                        for (name, value) in sanitized_headers.headers.iter() {
+                            if name == HOST || name == CONTENT_LENGTH {
+                                continue;
+                            }
+                            builder = builder.header(name, value);
+                        }
+                        if inject_upstream_bearer_auth {
+                            builder = builder
+                                .header("Authorization", format!("Bearer {}", upstream_secret));
+                        }
+                        builder.body(request_body.clone())
+                    },
+                )
+                .await;
+
+            // The final attempt of the budget never retries; it only labels the
+            // chain it terminates. `attempts_used == 1` here means the budget
+            // holds a single attempt (env `KEY_RETRY_MAX_ATTEMPTS=1`), so there
+            // is no chain and the row keeps today's `fallback_reason: None`.
+            let terminal_attempt = attempts_used >= retry_budget.max_attempts;
+            let retry_base = HttpJsonCrossKeyRetryProbe {
+                request_kind: retry_request_kind,
+                // The four outcome fields below are filled per attempt arm.
+                signal: ProviderFailureSignal::Ok,
+                effective_status: None,
+                evidence: KeyRetryAttemptEvidence::none(),
+                retry_after_secs: None,
+                attempts_used,
+                elapsed: retry_deadline_start.elapsed(),
+                budget: &retry_budget,
+                auth_token_id,
+                backoff_scope: retry_backoff_scope,
+                current_key_id: &attempt_key_id,
+                excluded_key_ids: &excluded_key_ids,
+            };
+
+            match response {
+                Ok((response, _relay_lease)) => {
+                    let status = response.status();
+                    let headers = response.headers().clone();
+                    let body_bytes = response.bytes().await.map_err(ProxyError::Http)?;
+
+                    let mut analysis = analyze_http_attempt(status, &body_bytes);
+                    analysis.api_key_id = Some(attempt_lease.id.clone());
+                    if analysis.failure_kind.is_none() && analysis.status == OUTCOME_ERROR {
+                        analysis.failure_kind = classify_failure_kind(
+                            display_path,
+                            Some(status.as_u16() as i64),
+                            analysis.tavily_status_code,
+                            None,
+                            &body_bytes,
+                        );
+                    }
+                    let redacted_response_body = redact_api_key_bytes(&body_bytes);
+                    if status.is_success()
+                        && upstream_path == "/research"
+                        && let Some(request_id) = extract_research_request_id(&body_bytes)
+                        && let Some(token_id) = auth_token_id
+                    {
+                        self.record_research_request_affinity(
+                            &request_id,
+                            &attempt_lease.id,
+                            token_id,
+                        )
+                        .await?;
+                    }
+
+                    let mut key_effect = self
+                        .reconcile_key_health(&attempt_lease, display_path, &analysis, auth_token_id)
+                        .await?;
+                    if key_effect.code == KEY_EFFECT_NONE && analysis.status == OUTCOME_SUCCESS {
+                        key_effect = self
+                            .clear_transient_backoffs_after_success(&attempt_lease.id, display_path, auth_token_id)
+                            .await?;
+                    }
+                    let armed_api_rebalance_backoff = if used_api_rebalance {
+                        self.maybe_arm_api_rebalance_backoff(&attempt_lease.id, &headers, &analysis)
+                            .await?
+                    } else {
+                        false
+                    };
+                    let armed_http_global_backoff = if used_api_rebalance {
+                        false
+                    } else {
+                        self.maybe_arm_http_global_backoff(&attempt_lease.id, &headers, &analysis)
+                            .await?
+                    };
+                    let armed_http_project_affinity_backoff = if used_http_project_affinity {
+                        self.maybe_arm_http_project_affinity_backoff(
+                            &attempt_lease.id,
+                            &headers,
+                            &analysis,
+                            true,
+                        )
+                        .await?
+                    } else {
+                        false
+                    };
+                    if key_effect.code == KEY_EFFECT_NONE
+                        && (armed_api_rebalance_backoff
+                            || armed_http_project_affinity_backoff
+                            || armed_http_global_backoff)
+                    {
+                        key_effect = Self::transient_backoff_set_effect();
+                    }
+                    let primary_effect = Self::primary_request_effect(
+                        &key_effect,
+                        &api_route_binding_effect,
+                        &api_route_selection_effect,
+                    );
+
+                    // Cross-key retry verdict, taken AFTER reconcile/arm (so the
+                    // failing key is already marked and cooling, which the strict
+                    // acquire honors) and BEFORE the log row, so this row can
+                    // carry its own marker.
+                    let signal = classify_provider_failure(
+                        providers::ProviderId::Tavily,
+                        &ProviderFailureEvidence {
+                            status: status.as_u16(),
+                            headers: Some(&headers),
+                            body: &body_bytes,
+                        },
+                    );
+                    let (fallback_marker, retry_lease) = if terminal_attempt {
+                        (
+                            upstream_key_retry_terminal_marker(
+                                attempts_used,
+                                status.is_success() && analysis.status == OUTCOME_SUCCESS,
+                            ),
+                            None,
+                        )
+                    } else {
+                        self.decide_http_json_cross_key_retry(&HttpJsonCrossKeyRetryProbe {
+                            signal,
+                            // A structured body status wins: HTTP 200 whose body
+                            // says `status: 432` is an exhaustion signal.
+                            effective_status: analysis
+                                .tavily_status_code
+                                .and_then(|code| u16::try_from(code).ok())
+                                .or(Some(status.as_u16())),
+                            evidence: KeyRetryAttemptEvidence::none(),
+                            retry_after_secs: Self::parse_retry_after_secs(
+                                &headers,
+                                self.backend_time.now_ts(),
+                            )
+                            .and_then(|secs| u64::try_from(secs.max(0)).ok()),
+                            ..retry_base
+                        })
+                        .await?
+                    };
+
+                    let request_log_id = self
+                        .key_store
+                        .log_attempt(AttemptLog {
+                            key_id: Some(&attempt_lease.id),
+                            auth_token_id,
+                            method,
+                            path: display_path,
+                            query: None,
+                            status: Some(status),
+                            tavily_status_code: analysis.tavily_status_code,
+                            error: None,
+                            request_body: &redacted_request_body,
+                            response_body: &redacted_response_body,
+                            outcome: analysis.status,
+                            failure_kind: analysis.failure_kind.as_deref(),
+                            key_effect_code: key_effect.code.as_str(),
+                            key_effect_summary: key_effect.summary.as_deref(),
+                            binding_effect_code: api_route_binding_effect.code.as_str(),
+                            binding_effect_summary: api_route_binding_effect.summary.as_deref(),
+                            selection_effect_code: api_route_selection_effect.code.as_str(),
+                            selection_effect_summary: api_route_selection_effect.summary.as_deref(),
+                            gateway_mode: None,
+                            experiment_variant: None,
+                            provider: None,
+                            proxy_session_id: None,
+                            routing_subject_hash: None,
+                            upstream_operation,
+                            fallback_reason: fallback_marker,
+                            forwarded_headers: &sanitized_headers.forwarded,
+                            dropped_headers: &sanitized_headers.dropped,
+                            client_ip,
+                        })
+                        .await?;
+                    self.link_transient_backoff_clear_request_log(
+                        &key_effect,
+                        &attempt_lease.id,
+                        request_log_id,
+                    )
+                    .await?;
+                    if armed_api_rebalance_backoff {
+                        self.key_store
+                            .set_api_key_transient_backoff_request_log_id(
+                                &attempt_lease.id,
+                                API_REBALANCE_HTTP_BACKOFF_SCOPE,
+                                request_log_id,
+                                self.backend_time.now_ts(),
+                            )
+                            .await?;
+                    } else if armed_http_project_affinity_backoff {
+                        self.key_store
+                            .set_api_key_transient_backoff_request_log_id(
+                                &attempt_lease.id,
+                                HTTP_PROJECT_AFFINITY_BACKOFF_SCOPE,
+                                request_log_id,
+                                self.backend_time.now_ts(),
+                            )
+                            .await?;
+                    } else if armed_http_global_backoff {
+                        self.key_store
+                            .set_api_key_transient_backoff_request_log_id(
+                                &attempt_lease.id,
+                                HTTP_GLOBAL_BACKOFF_SCOPE,
+                                request_log_id,
+                                self.backend_time.now_ts(),
+                            )
+                            .await?;
+                    }
+
+                    if let Some(next_lease) = retry_lease {
+                        // ONE extra attempt, zero sleep: the retry REPLACES this
+                        // buffered response, which never reaches the client.
+                        excluded_key_ids.push(attempt_key_id);
+                        attempt_lease = next_lease;
+                        continue;
+                    }
+                    // Ineligible outcome, deadline spent, budget exhausted or no
+                    // eligible key: the buffered attempt above goes back to the
+                    // caller byte-for-byte (status, Retry-After header, body) and
+                    // is never rerouted through the 502 path.
+                    analysis.key_effect = primary_effect;
+
+                    return Ok((
+                        ProxyResponse {
+                            status,
+                            headers,
+                            body: body_bytes,
+                            api_key_id: Some(attempt_lease.id.clone()),
+                            request_log_id: Some(request_log_id),
+                            key_effect_code: key_effect.code,
+                            key_effect_summary: key_effect.summary,
+                            binding_effect_code: api_route_binding_effect.code,
+                            binding_effect_summary: api_route_binding_effect.summary,
+                            selection_effect_code: api_route_selection_effect.code,
+                            selection_effect_summary: api_route_selection_effect.summary,
+                        },
+                        analysis,
+                    ))
+                }
+                Err(err) => {
+                    log_proxy_error(&attempt_lease.secret, method, display_path, None, &err);
+                    let redacted_empty: Vec<u8> = Vec::new();
+                    // A transport failure has neither a status nor a body, so the
+                    // amendment's transient arm rides on the evidence derived
+                    // from this executor's own error object. `ServeOriginal` on
+                    // this arm means today's transport-error path exactly - the
+                    // row below plus `Err(err)` - because nothing was buffered.
+                    let evidence = key_retry_transport_evidence(&err);
+                    let (fallback_marker, retry_lease) = if terminal_attempt {
+                        (upstream_key_retry_terminal_marker(attempts_used, false), None)
+                    } else {
+                        self.decide_http_json_cross_key_retry(&HttpJsonCrossKeyRetryProbe {
+                            signal: if evidence.transport_failure.is_some() {
+                                ProviderFailureSignal::ServerTransient
+                            } else {
+                                // Deferred admission or a store error: no
+                                // retryable evidence, so the kernel stays on
+                                // `NotRetryableOutcome`.
+                                ProviderFailureSignal::ClientError
+                            },
+                            effective_status: None,
+                            evidence,
+                            retry_after_secs: None,
+                            ..retry_base
+                        })
+                        .await?
+                    };
+                    self.key_store
+                        .log_attempt(AttemptLog {
+                            key_id: Some(&attempt_lease.id),
+                            auth_token_id,
+                            method,
+                            path: display_path,
+                            query: None,
+                            status: None,
+                            tavily_status_code: None,
+                            error: Some(&err.to_string()),
+                            request_body: &redacted_request_body,
+                            response_body: &redacted_empty,
+                            outcome: OUTCOME_ERROR,
+                            failure_kind: None,
+                            key_effect_code: KEY_EFFECT_NONE,
+                            key_effect_summary: None,
+                            binding_effect_code: KEY_EFFECT_NONE,
+                            binding_effect_summary: None,
+                            selection_effect_code: KEY_EFFECT_NONE,
+                            selection_effect_summary: None,
+                            gateway_mode: None,
+                            experiment_variant: None,
+                            provider: None,
+                            proxy_session_id: None,
+                            routing_subject_hash: None,
+                            upstream_operation,
+                            fallback_reason: fallback_marker,
+                            forwarded_headers: &sanitized_headers.forwarded,
+                            dropped_headers: &sanitized_headers.dropped,
+                            client_ip,
+                        })
+                        .await?;
+                    if let Some(next_lease) = retry_lease {
+                        excluded_key_ids.push(attempt_key_id);
+                        attempt_lease = next_lease;
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    /// Build one attempt's upstream JSON body plus its redacted twin for the log
+    /// row: the EXISTING sanitization path (a client-supplied `api_key` is
+    /// dropped case-insensitively, the leased Tavily key is inserted, and
+    /// `include_usage` is forced on the predictable endpoints). Every attempt of
+    /// a logical request - a cross-key retry included - re-enters this function,
+    /// so the key swap cannot drift from the first hit's body shape.
+    fn build_http_json_upstream_body(
+        options: &Value,
+        upstream_path: &str,
+        api_key_secret: &str,
+    ) -> Result<(Vec<u8>, Vec<u8>), ProxyError> {
+        let mut upstream_options = options.clone();
         if let Value::Object(ref mut map) = upstream_options {
             // Remove any existing api_key field (case-insensitive) before inserting the Tavily key.
             let keys_to_remove: Vec<String> = map
@@ -356,11 +840,17 @@ impl TavilyProxy {
             for key in keys_to_remove {
                 map.remove(&key);
             }
-            map.insert("api_key".to_string(), Value::String(lease.secret.clone()));
+            map.insert(
+                "api_key".to_string(),
+                Value::String(api_key_secret.to_string()),
+            );
         } else {
             // Unexpected payload shape; wrap it so we still send a valid JSON object upstream.
             let mut map = serde_json::Map::new();
-            map.insert("api_key".to_string(), Value::String(lease.secret.clone()));
+            map.insert(
+                "api_key".to_string(),
+                Value::String(api_key_secret.to_string()),
+            );
             map.insert("payload".to_string(), upstream_options);
             upstream_options = Value::Object(map);
         }
@@ -377,221 +867,73 @@ impl TavilyProxy {
         let request_body =
             serde_json::to_vec(&upstream_options).map_err(|e| ProxyError::Other(e.to_string()))?;
         let redacted_request_body = redact_api_key_bytes(&request_body);
+        Ok((request_body, redacted_request_body))
+    }
 
-        let request_method = method.clone();
-        let request_url = url.clone();
-        let upstream_secret = lease.secret.clone();
-        let response = self
-            .send_with_forward_proxy(&lease.id, upstream_path.trim_start_matches('/'), |client| {
-                let mut builder = client.request(request_method.clone(), request_url.clone());
-                for (name, value) in sanitized_headers.headers.iter() {
-                    if name == HOST || name == CONTENT_LENGTH {
-                        continue;
-                    }
-                    builder = builder.header(name, value);
-                }
-                if inject_upstream_bearer_auth {
-                    builder =
-                        builder.header("Authorization", format!("Bearer {}", upstream_secret));
-                }
-                builder.body(request_body.clone())
-            })
-            .await;
+    /// Bounded cross-key retry verdict for one Tavily HTTP attempt (plan
+    /// provider-key-429-retry todo 6).
+    ///
+    /// Returns the `fallback_reason` marker for THIS attempt's log row plus the
+    /// lease to replay on when the verdict is `Retry`. `(None, None)` means the
+    /// attempt is served to the client unchanged - the buffered response on the
+    /// `Ok` arm, today's `Err(err)` on the transport arm, never the 502 path.
+    ///
+    /// The kernel is pure and zero-I/O, so it is asked twice: first with the pool
+    /// flag optimistically true - that call settles every non-pool gate (request
+    /// surface, signal, Retry-After, attempt budget, deadline) and keeps a
+    /// success or an ineligible failure away from the store - and then, only when
+    /// that verdict is `Retry`, with the REAL todo-5 strict-acquire probe result,
+    /// which is the verdict this seam acts on.
+    async fn decide_http_json_cross_key_retry(
+        &self,
+        probe: &HttpJsonCrossKeyRetryProbe<'_>,
+    ) -> Result<(Option<&'static str>, Option<ApiKeyLease>), ProxyError> {
+        let verdict = |eligible_key_available: bool| {
+            decide_cross_key_retry(
+                providers::ProviderId::Tavily,
+                probe.request_kind,
+                probe.signal,
+                probe.effective_status,
+                &probe.evidence,
+                probe.retry_after_secs,
+                &KeyRetryContext {
+                    attempts_used: probe.attempts_used,
+                    elapsed: probe.elapsed,
+                    eligible_key_available,
+                },
+                probe.budget,
+            )
+        };
+        if verdict(true) != RetryDecision::Retry {
+            return Ok((None, None));
+        }
 
-        match response {
-            Ok((response, _relay_lease)) => {
-                let status = response.status();
-                let headers = response.headers().clone();
-                let body_bytes = response.bytes().await.map_err(ProxyError::Http)?;
+        // Strict primitive: the key this attempt just failed on plus every key
+        // this logical request already judged dead are excluded, cooling,
+        // quarantined and depleted keys are skipped, and NOTHING is marked here
+        // (reconcile/arm above already did the marking for this attempt).
+        let mut excluded = probe.excluded_key_ids.to_vec();
+        excluded.push(probe.current_key_id.to_string());
+        let acquired = self
+            .key_store
+            .acquire_key_for_cross_key_retry(
+                providers::ProviderId::Tavily,
+                probe.auth_token_id,
+                probe.backoff_scope,
+                &excluded,
+            )
+            .await?;
 
-                let mut analysis = analyze_http_attempt(status, &body_bytes);
-                analysis.api_key_id = Some(lease.id.clone());
-                if analysis.failure_kind.is_none() && analysis.status == OUTCOME_ERROR {
-                    analysis.failure_kind = classify_failure_kind(
-                        display_path,
-                        Some(status.as_u16() as i64),
-                        analysis.tavily_status_code,
-                        None,
-                        &body_bytes,
-                    );
-                }
-                let redacted_response_body = redact_api_key_bytes(&body_bytes);
-                if status.is_success()
-                    && upstream_path == "/research"
-                    && let Some(request_id) = extract_research_request_id(&body_bytes)
-                    && let Some(token_id) = auth_token_id
-                {
-                    self.record_research_request_affinity(&request_id, &lease.id, token_id)
-                        .await?;
-                }
-
-                let mut key_effect = self
-                    .reconcile_key_health(&lease, display_path, &analysis, auth_token_id)
-                    .await?;
-                if key_effect.code == KEY_EFFECT_NONE && analysis.status == OUTCOME_SUCCESS {
-                    key_effect = self
-                        .clear_transient_backoffs_after_success(&lease.id, display_path, auth_token_id)
-                        .await?;
-                }
-                let armed_api_rebalance_backoff = if used_api_rebalance {
-                    self.maybe_arm_api_rebalance_backoff(&lease.id, &headers, &analysis)
-                        .await?
-                } else {
-                    false
-                };
-                let armed_http_global_backoff = if used_api_rebalance {
-                    false
-                } else {
-                    self.maybe_arm_http_global_backoff(&lease.id, &headers, &analysis)
-                        .await?
-                };
-                let armed_http_project_affinity_backoff = if used_http_project_affinity {
-                    self.maybe_arm_http_project_affinity_backoff(
-                        &lease.id,
-                        &headers,
-                        &analysis,
-                        true,
-                    )
-                    .await?
-                } else {
-                    false
-                };
-                if key_effect.code == KEY_EFFECT_NONE
-                    && (armed_api_rebalance_backoff
-                        || armed_http_project_affinity_backoff
-                        || armed_http_global_backoff)
-                {
-                    key_effect = Self::transient_backoff_set_effect();
-                }
-                let primary_effect = Self::primary_request_effect(
-                    &key_effect,
-                    &api_route_binding_effect,
-                    &api_route_selection_effect,
-                );
-
-                let request_log_id = self
-                    .key_store
-                    .log_attempt(AttemptLog {
-                        key_id: Some(&lease.id),
-                        auth_token_id,
-                        method,
-                        path: display_path,
-                        query: None,
-                        status: Some(status),
-                        tavily_status_code: analysis.tavily_status_code,
-                        error: None,
-                        request_body: &redacted_request_body,
-                        response_body: &redacted_response_body,
-                        outcome: analysis.status,
-                        failure_kind: analysis.failure_kind.as_deref(),
-                        key_effect_code: key_effect.code.as_str(),
-                        key_effect_summary: key_effect.summary.as_deref(),
-                        binding_effect_code: api_route_binding_effect.code.as_str(),
-                        binding_effect_summary: api_route_binding_effect.summary.as_deref(),
-                        selection_effect_code: api_route_selection_effect.code.as_str(),
-                        selection_effect_summary: api_route_selection_effect.summary.as_deref(),
-                        gateway_mode: None,
-                        experiment_variant: None,
-                        provider: None,
-                        proxy_session_id: None,
-                        routing_subject_hash: None,
-                        upstream_operation,
-                        fallback_reason: None,
-                        forwarded_headers: &sanitized_headers.forwarded,
-                        dropped_headers: &sanitized_headers.dropped,
-                        client_ip,
-                    })
-                    .await?;
-                self.link_transient_backoff_clear_request_log(
-                    &key_effect,
-                    &lease.id,
-                    request_log_id,
-                )
-                .await?;
-                if armed_api_rebalance_backoff {
-                    self.key_store
-                        .set_api_key_transient_backoff_request_log_id(
-                            &lease.id,
-                            API_REBALANCE_HTTP_BACKOFF_SCOPE,
-                            request_log_id,
-                            self.backend_time.now_ts(),
-                        )
-                        .await?;
-                } else if armed_http_project_affinity_backoff {
-                    self.key_store
-                        .set_api_key_transient_backoff_request_log_id(
-                            &lease.id,
-                            HTTP_PROJECT_AFFINITY_BACKOFF_SCOPE,
-                            request_log_id,
-                            self.backend_time.now_ts(),
-                        )
-                        .await?;
-                } else if armed_http_global_backoff {
-                    self.key_store
-                        .set_api_key_transient_backoff_request_log_id(
-                            &lease.id,
-                            HTTP_GLOBAL_BACKOFF_SCOPE,
-                            request_log_id,
-                            self.backend_time.now_ts(),
-                        )
-                        .await?;
-                }
-                analysis.key_effect = primary_effect;
-
-                Ok((
-                    ProxyResponse {
-                        status,
-                        headers,
-                        body: body_bytes,
-                        api_key_id: Some(lease.id.clone()),
-                        request_log_id: Some(request_log_id),
-                        key_effect_code: key_effect.code,
-                        key_effect_summary: key_effect.summary,
-                        binding_effect_code: api_route_binding_effect.code,
-                        binding_effect_summary: api_route_binding_effect.summary,
-                        selection_effect_code: api_route_selection_effect.code,
-                        selection_effect_summary: api_route_selection_effect.summary,
-                    },
-                    analysis,
-                ))
-            }
-            Err(err) => {
-                log_proxy_error(&lease.secret, method, display_path, None, &err);
-                let redacted_empty: Vec<u8> = Vec::new();
-                self.key_store
-                    .log_attempt(AttemptLog {
-                        key_id: Some(&lease.id),
-                        auth_token_id,
-                        method,
-                        path: display_path,
-                        query: None,
-                        status: None,
-                        tavily_status_code: None,
-                        error: Some(&err.to_string()),
-                        request_body: &redacted_request_body,
-                        response_body: &redacted_empty,
-                        outcome: OUTCOME_ERROR,
-                        failure_kind: None,
-                        key_effect_code: KEY_EFFECT_NONE,
-                        key_effect_summary: None,
-                        binding_effect_code: KEY_EFFECT_NONE,
-                        binding_effect_summary: None,
-                        selection_effect_code: KEY_EFFECT_NONE,
-                        selection_effect_summary: None,
-                        gateway_mode: None,
-                        experiment_variant: None,
-                        provider: None,
-                        proxy_session_id: None,
-                        routing_subject_hash: None,
-                        upstream_operation,
-                        fallback_reason: None,
-                        forwarded_headers: &sanitized_headers.forwarded,
-                        dropped_headers: &sanitized_headers.dropped,
-                        client_ip,
-                    })
-                    .await?;
-                Err(err)
-            }
+        match verdict(acquired.is_some()) {
+            RetryDecision::Retry => Ok((Some(UPSTREAM_KEY_RETRY_ATTEMPTED), acquired)),
+            RetryDecision::ServeOriginal(ServeOriginalReason::NoEligibleKey) => Ok((
+                Some(UPSTREAM_KEY_RETRY_SKIPPED_NO_ELIGIBLE_KEY),
+                None,
+            )),
+            // Unreachable: the two verdicts differ only in the pool flag, which
+            // can solely produce `NoEligibleKey`. Serving the attempt unmarked is
+            // the safe reading either way.
+            RetryDecision::ServeOriginal(_) => Ok((None, None)),
         }
     }
 

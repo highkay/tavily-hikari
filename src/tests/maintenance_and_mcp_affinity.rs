@@ -1515,12 +1515,37 @@ async fn unknown_403_temporarily_cools_key_without_quarantine_and_success_clears
         )
         .await
         .expect("first project request should complete");
-    assert_eq!(first_resp.status, StatusCode::FORBIDDEN);
-    assert_eq!(
-        first_analysis.failure_kind.as_deref(),
-        Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED),
+    // Plan provider-key-429-retry (2026-10-16 amendment): a bare 403 belongs to
+    // the auth-block family, i.e. an explicit key rejection, so the bounded
+    // cross-key retry now absorbs it inside the same logical request. Everything
+    // this test pins about MARKING is unchanged - the bound key is still the one
+    // that 403s and still gets the transient cooldown asserted below, with no
+    // quarantine - but the caller sees the retry's success instead of the 403.
+    assert_eq!(first_resp.status, StatusCode::OK);
+    assert_eq!(first_analysis.failure_kind.as_deref(), None);
+    assert_ne!(
+        first_resp.api_key_id.as_deref(),
+        Some(hotter_key_id.as_str()),
+        "the retry must serve from a key other than the blocked one"
     );
-    assert_eq!(first_resp.key_effect_code, KEY_EFFECT_TRANSIENT_BACKOFF_SET);
+    let first_chain: Vec<(Option<i64>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT status_code, api_key_id, fallback_reason FROM observability.request_logs ORDER BY id ASC",
+    )
+    .fetch_all(&proxy.key_store.pool)
+    .await
+    .expect("load first request attempt rows");
+    assert_eq!(first_chain.len(), 2, "one visible row per upstream attempt");
+    assert_eq!(first_chain[0].0, Some(403));
+    assert_eq!(first_chain[0].1.as_deref(), Some(hotter_key_id.as_str()));
+    assert_eq!(
+        first_chain[0].2.as_deref(),
+        Some("upstream_key_retry:attempted")
+    );
+    assert_eq!(first_chain[1].0, Some(200));
+    assert_eq!(
+        first_chain[1].2.as_deref(),
+        Some("upstream_key_retry:succeeded")
+    );
 
     let quarantine_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM api_key_quarantines WHERE key_id = ? AND cleared_at IS NULL",
@@ -1591,10 +1616,37 @@ async fn unknown_403_temporarily_cools_key_without_quarantine_and_success_clears
         )
         .await
         .expect("second project request should complete");
-    assert_eq!(second_resp.status, StatusCode::FORBIDDEN);
+    // The quota sync cleared the cooldown, so the bound key is selectable again
+    // and 403s again - which its own attempt row still proves. The caller sees
+    // the retry's success (amendment contract), and that 403 re-arms the
+    // cooldown the next sync below clears.
+    assert_eq!(second_resp.status, StatusCode::OK);
+    let second_chain: Vec<(Option<i64>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT status_code, api_key_id, fallback_reason FROM observability.request_logs ORDER BY id DESC LIMIT 2",
+    )
+    .fetch_all(&proxy.key_store.pool)
+    .await
+    .expect("load second request attempt rows");
     assert_eq!(
-        second_resp.api_key_id.as_deref(),
-        Some(hotter_key_id.as_str())
+        second_chain.len(),
+        2,
+        "one visible row per upstream attempt"
+    );
+    // Newest first: [0] is the retry, [1] the blocked attempt on the cleared key.
+    assert_eq!(second_chain[1].0, Some(403));
+    assert_eq!(
+        second_chain[1].1.as_deref(),
+        Some(hotter_key_id.as_str()),
+        "the cleared key is selectable again and hits the 403"
+    );
+    assert_eq!(
+        second_chain[1].2.as_deref(),
+        Some("upstream_key_retry:attempted")
+    );
+    assert_eq!(second_chain[0].0, Some(200));
+    assert_eq!(
+        second_chain[0].2.as_deref(),
+        Some("upstream_key_retry:succeeded")
     );
 
     proxy
@@ -1777,16 +1829,37 @@ async fn unknown_403_api_rebalance_cools_key_and_next_request_avoids_it() {
         )
         .await
         .expect("first global HTTP request should complete");
-    assert_eq!(first_resp.status, StatusCode::FORBIDDEN);
+    // Plan provider-key-429-retry (2026-10-16 amendment): the auth-block 403 is
+    // an explicit key rejection, so the bounded cross-key retry absorbs it. The
+    // strict acquire must skip BOTH the key that just 403ed and the key that was
+    // already cooling in the api_rebalance_http scope, and land on the healthy
+    // one - a stronger form of what this test pinned before the retry existed.
+    assert_eq!(first_resp.status, StatusCode::OK);
     assert_eq!(
         first_resp.api_key_id.as_deref(),
-        Some(cooled_key_id.as_str())
+        Some(healthy_key_id.as_str()),
+        "the retry must skip the cooled and the already-cooling key"
     );
+    assert_eq!(first_analysis.failure_kind.as_deref(), None);
+    let first_chain: Vec<(Option<i64>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT status_code, api_key_id, fallback_reason FROM observability.request_logs ORDER BY id ASC",
+    )
+    .fetch_all(&proxy.key_store.pool)
+    .await
+    .expect("load first request attempt rows");
+    assert_eq!(first_chain.len(), 2, "one visible row per upstream attempt");
+    assert_eq!(first_chain[0].0, Some(403));
+    assert_eq!(first_chain[0].1.as_deref(), Some(cooled_key_id.as_str()));
     assert_eq!(
-        first_analysis.failure_kind.as_deref(),
-        Some(FAILURE_KIND_UPSTREAM_AUTH_BLOCKED),
+        first_chain[0].2.as_deref(),
+        Some("upstream_key_retry:attempted")
     );
-    assert_eq!(first_resp.key_effect_code, KEY_EFFECT_TRANSIENT_BACKOFF_SET);
+    assert_eq!(first_chain[1].0, Some(200));
+    assert_eq!(first_chain[1].1.as_deref(), Some(healthy_key_id.as_str()));
+    assert_eq!(
+        first_chain[1].2.as_deref(),
+        Some("upstream_key_retry:succeeded")
+    );
 
     let cooldown = proxy
         .key_store

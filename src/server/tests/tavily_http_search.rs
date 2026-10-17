@@ -3211,3 +3211,9 @@ use tower::ServiceExt;
 
         let _ = std::fs::remove_file(db_path);
     }
+
+    // plan provider-key-429-retry todo 6: the cross-key retry seam coverage lives in
+    // a fragment because this file is at its rust_source_line_budgets ceiling (the plan
+    // forbids raising a budget). include! keeps the module path, so the CI manifest
+    // prefix server::tests::tavily_http_search::tavily_ still covers the new tests.
+    include!("tavily_http_search/key_retry.rs");
