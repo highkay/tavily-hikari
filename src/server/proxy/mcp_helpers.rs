@@ -190,18 +190,105 @@ async fn annotate_request_log_key_effect_if_none(
     }
 }
 
+/// Client identity the proxy-driven re-`initialize` presents upstream (plan
+/// provider-key-429-retry todo 13). The client never sees this call, so it names
+/// the proxy instead of impersonating the client.
+const MCP_SESSION_REBIND_CLIENT_NAME: &str = "tavily-hikari-session-rebind";
+const MCP_SESSION_REBIND_INITIALIZE_ID: &str = "hikari-session-rebind";
+
+/// Protocol version the pinned session negotiated, as forwarded on the request
+/// headers. The re-`initialize` reuses it so a migrated session keeps speaking
+/// the version the client asked for.
+fn mcp_request_protocol_version(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("mcp-protocol-version")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// Body of the proxy-driven `initialize` that re-opens an upstream MCP session
+/// on a NEW key. `REBALANCE_MCP_PROTOCOL_VERSION_DEFAULT` is the repo's single
+/// literal for the default MCP protocol version, reused here for a session that
+/// never negotiated one.
+fn mcp_session_rebind_initialize_body(protocol_version: Option<&str>) -> Bytes {
+    Bytes::from(
+        json!({
+            "jsonrpc": "2.0",
+            "id": MCP_SESSION_REBIND_INITIALIZE_ID,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": protocol_version
+                    .unwrap_or(REBALANCE_MCP_PROTOCOL_VERSION_DEFAULT),
+                "capabilities": {},
+                "clientInfo": {
+                    "name": MCP_SESSION_REBIND_CLIENT_NAME,
+                    "version": REBALANCE_MCP_SERVER_VERSION,
+                }
+            }
+        })
+        .to_string(),
+    )
+}
+
+/// Upstream session id a re-`initialize` produced, or `None` when it did not
+/// yield a usable session (non-success status, or no `mcp-session-id` header).
+/// `None` aborts the migration and the caller serves the original rejection.
+fn mcp_rebind_upstream_session_id(response: &ProxyResponse) -> Option<String> {
+    if !response.status.is_success() {
+        return None;
+    }
+    response
+        .headers
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 async fn proxy_mcp_follow_up_with_retry(
     state: &Arc<AppState>,
     proxy_session_id: &str,
     proxy_request: ProxyRequest,
 ) -> Result<ProxyResponse, ProxyError> {
     let waited_before_send = wait_for_mcp_session_retry_window(state, proxy_session_id).await?;
-    let mut first_response = state.proxy.proxy_request(proxy_request.clone()).await?;
+    let first_response = state.proxy.proxy_request(proxy_request.clone()).await?;
     let first_analysis = analyze_mcp_attempt(first_response.status, &first_response.body);
     let first_rate_limited =
         first_analysis.failure_kind.as_deref() == Some(FAILURE_KIND_UPSTREAM_RATE_LIMITED_429_CODE);
 
     if !first_rate_limited {
+        // Plan provider-key-429-retry todo 13: an AuthFailed/Exhausted rejection
+        // kills the PINNED KEY, not the session, so migrate the session onto a
+        // fresh key and replay once. The effective status is the one the
+        // analysis above already derived (it lifts Tavily's envelope-shaped 432
+        // out of an HTTP 200), so a successful follow-up pays no second body
+        // parse. `None` - ineligible signal, no other key, a refused
+        // re-initialization, a failed rebind or a failed replay - falls through
+        // to today's unchanged behavior, which serves the ORIGINAL rejection
+        // byte-for-byte and never loops.
+        let effective_status = first_analysis
+            .tavily_status_code
+            .and_then(|code| u16::try_from(code).ok())
+            .unwrap_or_else(|| first_response.status.as_u16());
+        let migrated = if tavily_hikari::mcp_key_migration_signal(
+            tavily_hikari::providers::ProviderId::Tavily,
+            effective_status,
+            &first_response.body,
+        )
+        .requires_key_migration()
+        {
+            migrate_pinned_mcp_session_off_failed_key(state, proxy_session_id, &proxy_request)
+                .await?
+        } else {
+            None
+        };
+        let mut first_response = match migrated {
+            Some(response) => response,
+            None => first_response,
+        };
         if waited_before_send {
             annotate_request_log_key_effect_if_none(
                 state,
@@ -282,6 +369,111 @@ async fn proxy_mcp_follow_up_with_retry(
     }
 
     Ok(retry_response)
+}
+
+/// Migrate a pinned MCP session onto another upstream key (plan
+/// provider-key-429-retry todo 13). The caller has already decided the attempt
+/// was a KEY-scoped rejection (`AuthFailed` / `Exhausted`): both say the key is
+/// dead while the session itself is fine, so one fresh key plus a proxy-driven
+/// re-`initialize` salvages it and the client never observes the move (its proxy
+/// session id is stable). `RateLimited` never reaches this function - the ladder
+/// above keeps its "wait Retry-After, retry once on the SAME key" behavior.
+///
+/// Bounded by construction: ONE strict acquire (dead key excluded), ONE
+/// re-`initialize`, ONE rebind, ONE replay, and no loop. Every miss - no
+/// eligible key, a refused re-`initialize`, a failed rebind, a transport error
+/// on either upstream call - returns `None`, and the caller serves the ORIGINAL
+/// rejection byte-for-byte. Marking the dead key stays with the first attempt's
+/// existing reconcile/arm path; nothing is marked here, and no billing seam is
+/// re-entered (the handler settles once on whatever the ladder returns).
+///
+/// Cap policy (orchestrator-settled for this plan, do not "fix"): the rebind
+/// does NOT consult `list_active_mcp_session_counts_by_subject`. That count
+/// groups by `upstream_key_id`, so a migrated session merely moves out of the
+/// dead key's tally and into the new key's future headroom - it salvages a
+/// session the subject already had, and a cap check here would turn a
+/// recoverable dead key into a forced client reconnect.
+///
+/// Runs inside the caller's session lock: the handler holds
+/// `lock_mcp_session_request(proxy_session_id)` across the whole ladder, so no
+/// concurrent follow-up on this session can interleave between the
+/// re-`initialize` and the rebind.
+async fn migrate_pinned_mcp_session_off_failed_key(
+    state: &Arc<AppState>,
+    proxy_session_id: &str,
+    proxy_request: &ProxyRequest,
+) -> Result<Option<ProxyResponse>, ProxyError> {
+    // A follow-up without a pinned key is not a session migration; whatever it
+    // hit is served unchanged.
+    let Some(dead_key_id) = proxy_request.pinned_api_key_id.clone() else {
+        return Ok(None);
+    };
+
+    // Strict acquire: a DIFFERENT, provably usable key or nothing. The rejected
+    // key is excluded, cooling/quarantined/depleted keys are skipped, and there
+    // is no fallback to the dead key.
+    let Some(new_key_id) = state
+        .proxy
+        .acquire_mcp_session_migration_key(
+            tavily_hikari::providers::ProviderId::Tavily,
+            proxy_request.auth_token_id.as_deref(),
+            std::slice::from_ref(&dead_key_id),
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+
+    // Re-`initialize` on the new key: same client shape as the rejected call
+    // (accept/content-type/protocol version carried over), minus the dead
+    // upstream session id.
+    let protocol_version = mcp_request_protocol_version(&proxy_request.headers);
+    let mut initialize_headers = proxy_request.headers.clone();
+    initialize_headers.remove("mcp-session-id");
+    let initialize_request = ProxyRequest {
+        method: Method::POST,
+        headers: initialize_headers,
+        body: mcp_session_rebind_initialize_body(protocol_version.as_deref()),
+        pinned_api_key_id: Some(new_key_id.clone()),
+        prefer_mcp_session_affinity: false,
+        ..proxy_request.clone()
+    };
+    let Ok(initialize_response) = state.proxy.proxy_request(initialize_request).await else {
+        return Ok(None);
+    };
+    let Some(new_upstream_session_id) = mcp_rebind_upstream_session_id(&initialize_response) else {
+        return Ok(None);
+    };
+
+    // One atomic UPDATE rewrites the upstream identity pair; a revoked row is a
+    // silent no-op, which is also the safe answer here (the session is gone, so
+    // the client gets the original rejection and reconnects).
+    if state
+        .proxy
+        .rebind_mcp_session_upstream_key(proxy_session_id, &new_upstream_session_id, &new_key_id)
+        .await
+        .is_err()
+    {
+        return Ok(None);
+    }
+
+    // Replay the ORIGINAL call once on the migrated session.
+    let mut replay_headers = proxy_request.headers.clone();
+    let Ok(new_session_header) = ReqHeaderValue::from_str(&new_upstream_session_id) else {
+        return Ok(None);
+    };
+    replay_headers.insert(HeaderName::from_static("mcp-session-id"), new_session_header);
+    let replay_request = ProxyRequest {
+        headers: replay_headers,
+        pinned_api_key_id: Some(new_key_id),
+        ..proxy_request.clone()
+    };
+    match state.proxy.proxy_request(replay_request).await {
+        Ok(response) => Ok(Some(response)),
+        // A transport/store failure on the replay is a failed migration step:
+        // the client gets the original rejection, never a 502 and never a loop.
+        Err(_) => Ok(None),
+    }
 }
 
 /// Generalized client key-slot strip (plan todo 4): removes EVERY

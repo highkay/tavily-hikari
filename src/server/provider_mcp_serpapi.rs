@@ -162,13 +162,35 @@ async fn provider_mcp_follow_up_with_retry(
     request: ProviderMcpPassthroughRequest,
 ) -> Result<tavily_hikari::ProxyResponse, ProxyError> {
     let waited_before_send = wait_for_mcp_session_retry_window(state, proxy_session_id).await?;
-    let mut first_response = state
+    let first_response = state
         .proxy
         .proxy_provider_mcp_passthrough(request.clone())
         .await?;
     let first_rate_limited = provider_mcp_response_rate_limited(&first_response);
 
     if !first_rate_limited {
+        // Plan provider-key-429-retry todo 13: AuthFailed/Exhausted kills the
+        // PINNED KEY, not the session, so migrate and replay once. SerpApi's
+        // verdict rides the HTTP status (the run-out text only splits the two
+        // 429 flavors, and the hourly one is owned by the branch below), so a
+        // successful follow-up pays no second body parse. `None` falls through
+        // to today's unchanged behavior, which serves the ORIGINAL rejection
+        // byte-for-byte and never loops.
+        let migrated = if tavily_hikari::mcp_key_migration_signal(
+            request.provider,
+            first_response.status.as_u16(),
+            &first_response.body,
+        )
+        .requires_key_migration()
+        {
+            migrate_provider_mcp_session_off_failed_key(state, proxy_session_id, &request).await?
+        } else {
+            None
+        };
+        let mut first_response = match migrated {
+            Some(response) => response,
+            None => first_response,
+        };
         if waited_before_send {
             annotate_request_log_key_effect_if_none(
                 state,
@@ -246,6 +268,86 @@ async fn provider_mcp_follow_up_with_retry(
     }
 
     Ok(retry_response)
+}
+
+/// Migrate a pinned hosted-MCP session onto another upstream key: the provider
+/// mirror of `migrate_pinned_mcp_session_off_failed_key` (mcp_helpers.rs), with
+/// the same bounds and the same fallback contract - the caller has already
+/// decided the attempt was a KEY-scoped rejection, and this performs ONE strict
+/// acquire (dead key excluded), ONE proxy-driven re-`initialize`, ONE atomic
+/// rebind and ONE replay of the original call, never a loop. Any miss returns
+/// `None` so the caller serves the ORIGINAL rejection byte-for-byte. Run-out 429
+/// classifies `Exhausted` here (SerpApi's dual-semantic 429) and therefore
+/// migrates, while the hourly flavor stays `RateLimited` and keeps the existing
+/// wait + same-key retry in the ladder above. The rebind deliberately skips the
+/// per-subject session cap: the migrated session already counted against the
+/// dead key, and the cap tally groups by `upstream_key_id`, so the row moves
+/// into the new key's headroom. Runs inside the caller's
+/// `lock_mcp_session_request` guard.
+async fn migrate_provider_mcp_session_off_failed_key(
+    state: &Arc<AppState>,
+    proxy_session_id: &str,
+    request: &ProviderMcpPassthroughRequest,
+) -> Result<Option<tavily_hikari::ProxyResponse>, ProxyError> {
+    let Some(dead_key_id) = request.pinned_api_key_id.clone() else {
+        return Ok(None);
+    };
+    let Some(new_key_id) = state
+        .proxy
+        .acquire_mcp_session_migration_key(
+            request.provider,
+            request.auth_token_id.as_deref(),
+            std::slice::from_ref(&dead_key_id),
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+
+    // Re-`initialize` on the new key: the executor strips any client-visible
+    // `mcp-session-id` and only re-adds one when `upstream_session_id` is set,
+    // so `None` here opens a genuinely new upstream session.
+    let protocol_version = mcp_request_protocol_version(&request.headers);
+    let initialize_request = ProviderMcpPassthroughRequest {
+        method: Method::POST,
+        body: mcp_session_rebind_initialize_body(protocol_version.as_deref()).to_vec(),
+        pinned_api_key_id: Some(new_key_id.clone()),
+        upstream_session_id: None,
+        ..request.clone()
+    };
+    let Ok(initialize_response) = state
+        .proxy
+        .proxy_provider_mcp_passthrough(initialize_request)
+        .await
+    else {
+        return Ok(None);
+    };
+    let Some(new_upstream_session_id) = mcp_rebind_upstream_session_id(&initialize_response) else {
+        return Ok(None);
+    };
+
+    if state
+        .proxy
+        .rebind_mcp_session_upstream_key(proxy_session_id, &new_upstream_session_id, &new_key_id)
+        .await
+        .is_err()
+    {
+        return Ok(None);
+    }
+
+    let replay_request = ProviderMcpPassthroughRequest {
+        pinned_api_key_id: Some(new_key_id),
+        upstream_session_id: Some(new_upstream_session_id),
+        ..request.clone()
+    };
+    match state
+        .proxy
+        .proxy_provider_mcp_passthrough(replay_request)
+        .await
+    {
+        Ok(response) => Ok(Some(response)),
+        Err(_) => Ok(None),
+    }
 }
 
 /// SerpApi hosted MCP passthrough body (replaces the todo-11 typed

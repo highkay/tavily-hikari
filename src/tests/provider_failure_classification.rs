@@ -1411,3 +1411,128 @@ fn provider_mcp_ingress_paths_are_pinned() {
     assert_eq!(provider_mcp_ingress_path(ProviderId::Exa), "/exa/mcp");
     assert_eq!(provider_mcp_ingress_path(ProviderId::Brave), "/brave/mcp");
 }
+
+// ---------------------------------------------------------------------------
+// Plan provider-key-429-retry todo 13: the boundary projection the bin-side MCP
+// follow-up ladders branch on. Only `AuthFailed` / `Exhausted` migrate a pinned
+// session; `RateLimited` is reported so the ladders' existing "wait Retry-After,
+// retry once on the SAME key" path keeps owning 429 untouched.
+// ---------------------------------------------------------------------------
+
+fn migrate_signal(
+    provider: ProviderId,
+    effective_status: u16,
+    body: &[u8],
+) -> McpKeyMigrationSignal {
+    mcp_key_migration_signal(provider, effective_status, body)
+}
+
+/// The effective status the `/mcp` ladder hands the signal: the analyzer's
+/// envelope-aware code (Tavily reports quota exhaustion as HTTP 200 + body
+/// `status: 432`), falling back to the HTTP status.
+fn effective_tavily_status(status: StatusCode, body: &[u8]) -> u16 {
+    analyze_mcp_attempt(status, body)
+        .tavily_status_code
+        .and_then(|code| u16::try_from(code).ok())
+        .unwrap_or_else(|| status.as_u16())
+}
+
+#[test]
+fn mcp_key_migration_signal_splits_key_scoped_rejections_from_the_rest() {
+    // Given Tavily's envelope-shaped exhaustion: HTTP 200 whose JSON-RPC result
+    // carries `status: 432` - the shape the /mcp pipeline really sees.
+    let tavily_432 = br#"{"jsonrpc":"2.0","id":1,"result":{"structuredContent":{"status":432}}}"#;
+
+    // When the ladder asks for the migration signal
+    // Then the effective status came from the envelope, not the HTTP line.
+    let envelope_status = effective_tavily_status(StatusCode::OK, tavily_432);
+    assert_eq!(envelope_status, 432);
+    let envelope_signal = migrate_signal(ProviderId::Tavily, envelope_status, tavily_432);
+    assert_eq!(envelope_signal, McpKeyMigrationSignal::Exhausted);
+    assert!(
+        envelope_signal.requires_key_migration(),
+        "exhaustion migrates the pinned session"
+    );
+    // A bare HTTP 432 travels the same arm.
+    assert_eq!(
+        migrate_signal(ProviderId::Tavily, 432, br#"{"error":"quota"}"#),
+        McpKeyMigrationSignal::Exhausted
+    );
+
+    // Given the auth family: a bare 403 (todo-1 auth block) and a keyword 401
+    // both kill the KEY.
+    assert_eq!(
+        migrate_signal(ProviderId::Tavily, 403, br#"{"error":"Forbidden"}"#),
+        McpKeyMigrationSignal::AuthFailed
+    );
+    assert_eq!(
+        migrate_signal(ProviderId::Tavily, 401, br#"{"error":"invalid api key"}"#),
+        McpKeyMigrationSignal::AuthFailed
+    );
+
+    // Given a throughput 429: reported as RateLimited, and it must NOT migrate.
+    let rate_limited = migrate_signal(
+        ProviderId::Tavily,
+        429,
+        br#"{"error":"excessive requests"}"#,
+    );
+    assert_eq!(rate_limited, McpKeyMigrationSignal::RateLimited);
+    assert!(!rate_limited.requires_key_migration());
+
+    // Given everything that is not key-scoped: a success, a request-shaped 4xx
+    // and a 5xx all stay put (the MCP surfaces never enter the retry kernel).
+    let success_body = br#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#;
+    assert_eq!(
+        migrate_signal(
+            ProviderId::Tavily,
+            effective_tavily_status(StatusCode::OK, success_body),
+            success_body
+        ),
+        McpKeyMigrationSignal::NotEligible,
+        "a successful follow-up never migrates"
+    );
+    assert_eq!(
+        migrate_signal(ProviderId::Tavily, 400, br#"{"error":"bad request"}"#),
+        McpKeyMigrationSignal::NotEligible
+    );
+    assert_eq!(
+        migrate_signal(ProviderId::Tavily, 503, br#"{"error":"upstream"}"#),
+        McpKeyMigrationSignal::NotEligible
+    );
+}
+
+#[test]
+fn mcp_key_migration_signal_reads_serpapi_dual_semantic_429_from_the_body() {
+    // Given SerpApi's two flavors of 429 on the hosted MCP passthrough, when the
+    // ladder asks, then the run-out flavor migrates ...
+    assert_eq!(
+        migrate_signal(
+            ProviderId::Serpapi,
+            429,
+            br#"{"error":"Your account has run out of searches."}"#
+        ),
+        McpKeyMigrationSignal::Exhausted
+    );
+    // ... including SSE-wrapped, which is how the MCP surface carries it.
+    assert_eq!(
+        migrate_signal(
+            ProviderId::Serpapi,
+            429,
+            b"event: message\ndata: {\"error\":\"Your account has run out of searches.\"}\n\n"
+        ),
+        McpKeyMigrationSignal::Exhausted
+    );
+    // ... while the hourly flavor stays the existing wait + same-key retry.
+    let hourly = migrate_signal(
+        ProviderId::Serpapi,
+        429,
+        br#"{"error":"Your account has exceeded its hourly throughput limit."}"#,
+    );
+    assert_eq!(hourly, McpKeyMigrationSignal::RateLimited);
+    assert!(!hourly.requires_key_migration());
+    // A serpapi 401 is an auth failure on the key, so it migrates too.
+    assert_eq!(
+        migrate_signal(ProviderId::Serpapi, 401, br#"{"error":"Invalid API key"}"#),
+        McpKeyMigrationSignal::AuthFailed
+    );
+}

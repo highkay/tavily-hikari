@@ -1875,6 +1875,70 @@ impl TavilyProxy {
             .await
     }
 
+    /// Migrate a pinned MCP session onto a different upstream key (plan
+    /// provider-key-429-retry todo 13): pass-through for the todo-12 store
+    /// write, which atomically rewrites `upstream_session_id` +
+    /// `upstream_key_id` and no-ops on a revoked or unknown row. The proxy
+    /// session id is untouched, so clients never observe the migration, and
+    /// `expires_at` is NOT refreshed - the lease stays
+    /// [`Self::touch_mcp_session`]'s job.
+    ///
+    /// Deliberately no per-subject session-cap check: a migration salvages a
+    /// session that already counted against the dead key, and
+    /// `list_active_mcp_session_counts_by_subject` groups by `upstream_key_id`,
+    /// so the row simply moves into the new key's headroom instead of adding a
+    /// session to the subject.
+    pub async fn rebind_mcp_session_upstream_key(
+        &self,
+        proxy_session_id: &str,
+        upstream_session_id: &str,
+        upstream_key_id: &str,
+    ) -> Result<(), ProxyError> {
+        self.key_store
+            .rebind_mcp_session_upstream_key(
+                proxy_session_id,
+                upstream_session_id,
+                upstream_key_id,
+            )
+            .await
+    }
+
+    /// Strict "hand me a DIFFERENT, provably usable key or nothing" acquire for
+    /// the todo-13 MCP session migration: the todo-5 cross-key-retry primitive
+    /// with the rejected key in `excluded`, reduced to the key id the bin-side
+    /// ladders pin their re-`initialize` and replay on (the executors re-lease
+    /// the secret themselves from `pinned_api_key_id`). `Ok(None)` is the
+    /// "no eligible key" signal - the caller then serves the original rejection
+    /// byte-for-byte. Nothing is marked here; the first attempt's existing
+    /// reconcile/arm path already did the marking.
+    pub async fn acquire_mcp_session_migration_key(
+        &self,
+        provider: providers::ProviderId,
+        auth_token_id: Option<&str>,
+        excluded_key_ids: &[String],
+    ) -> Result<Option<String>, ProxyError> {
+        let scope = Self::mcp_key_migration_backoff_scope(provider);
+        Ok(self
+            .key_store
+            .acquire_key_for_cross_key_retry(provider, auth_token_id, scope, excluded_key_ids)
+            .await?
+            .map(|lease| lease.id))
+    }
+
+    /// Transient-backoff scope the strict MCP migration acquire honors: the
+    /// same scope each provider's MCP executor arms, so a key already cooling
+    /// for THIS surface is never handed back as the migration target. Tavily's
+    /// `/mcp` executor arms `mcp_session_init`; the hosted provider
+    /// passthrough arms the shared HTTP scope.
+    fn mcp_key_migration_backoff_scope(provider: providers::ProviderId) -> &'static str {
+        match provider {
+            providers::ProviderId::Tavily => MCP_SESSION_INIT_BACKOFF_SCOPE,
+            providers::ProviderId::Serpapi
+            | providers::ProviderId::Exa
+            | providers::ProviderId::Brave => HTTP_GLOBAL_BACKOFF_SCOPE,
+        }
+    }
+
     pub async fn mark_mcp_session_rate_limited(
         &self,
         proxy_session_id: &str,

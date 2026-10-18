@@ -26,6 +26,70 @@ impl ProviderFailureSignal {
     }
 }
 
+/// Key-migration signal for the bin-side MCP follow-up ladders (plan
+/// provider-key-429-retry todo 13).
+///
+/// The ladders live in the binary crate, where the classifier internals are
+/// crate-private, so this is the same boundary projection pattern as
+/// `serpapi_facade_outcome`: ONE call maps a buffered MCP follow-up response
+/// onto the signal the ladder branches on. `RateLimited` is reported for
+/// completeness only - both ladders keep their existing 429 detection
+/// (`upstream_rate_limited_429`) and the "wait Retry-After, retry once on the
+/// SAME key" behavior it drives, untouched; only `AuthFailed` / `Exhausted`
+/// migrate a pinned session onto another key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpKeyMigrationSignal {
+    /// Not a key-scoped rejection: the attempt is served to the client as-is.
+    NotEligible,
+    /// Throughput 429: the ladder's Retry-After wait + same-key retry owns it.
+    RateLimited,
+    /// 401/403 auth rejection: the pinned key is dead.
+    AuthFailed,
+    /// Quota run-out (Tavily 432, SerpApi "run out of searches"): the pinned
+    /// key is spent.
+    Exhausted,
+}
+
+impl McpKeyMigrationSignal {
+    /// True exactly for the two signals that justify moving a pinned session
+    /// onto another key.
+    pub fn requires_key_migration(self) -> bool {
+        matches!(self, Self::AuthFailed | Self::Exhausted)
+    }
+}
+
+/// Classify one buffered MCP follow-up response for the session-migration
+/// branch. `effective_status` is the status the CALLER already derived, which
+/// keeps this off the hot path: the Tavily `/mcp` ladder passes
+/// `analyze_mcp_attempt(..).tavily_status_code` (that analyzer lifts an
+/// envelope-shaped `status: 432` out of an HTTP 200 body) falling back to the
+/// HTTP status, and the hosted provider passthrough passes the HTTP status
+/// itself. `body` is only read where a provider's verdict depends on it -
+/// SerpApi's dual-semantic 429, whose run-out flavor travels as text in either
+/// the raw-JSON or the SSE-envelope shape. Retry-After sizing is irrelevant
+/// here (each ladder sizes its own wait), so no headers are passed.
+pub fn mcp_key_migration_signal(
+    provider: ProviderId,
+    effective_status: u16,
+    body: &[u8],
+) -> McpKeyMigrationSignal {
+    match classify_provider_failure(
+        provider,
+        &ProviderFailureEvidence {
+            status: effective_status,
+            headers: None,
+            body,
+        },
+    ) {
+        ProviderFailureSignal::RateLimited { .. } => McpKeyMigrationSignal::RateLimited,
+        ProviderFailureSignal::AuthFailed => McpKeyMigrationSignal::AuthFailed,
+        ProviderFailureSignal::Exhausted => McpKeyMigrationSignal::Exhausted,
+        ProviderFailureSignal::Ok
+        | ProviderFailureSignal::ClientError
+        | ProviderFailureSignal::ServerTransient => McpKeyMigrationSignal::NotEligible,
+    }
+}
+
 /// Exhaustion depletion gate (M8): Tavily-432 ONLY; new providers never write
 /// depletion rows (todo 9 threaded provider-scoped leases).
 pub(crate) fn low_quota_depletion_applies(

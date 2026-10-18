@@ -1205,6 +1205,200 @@
         (addr, calls)
     }
 
+    /// One MCP call as the todo-13 key-migration mock saw it: the JSON-RPC
+    /// method, the pooled key that reached the upstream, and the upstream
+    /// session id header it presented.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) struct KeyMigrationSessionCall {
+        pub(super) method: String,
+        pub(super) tavily_api_key: String,
+        pub(super) upstream_session_id_header: Option<String>,
+    }
+
+    /// How the migration mock rejects a follow-up that arrives on the key the
+    /// session is pinned to. Both shapes are KEY-scoped rejections, which is
+    /// what makes them migration-eligible; neither is a 429, so the existing
+    /// wait + same-key retry never fires.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum McpKeyMigrationRejection {
+        /// Bare 403 with no quarantine keyword: the todo-1 auth-block family.
+        AuthBlocked403,
+        /// HTTP 200 whose JSON-RPC envelope carries `status: 432` - Tavily's
+        /// quota-exhausted shape, which never travels as an HTTP 432.
+        QuotaExhausted432,
+    }
+
+    /// Upstream session id the migrated key's re-`initialize` hands out.
+    pub(super) const MCP_KEY_MIGRATION_UPSTREAM_SESSION: &str = "upstream-session-migrated";
+    /// Upstream session id the FIRST (pinning) `initialize` hands out.
+    pub(super) const MCP_KEY_MIGRATION_PINNED_SESSION: &str = "upstream-session-pinned";
+    /// Body of every rejection the migration mock answers: distinct from the
+    /// success bodies so the client-visible bytes prove WHICH attempt was
+    /// served.
+    pub(super) const MCP_KEY_MIGRATION_REJECTION_BODY: &str = r#"{"error":"Forbidden"}"#;
+
+    /// Mock upstream for the todo-13 pinned-session key migration (plan
+    /// provider-key-429-retry). The FIRST `initialize` pins the session to
+    /// whichever pooled key the proxy happened to pick, so a case never depends
+    /// on pool ordering; every follow-up on that pinned key answers `rejection`,
+    /// while a re-`initialize` on the OTHER key opens
+    /// [`MCP_KEY_MIGRATION_UPSTREAM_SESSION`] and follow-ups on it succeed. With
+    /// `reject_reinitialize` the second `initialize` is refused with a bare 403
+    /// instead - the shape that must end in the original rejection, with no
+    /// replay and no loop.
+    pub(super) async fn spawn_mock_mcp_upstream_for_session_key_migration(
+        pool_keys: Vec<String>,
+        rejection: McpKeyMigrationRejection,
+        reject_reinitialize: bool,
+    ) -> (SocketAddr, Arc<Mutex<Vec<KeyMigrationSessionCall>>>) {
+        let calls: Arc<Mutex<Vec<KeyMigrationSessionCall>>> = Arc::new(Mutex::new(Vec::new()));
+        let pinned_key: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let app = Router::new().route(
+            "/mcp",
+            any({
+                let calls = calls.clone();
+                let pinned_key = pinned_key.clone();
+                move |headers: HeaderMap,
+                      Query(params): Query<HashMap<String, String>>,
+                      Json(body): Json<Value>| {
+                    let calls = calls.clone();
+                    let pinned_key = pinned_key.clone();
+                    let pool_keys = pool_keys.clone();
+                    async move {
+                        let api_key = params.get("tavilyApiKey").cloned().unwrap_or_default();
+                        assert!(
+                            pool_keys.contains(&api_key),
+                            "unexpected pooled key reached the mock: {api_key}"
+                        );
+                        let method = body
+                            .get("method")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        let upstream_session_id_header = headers
+                            .get("mcp-session-id")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string);
+                        calls
+                            .lock()
+                            .expect("key migration calls lock poisoned")
+                            .push(KeyMigrationSessionCall {
+                                method: method.clone(),
+                                tavily_api_key: api_key.clone(),
+                                upstream_session_id_header: upstream_session_id_header.clone(),
+                            });
+                        let response_id = body
+                            .get("id")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!(1));
+
+                        match method.as_str() {
+                            "initialize" => {
+                                let mut pinned_state =
+                                    pinned_key.lock().expect("pinned key lock poisoned");
+                                if pinned_state.is_none() {
+                                    *pinned_state = Some(api_key.clone());
+                                }
+                                let is_rebind = pinned_state.as_deref() != Some(api_key.as_str());
+                                drop(pinned_state);
+                                if is_rebind && reject_reinitialize {
+                                    return Response::builder()
+                                        .status(StatusCode::FORBIDDEN)
+                                        .header(CONTENT_TYPE, "application/json")
+                                        .body(Body::from(MCP_KEY_MIGRATION_REJECTION_BODY))
+                                        .expect("build refused re-initialize response");
+                                }
+                                let session_id = if is_rebind {
+                                    MCP_KEY_MIGRATION_UPSTREAM_SESSION
+                                } else {
+                                    MCP_KEY_MIGRATION_PINNED_SESSION
+                                };
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_TYPE, "application/json")
+                                    .header("mcp-session-id", session_id)
+                                    .body(Body::from(
+                                        serde_json::json!({
+                                            "jsonrpc": "2.0",
+                                            "id": response_id,
+                                            "result": {
+                                                "protocolVersion": "2025-03-26",
+                                                "serverInfo": { "name": "mock-mcp", "version": "1.0.0" },
+                                                "capabilities": {}
+                                            }
+                                        })
+                                        .to_string(),
+                                    ))
+                                    .expect("build initialize response")
+                            }
+                            "notifications/initialized" => Response::builder()
+                                .status(StatusCode::ACCEPTED)
+                                .body(Body::empty())
+                                .expect("build notifications/initialized response"),
+                            _ => {
+                                let on_pinned_key = pinned_key
+                                    .lock()
+                                    .expect("pinned key lock poisoned")
+                                    .as_deref()
+                                    == Some(api_key.as_str());
+                                if on_pinned_key {
+                                    return match rejection {
+                                        McpKeyMigrationRejection::AuthBlocked403 => Response::builder()
+                                            .status(StatusCode::FORBIDDEN)
+                                            .header(CONTENT_TYPE, "application/json")
+                                            .body(Body::from(MCP_KEY_MIGRATION_REJECTION_BODY))
+                                            .expect("build auth-block rejection"),
+                                        McpKeyMigrationRejection::QuotaExhausted432 => {
+                                            Response::builder()
+                                                .status(StatusCode::OK)
+                                                .header(CONTENT_TYPE, "application/json")
+                                                .body(Body::from(
+                                                    serde_json::json!({
+                                                        "jsonrpc": "2.0",
+                                                        "id": response_id,
+                                                        "result": {
+                                                            "structuredContent": { "status": 432 }
+                                                        }
+                                                    })
+                                                    .to_string(),
+                                                ))
+                                                .expect("build quota-exhausted rejection")
+                                        }
+                                    };
+                                }
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_TYPE, "application/json")
+                                    .body(Body::from(
+                                        serde_json::json!({
+                                            "jsonrpc": "2.0",
+                                            "id": response_id,
+                                            "result": {
+                                                "tools": [
+                                                    { "name": "tavily_search", "description": "mock tool" }
+                                                ]
+                                            }
+                                        })
+                                        .to_string(),
+                                    ))
+                                    .expect("build tools/list success response")
+                            }
+                        }
+                    }
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        (addr, calls)
+    }
+
     pub(super) async fn spawn_mock_mcp_upstream_for_serialized_session_requests(
         expected_api_key: String,
         tools_list_delay: Duration,

@@ -361,9 +361,11 @@ impl KeyStore {
     /// rate-limit or lease column is touched - callers keep using
     /// `touch_mcp_session` for the lease - and a revoked or unknown row is a
     /// silent no-op, like every sibling update in this module.
-    // Not wired into production yet: plan todo 13 calls this from the MCP
-    // follow-up ladder (Auth|Exhausted migration) through a Proxy facade.
-    #[cfg_attr(not(test), allow(dead_code))]
+    // Production consumer: the todo-13 MCP follow-up ladders
+    // (`server/proxy/mcp_helpers.rs` for Tavily, `server/provider_mcp_serpapi.rs`
+    // for the hosted passthrough) call this through the
+    // `TavilyProxy::rebind_mcp_session_upstream_key` facade, so the staged-seam
+    // allow is gone.
     pub(crate) async fn rebind_mcp_session_upstream_key(
         &self,
         proxy_session_id: &str,

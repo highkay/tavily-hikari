@@ -3034,3 +3034,8 @@ use super::upstream_support_and_manual_jobs::*;
 
         let _ = std::fs::remove_file(db_path);
     }
+
+    // plan provider-key-429-retry todo 13: the pinned-session key migration seam lives
+    // in a fragment because this file is at its rust_source_line_budgets ceiling; the
+    // include! keeps the manifest prefix `...::mcp_follow_up_` covering the new tests.
+    include!("mcp_rebalance_and_follow_up/key_migration.rs");

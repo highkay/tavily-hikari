@@ -2542,3 +2542,403 @@ use super::*;
         );
         pool.close().await;
     }
+
+    // ---------------------------------------------------------------------
+    // Hosted-MCP pinned-session key migration (plan provider-key-429-retry
+    // todo 13): the serpapi mirror of the Tavily ladder battery in
+    // `mcp_rebalance_and_follow_up/key_migration.rs`. An auth-failed pooled key
+    // kills the KEY, not the session, so the follow-up ladder migrates the
+    // pinned session (strict acquire with the dead key excluded -> one
+    // proxy-driven re-`initialize` -> one atomic rebind -> one replay) and the
+    // client only ever sees a success under its STABLE proxy session id. The
+    // hourly-flavor 429 keeps its wait + same-key retry and is pinned by the
+    // todo-15 ladder coverage.
+    // ---------------------------------------------------------------------
+
+    /// One hosted-MCP upstream call as the migration mock saw it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ProviderMcpMigrationCall {
+        method: String,
+        /// Pooled key out of the `Authorization: Bearer` slot.
+        api_key: String,
+        session_header: Option<String>,
+    }
+
+    /// Upstream session id the first (pinning) `initialize` hands out.
+    const PROVIDER_MCP_PINNED_SESSION: &str = "serpapi-upstream-pinned";
+    /// Upstream session id the migrated key's re-`initialize` hands out.
+    const PROVIDER_MCP_MIGRATED_SESSION: &str = "serpapi-upstream-migrated";
+    /// SerpApi's auth-fail body: a bare 401, which the todo-3 classifier reads
+    /// as `AuthFailed` (and the executor quarantines the key for).
+    const PROVIDER_MCP_AUTH_FAIL_BODY: &str =
+        "Invalid API key. Your API key should be here: https://serpapi.com/manage-api-key";
+
+    fn provider_mcp_migration_response(
+        status: StatusCode,
+        session: Option<&str>,
+        payload: Option<Value>,
+    ) -> Response {
+        let mut builder = Response::builder().status(status);
+        if payload.is_some() {
+            builder = builder.header(CONTENT_TYPE, "application/json");
+        }
+        if let Some(session) = session {
+            builder = builder.header("mcp-session-id", session);
+        }
+        let body = match payload {
+            Some(payload) => Body::from(payload.to_string()),
+            None => Body::empty(),
+        };
+        builder.body(body).expect("build migration mock response")
+    }
+
+    /// Mock SerpApi hosted MCP upstream. The FIRST `initialize` pins the session
+    /// to whichever pooled key the proxy picked (so the case never depends on
+    /// pool ordering); every follow-up on that pinned key answers the bare 401,
+    /// while a re-`initialize` on the OTHER key opens
+    /// [`PROVIDER_MCP_MIGRATED_SESSION`] and follow-ups on it succeed.
+    async fn spawn_provider_mcp_migration_upstream(
+        pool_keys: Vec<String>,
+    ) -> (SocketAddr, Arc<Mutex<Vec<ProviderMcpMigrationCall>>>) {
+        let calls: Arc<Mutex<Vec<ProviderMcpMigrationCall>>> = Arc::new(Mutex::new(Vec::new()));
+        let pinned_key: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let calls_for_app = calls.clone();
+        let pinned_for_app = pinned_key.clone();
+        let app = Router::new().fallback(move |req: Request<Body>| {
+            let calls = calls_for_app.clone();
+            let pinned_key = pinned_for_app.clone();
+            let pool_keys = pool_keys.clone();
+            async move {
+                let (parts, body) = req.into_parts();
+                let body_bytes = body::to_bytes(body, BODY_LIMIT).await.unwrap_or_default();
+                let parsed: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
+                let api_key = parts
+                    .headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.strip_prefix("Bearer "))
+                    .unwrap_or_default()
+                    .to_string();
+                assert!(
+                    pool_keys.contains(&api_key),
+                    "unexpected pooled key reached the hosted MCP mock: {api_key}"
+                );
+                let method = parsed
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let session_header = parts
+                    .headers
+                    .get("mcp-session-id")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                calls
+                    .lock()
+                    .expect("provider mcp migration calls lock poisoned")
+                    .push(ProviderMcpMigrationCall {
+                        method: method.clone(),
+                        api_key: api_key.clone(),
+                        session_header,
+                    });
+                let response_id = parsed
+                    .get("id")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!(1));
+
+                match method.as_str() {
+                    "initialize" => {
+                        let mut pinned_state =
+                            pinned_key.lock().expect("provider mcp pinned key lock poisoned");
+                        if pinned_state.is_none() {
+                            *pinned_state = Some(api_key.clone());
+                        }
+                        let is_rebind = pinned_state.as_deref() != Some(api_key.as_str());
+                        drop(pinned_state);
+                        let session = if is_rebind {
+                            PROVIDER_MCP_MIGRATED_SESSION
+                        } else {
+                            PROVIDER_MCP_PINNED_SESSION
+                        };
+                        provider_mcp_migration_response(
+                            StatusCode::OK,
+                            Some(session),
+                            Some(serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": response_id,
+                                "result": {
+                                    "protocolVersion": "2025-03-26",
+                                    "serverInfo": {
+                                        "name": "mock-serpapi-mcp",
+                                        "version": "1.0.0"
+                                    },
+                                    "capabilities": {}
+                                }
+                            })),
+                        )
+                    }
+                    "notifications/initialized" => {
+                        provider_mcp_migration_response(StatusCode::ACCEPTED, None, None)
+                    }
+                    _ => {
+                        let on_pinned_key = pinned_key
+                            .lock()
+                            .expect("provider mcp pinned key lock poisoned")
+                            .as_deref()
+                            == Some(api_key.as_str());
+                        if on_pinned_key {
+                            return provider_mcp_migration_response(
+                                StatusCode::UNAUTHORIZED,
+                                None,
+                                Some(serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": response_id,
+                                    "error": { "code": 401, "message": PROVIDER_MCP_AUTH_FAIL_BODY }
+                                })),
+                            );
+                        }
+                        provider_mcp_migration_response(
+                            StatusCode::OK,
+                            None,
+                            Some(serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": response_id,
+                                "result": {
+                                    "tools": [
+                                        { "name": "search", "description": "mock tool" }
+                                    ]
+                                }
+                            })),
+                        )
+                    }
+                }
+            }
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        (addr, calls)
+    }
+
+    struct ProviderMcpMigrationHarness {
+        addr: SocketAddr,
+        calls: Arc<Mutex<Vec<ProviderMcpMigrationCall>>>,
+        token: String,
+        db_str: String,
+        db_path: PathBuf,
+    }
+
+    impl Drop for ProviderMcpMigrationHarness {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.db_path);
+        }
+    }
+
+    /// Two-key serpapi pool in front of the migration mock, mounted on the real
+    /// provider facade routes. The second key is what makes a migration possible
+    /// at all, so a single-attempt outcome is always a policy verdict.
+    async fn spawn_provider_mcp_migration_harness(prefix: &str) -> ProviderMcpMigrationHarness {
+        let db_path = temp_db_path(prefix);
+        let db_str = db_path.to_string_lossy().to_string();
+        let pool_keys = vec![
+            "mock-serpapi-mcp-a".to_string(),
+            "mock-serpapi-mcp-b".to_string(),
+        ];
+        let (mcp_addr, calls) = spawn_provider_mcp_migration_upstream(pool_keys.clone()).await;
+        let (rest_addr, _rest_captures) = spawn_capturing_mock_upstream().await;
+        let providers = tavily_hikari::ProviderBootstrap {
+            serpapi_upstream: format!("http://{rest_addr}"),
+            // Path-prefixed MCP upstream (amendment M1), as in the routing and
+            // retry harnesses.
+            serpapi_mcp_upstream: format!("http://{mcp_addr}/gw/mcp"),
+            exa_upstream: format!("http://{rest_addr}"),
+            brave_upstream: format!("http://{rest_addr}"),
+            serpapi_keys: pool_keys,
+            exa_keys: vec!["mock-exa-key".to_string()],
+            brave_keys: vec!["mock-brave-key".to_string()],
+        };
+        let proxy = TavilyProxy::with_providers_in_ha_mode(
+            vec!["tvly-provider-mcp-migration-key".to_string()],
+            &format!("http://{rest_addr}/mcp"),
+            &db_str,
+            tavily_hikari::TavilyProxyOptions::from_database_path(&db_str),
+            providers,
+            tavily_hikari::HaMode::Single,
+        )
+        .await
+        .expect("proxy created");
+        let access_token = proxy
+            .create_access_token(Some(prefix))
+            .await
+            .expect("create access token");
+        let state = Arc::new(AppState {
+            proxy,
+            static_dir: None,
+            forward_auth: ForwardAuthConfig::new(None, None, None, None),
+            forward_auth_enabled: true,
+            builtin_admin: BuiltinAdminAuth::new(false, None, None),
+            admin_passkey: AdminPasskeyOptions::disabled(),
+            linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+            linuxdo_credit: LinuxDoCreditOptions::disabled(),
+            ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+            dev_open_admin: false,
+            usage_base: format!("http://{rest_addr}"),
+            api_key_ip_geo_origin: "https://api.country.is".to_string(),
+            dashboard_overview_cache: new_dashboard_overview_cache(),
+            remote_attempt_admission: new_remote_attempt_admission(),
+        });
+        let app = Router::new()
+            .merge(provider_facade::provider_facade_routes())
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        ProviderMcpMigrationHarness {
+            addr,
+            calls,
+            token: access_token.token,
+            db_str,
+            db_path,
+        }
+    }
+
+    #[tokio::test]
+    async fn serpapi_mcp_follow_up_migrates_pinned_session_off_auth_failed_key() {
+        let harness = spawn_provider_mcp_migration_harness("provider-mcp-key-migration").await;
+        let client = Client::new();
+        let url = format!("http://{}/serpapi/mcp", harness.addr);
+
+        let initialize = client
+            .post(&url)
+            .header("authorization", format!("Bearer {}", harness.token))
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .header("mcp-protocol-version", "2025-03-26")
+            .body(
+                r#"{"jsonrpc":"2.0","id":"init-migration","method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"probe","version":"0.1.0"}}}"#,
+            )
+            .send()
+            .await
+            .expect("serpapi mcp initialize");
+        assert_eq!(initialize.status(), StatusCode::OK);
+        let proxy_session_id = initialize
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok())
+            .expect("initialize response should expose the proxy session id")
+            .to_string();
+
+        // The follow-up rides the pinned key, which the mock answers with a bare
+        // 401: the ladder must migrate it and serve the replay's success.
+        let follow_up = client
+            .post(&url)
+            .header("authorization", format!("Bearer {}", harness.token))
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .header("mcp-protocol-version", "2025-03-26")
+            .header("mcp-session-id", proxy_session_id.as_str())
+            .body(r#"{"jsonrpc":"2.0","id":"tools-migration","method":"tools/list"}"#)
+            .send()
+            .await
+            .expect("serpapi mcp follow-up");
+        assert_eq!(
+            follow_up.status(),
+            StatusCode::OK,
+            "the client only ever sees the migrated success"
+        );
+        assert_eq!(
+            follow_up
+                .headers()
+                .get("mcp-session-id")
+                .and_then(|value| value.to_str().ok()),
+            Some(proxy_session_id.as_str()),
+            "the migration never changes the client-visible proxy session id"
+        );
+        let body: Value = follow_up.json().await.expect("json body");
+        assert_eq!(body["result"]["tools"].as_array().map(Vec::len), Some(1));
+
+        // Upstream chain: pin, reject, re-initialize on the new key, replay.
+        // Exactly ONE replay, so no loop.
+        let calls = harness
+            .calls
+            .lock()
+            .expect("provider mcp migration calls lock poisoned")
+            .clone();
+        assert_eq!(calls.len(), 4, "unexpected upstream call chain: {calls:?}");
+        assert_eq!(calls[0].method, "initialize");
+        let pinned_key = calls[0].api_key.clone();
+        assert_eq!(calls[1].method, "tools/list");
+        assert_eq!(calls[1].api_key, pinned_key);
+        assert_eq!(
+            calls[1].session_header.as_deref(),
+            Some(PROVIDER_MCP_PINNED_SESSION),
+            "the rejected follow-up still rode the original upstream session"
+        );
+        assert_eq!(calls[2].method, "initialize");
+        assert_ne!(
+            calls[2].api_key, pinned_key,
+            "the re-initialize runs on the newly acquired key"
+        );
+        assert_eq!(
+            calls[2].session_header, None,
+            "the re-initialize must open a NEW upstream session"
+        );
+        assert_eq!(calls[3].method, "tools/list");
+        assert_eq!(calls[3].api_key, calls[2].api_key);
+        assert_eq!(
+            calls[3].session_header.as_deref(),
+            Some(PROVIDER_MCP_MIGRATED_SESSION),
+            "the replay presents the migrated upstream session id"
+        );
+        let migrated_key = calls[2].api_key.clone();
+
+        // The session row moved to the new key AND the new upstream session id,
+        // and stayed live.
+        let pool = connect_sqlite_test_pool(&harness.db_str).await;
+        let pinned_key_id: String =
+            sqlx::query_scalar("SELECT id FROM api_keys WHERE api_key = ?")
+                .bind(pinned_key)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch pinned api key id");
+        let migrated_key_id: String =
+            sqlx::query_scalar("SELECT id FROM api_keys WHERE api_key = ?")
+                .bind(migrated_key)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch migrated api key id");
+        assert_ne!(pinned_key_id, migrated_key_id);
+        let (upstream_key_id, upstream_session_id, provider, revoked_at): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+        ) = sqlx::query_as(
+            r#"
+            SELECT upstream_key_id, upstream_session_id, provider, revoked_at
+            FROM mcp_sessions
+            WHERE proxy_session_id = ?
+            LIMIT 1
+            "#,
+        )
+        .bind(&proxy_session_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch migrated serpapi mcp session");
+        assert_eq!(upstream_key_id.as_deref(), Some(migrated_key_id.as_str()));
+        assert_eq!(
+            upstream_session_id.as_deref(),
+            Some(PROVIDER_MCP_MIGRATED_SESSION)
+        );
+        assert_eq!(provider.as_deref(), Some("serpapi"));
+        assert_eq!(revoked_at, None, "a migrated session is never revoked");
+        pool.close().await;
+    }

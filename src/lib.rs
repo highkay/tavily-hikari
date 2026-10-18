@@ -21,12 +21,13 @@ pub mod web_assets;
 pub use admin_mcp_session_bindings::*;
 pub use admin_token_filters::*;
 pub use analysis::{
-    analyze_http_attempt, analyze_mcp_attempt, canonical_request_kind_key_for_filter,
-    canonicalize_request_log_request_kind, classify_token_request_kind,
-    display_result_status_for_request_kind, extract_mcp_has_error_by_id_from_bytes,
-    extract_mcp_usage_credits_by_id_from_bytes, extract_research_request_id,
-    extract_usage_credits_from_json_bytes, extract_usage_credits_total_from_json_bytes,
-    failure_kind_solution_guidance, finalize_token_request_kind, is_canonical_request_kind_key,
+    McpKeyMigrationSignal, analyze_http_attempt, analyze_mcp_attempt,
+    canonical_request_kind_key_for_filter, canonicalize_request_log_request_kind,
+    classify_token_request_kind, display_result_status_for_request_kind,
+    extract_mcp_has_error_by_id_from_bytes, extract_mcp_usage_credits_by_id_from_bytes,
+    extract_research_request_id, extract_usage_credits_from_json_bytes,
+    extract_usage_credits_total_from_json_bytes, failure_kind_solution_guidance,
+    finalize_token_request_kind, is_canonical_request_kind_key, mcp_key_migration_signal,
     mcp_response_has_any_error, mcp_response_has_any_success, normalize_operational_class_filter,
     operational_class_for_request_kind, operational_class_for_request_log,
     operational_class_for_request_path, operational_class_for_token_log,
