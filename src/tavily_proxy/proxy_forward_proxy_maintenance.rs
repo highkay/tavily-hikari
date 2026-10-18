@@ -1738,6 +1738,16 @@ impl TavilyProxy {
     {
         let result = async {
             let mut last_error: Option<ProxyError> = None;
+            // The synthetic `__direct__` candidate and the post-loop direct
+            // fallback send through the SAME direct client, so running both
+            // replays one logical upstream attempt twice BELOW the caller's
+            // retry seam: the dead first send stays invisible (no
+            // `request_logs` row, no `fallback_reason` marker) while the seam
+            // books the replay's response as its one and only attempt. Plan
+            // provider-key-429-retry IS-3 requires one visible row per upstream
+            // attempt, so once the plan's own direct candidate has been sent,
+            // its outcome is the attempt's outcome and is returned unchanged.
+            let mut direct_candidate_sent = false;
             for candidate in plan {
                 let mut candidate = candidate;
                 let mut attempted_recovery = false;
@@ -1806,6 +1816,9 @@ impl TavilyProxy {
                     }
                 };
                 let started = Instant::now();
+                if candidate.key == forward_proxy::FORWARD_PROXY_DIRECT_KEY {
+                    direct_candidate_sent = true;
+                }
                 match build(client).send().await {
                     Ok(response) => {
                         let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -1844,6 +1857,11 @@ impl TavilyProxy {
                 }
             }
 
+            if direct_candidate_sent {
+                return Err(last_error.unwrap_or_else(|| {
+                    ProxyError::Other("direct forward-proxy attempt failed".to_string())
+                }));
+            }
             let direct = {
             let manager = self.forward_proxy.lock().await;
             manager

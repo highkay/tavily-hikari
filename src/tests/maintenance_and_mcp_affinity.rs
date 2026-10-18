@@ -1528,10 +1528,18 @@ async fn unknown_403_temporarily_cools_key_without_quarantine_and_success_clears
         Some(hotter_key_id.as_str()),
         "the retry must serve from a key other than the blocked one"
     );
+    // Observe the chain through a DEDICATED pool. Both attempt rows are
+    // committed before `proxy_http_json_endpoint` returns, but a connection
+    // reused from the writer's own pool can still hold an open WAL read
+    // snapshot and keep serving the state from before the winning attempt
+    // landed - observed under CI-grade contention as `left: 1` while a fresh
+    // connection already saw both rows. Every other retry-chain battery in
+    // this repo observes through `connect_sqlite_test_pool` for this reason.
+    let observe = super::support::connect_sqlite_test_pool(&db_str).await;
     let first_chain: Vec<(Option<i64>, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT status_code, api_key_id, fallback_reason FROM observability.request_logs ORDER BY id ASC",
     )
-    .fetch_all(&proxy.key_store.pool)
+    .fetch_all(&observe)
     .await
     .expect("load first request attempt rows");
     assert_eq!(first_chain.len(), 2, "one visible row per upstream attempt");
@@ -1551,7 +1559,7 @@ async fn unknown_403_temporarily_cools_key_without_quarantine_and_success_clears
         "SELECT COUNT(*) FROM api_key_quarantines WHERE key_id = ? AND cleared_at IS NULL",
     )
     .bind(&hotter_key_id)
-    .fetch_one(&proxy.key_store.pool)
+    .fetch_one(&observe)
     .await
     .expect("count quarantine rows");
     assert_eq!(quarantine_count, 0);
@@ -1594,7 +1602,7 @@ async fn unknown_403_temporarily_cools_key_without_quarantine_and_success_clears
     )
     .bind(&hotter_key_id)
     .bind(MAINTENANCE_OP_AUTO_CLEAR_TRANSIENT_BACKOFF)
-    .fetch_one(&proxy.key_store.pool)
+    .fetch_one(&observe)
     .await
     .expect("count maintenance records");
     assert_eq!(maintenance_count, 1);
@@ -1624,7 +1632,7 @@ async fn unknown_403_temporarily_cools_key_without_quarantine_and_success_clears
     let second_chain: Vec<(Option<i64>, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT status_code, api_key_id, fallback_reason FROM observability.request_logs ORDER BY id DESC LIMIT 2",
     )
-    .fetch_all(&proxy.key_store.pool)
+    .fetch_all(&observe)
     .await
     .expect("load second request attempt rows");
     assert_eq!(
@@ -1707,11 +1715,12 @@ async fn unknown_403_temporarily_cools_key_without_quarantine_and_success_clears
     )
     .bind(&hotter_key_id)
     .bind(API_REBALANCE_HTTP_BACKOFF_SCOPE)
-    .fetch_one(&proxy.key_store.pool)
+    .fetch_one(&observe)
     .await
     .expect("load retained reason");
     assert_eq!(retained_reason, FAILURE_KIND_UPSTREAM_RATE_LIMITED_429);
 
+    observe.close().await;
     let _ = std::fs::remove_file(db_path);
 }
 
@@ -1841,10 +1850,16 @@ async fn unknown_403_api_rebalance_cools_key_and_next_request_avoids_it() {
         "the retry must skip the cooled and the already-cooling key"
     );
     assert_eq!(first_analysis.failure_kind.as_deref(), None);
+    // Observe the chain through a DEDICATED pool: both attempt rows are
+    // committed before `proxy_http_json_endpoint` returns, but a connection
+    // reused from the writer's own pool can still hold an open WAL read
+    // snapshot and keep serving the pre-retry state (reproduced under
+    // CI-grade contention as `left: 1` with both rows committed).
+    let observe = super::support::connect_sqlite_test_pool(&db_str).await;
     let first_chain: Vec<(Option<i64>, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT status_code, api_key_id, fallback_reason FROM observability.request_logs ORDER BY id ASC",
     )
-    .fetch_all(&proxy.key_store.pool)
+    .fetch_all(&observe)
     .await
     .expect("load first request attempt rows");
     assert_eq!(first_chain.len(), 2, "one visible row per upstream attempt");
@@ -1931,6 +1946,7 @@ async fn unknown_403_api_rebalance_cools_key_and_next_request_avoids_it() {
         Some(healthy_key_id.as_str())
     );
 
+    observe.close().await;
     let _ = std::fs::remove_file(db_path);
 }
 
