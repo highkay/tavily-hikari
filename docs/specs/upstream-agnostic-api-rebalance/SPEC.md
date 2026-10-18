@@ -86,6 +86,47 @@
   - `POST /api/tavily/research` 成功后，必须把返回的 `request_id` 绑定到实际创建 request 的 `key_id`。
   - `GET /api/tavily/research/:request_id` 不参与 rollout gating，不重新全池选路，只使用创建时记录的 key。
 
+### MCP pinned 会话 key 迁移（Session key migration）
+
+> 本节为 additive 修订（plan provider-key-429-retry）：描述已落地并经测试钉住的
+> pinned 会话迁移语义。上文既有条款（含 429 等待语义与 selector 不做同请求自动
+> retry）不变。
+
+适用范围：`upstream_mcp` 模式的 pinned follow-up 会话，即 Tavily `/mcp` 与
+SerpApi hosted MCP 直通。`rebalance_http` 会话、Exa/Brave 本地 MCP 路径不适用
+本节（v1 保持单尝试）。
+
+- 触发条件：一次 pinned follow-up 的上游响应被分类为 `AuthFailed`（如裸
+  401/403 auth-block 家族）或 `Exhausted`（如 Tavily 432、SerpApi run-out 429）时，
+  该拒绝判定的是 KEY 而不是会话本身，代理必须尝试把会话迁移到另一把 key。
+  判定使用分析得出的 effective status（HTTP 200 包体内 envelope 形态的 432 同样
+  计入）。`RateLimited`（429，含 SerpApi hourly 429）不触发迁移，保持既有
+  「等待 Retry-After 后同 key 重试一次」语义不变。
+- 迁移链（有界，不循环）：至多一次严格取 key（被拒 key 在排除集内，绝不回退到
+  被拒 key；无其它可证明可用的 key 则不迁移）、至多一次代理代发的
+  re-`initialize`（在新 key 上开启全新上游会话，沿用客户端协商的 protocol
+  version）、至多一次原子重绑、至多一次对原始调用的重放。
+- 客户端不可见：代理会话 id（`mcp-session-id`）在迁移前后保持稳定；客户端只会
+  看到重放的结果；迁移永不撤销会话行。
+- 撤销跟随当前 key：重绑后，按 key 的会话撤销过滤（token 维度与 user 维度）不再
+  命中旧 key，改为命中新 key。
+- 失败回落：任一环节失败（无合格 key、re-`initialize` 被拒、重绑失败、重放传输
+  错误）时，必须把首次拒绝按字节原样返回给客户端（状态与正文），会话行保持旧
+  绑定且仍然存活；re-`initialize` 被拒后不再重放原始调用；该失败请求的上游调用
+  次数封顶为 2 次。
+- 重绑写路径：单条原子 UPDATE 同时写 `upstream_session_id` 与 `upstream_key_id`
+  （不出现两列撕裂的中间态），且不改动其它列：不刷新 `expires_at`（租期延续仍
+  由 touch 路径负责），不触碰配额、上限、限流列；已撤销或未知的 proxy session
+  id 是无副作用的 no-op。
+- 上限语义（salvage）：重绑不检查 per-subject 会话数上限。该计数按
+  `upstream_key_id` 分组，被迁移的会话只是从死亡 key 的计数移动到新 key 的余量
+  中，等价于拯救该 subject 已持有的会话，而不是新增。
+- 并发：整条迁移链在 per-session 请求锁内执行，re-`initialize` 与重绑之间不会被
+  同一会话的并发 follow-up 插入。
+- 标记与计费：迁移链内不做任何 key 标记（死亡 key 的标记由首击既有的
+  reconcile/arm 路径完成）；计费由 handler 对梯子最终返回的响应一次性结算，
+  迁移不重入计费缝。
+
 ### Edge cases / errors
 
 - 所有候选都在 cooldown 时，仍选择排序后“最不差”的可用 key，而不是直接失败。
