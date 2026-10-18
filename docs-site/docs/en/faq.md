@@ -102,7 +102,10 @@ of retrying harder.
 Exa bills from prepaid credits, so `402` with one of the budget tags (`NO_MORE_CREDITS`,
 `API_KEY_BUDGET_EXCEEDED`, `TEAM_BUDGET_EXCEEDED`) means the key or the team budget is out. Hikari
 marks the key `exhausted` until the next successful call or a manual restore; other `402` tags and
-`403` pass through without penalizing the key.
+`403` pass through without penalizing the key. On the REST read endpoints, a key-scoped `402` is
+absorbed inside Hikari by retrying the request once on another eligible pooled key, so a healthy pool
+hides it from clients; `TEAM_BUDGET_EXCEEDED` and Exa `429` are never retried, because another key
+cannot lift a team-level limit.
 
 Exa exposes no live remaining-balance API, so Hikari cannot sync a balance: admin `sync-usage`
 returns a typed `409 unsupported`, and quota is tracked by local counting. Plan for one more

@@ -127,6 +127,43 @@ HA business fence、每小时任意请求限频、reserved-credit 预检查、bi
 `businessCalls1h` reservation。被拒绝时返回既有 `429 quota_exhausted` 形状并写入 token 日志，
 不会命中上游。业务成功后才按 §4 的 credit 表 settle（共享同一钱包，无按商分账）。
 
+### 3.4 池内换 key 重试与标记（cross-key retry）
+
+读端点遇到的键级失败优先在池内消化，客户端无感：
+
+- 适用面：Tavily HTTP 读端点与三家 provider REST 读端点（§4）。MCP 表面不进入该契约：
+  pinned 会话按会话迁移语义处理，Exa/Brave 本地 MCP 保持单次尝试。
+- 触发集：键级明确拒绝（429 限速、432 配额耗尽、402 键级耗尽、401/403 auth-block
+  家族）与键级瞬时异常（上游 5xx、超时、传输发送错误）。判定使用分析得出的
+  effective status：HTTP 200 包体内 envelope 形态的 `status:432` 同样计入耗尽；
+  归一化信号优先于数字状态码（Brave 以 422 报 `SUBSCRIPTION_TOKEN_INVALID` 时按
+  auth-block 家族处理）。
+- 预算：同一逻辑请求至多 2 次上游尝试（即至多一次换 key），总死线 5 秒，零睡眠；
+  Retry-After 超过 2 秒的拒绝不重试（限速臂与瞬时臂同受此门约束），原样返回。预算可用环境变量调整
+  （`KEY_RETRY_MAX_ATTEMPTS` 等，默认值与边界见
+  [`upstream-agnostic-api-rebalance/SPEC.md`](specs/upstream-agnostic-api-rebalance/SPEC.md)
+  的「跨 key 重试契约」节）。
+- 永不轮换：请求自身错误的 4xx（400/404/406/422 等，不换 key 也不标记
+  key）、`/research`（POST 提交与 GET 轮询）与 `/crawl`（任务不可重放）、
+  Exa 429 与 Exa 团队级 402（`TEAM_BUDGET_EXCEEDED`，团队限额换 key 无法解除）；
+  Exa 402 仅当 body tag 明确为键级（`NO_MORE_CREDITS` / `API_KEY_BUDGET_EXCEEDED`）
+  时才换 key，无 tag 证据时同样保守不轮换。SerpApi「run out of searches」429 属耗尽
+  语义，不在 veto 之列，可换 key。
+- 池内无合格 key 时：客户端收到上游首击拒绝的逐字节原样响应（状态码、
+  Retry-After 头、正文），不会改写成 502。
+- 可观测与计费：每次上游尝试各留一条可见 request_logs 行；重试链以 `fallback_reason`
+  标记（`upstream_key_retry:attempted|succeeded|rejected|skipped_no_eligible_key`），
+  单尝试结果不成链、不写标记；计费仍只按最终响应结算一次。
+
+被拒 key 的标记语义：
+
+| 失败             | 标记                                            | 之后的可选性             |
+| ---------------- | ----------------------------------------------- | ------------------------ |
+| 429 限速         | 短时 transient cooldown                         | 窗口过后即可再次被选中   |
+| 432 配额耗尽     | 月度 exhausted                                  | 续费窗口或手动恢复后复活 |
+| 带关键词 401/403 | quarantine 隔离                                 | 需人工处理               |
+| 裸 401/403       | auth-block 长冷却（无提示 120 秒，上限 900 秒） | 冷却结束后回到池内       |
+
 ---
 
 ## 4. 每商详细设计

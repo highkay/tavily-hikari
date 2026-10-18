@@ -328,6 +328,12 @@ _Avoid_: worker is running, last slice was verified
 - `provider-scoped key pool`: key acquire, affinity, transient backoff, quarantine, and health
   transitions that never lease a key across providers. A request only ever uses a key belonging to
   the provider it addresses.
+- `cross-key retry`: one bounded, hidden replay of a read-endpoint request on a different eligible key
+  of the same provider after a key-scoped failure (429/432, key-scoped 402, 401-403 auth-block, upstream
+  5xx, timeout, or a transport send error). It never replays `/research` or `/crawl`, never rotates a
+  request-shaped 4xx, vetoes the Exa 429 and team-scoped 402 cases, and writes one visible
+  `request_logs` row per attempt with an `upstream_key_retry:*` marker; with no eligible key left it
+  serves the buffered first upstream rejection byte-for-byte.
 - `exhaustion signal`: a provider classifier's confirmation that an upstream response means the
   addressed key has no usable quota (Tavily `432`; SerpApi `429` `"run out of searches"`; Exa `402`
   `NO_MORE_CREDITS`, `API_KEY_BUDGET_EXCEEDED`, or `TEAM_BUDGET_EXCEEDED`; Brave `402`

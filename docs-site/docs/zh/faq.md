@@ -94,7 +94,9 @@ SerpApi 用同一个状态码表达两种不同情况，Hikari 会把它们分�
 
 Exa 按预付 credit 计费，因此带预算标签的 `402`（`NO_MORE_CREDITS`、`API_KEY_BUDGET_EXCEEDED`、
 `TEAM_BUDGET_EXCEEDED`）意味着该 key 或团队预算已耗尽。Hikari 会把 key 标记为 `exhausted`，直到
-下一次成功调用或管理员手动恢复；其他 `402` 标签与 `403` 会原样透传，不惩罚 key。
+下一次成功调用或管理员手动恢复；其他 `402` 标签与 `403` 会原样透传，不惩罚 key。在 REST 读端点上，
+键级 `402` 会被池内吸收：Hikari 换用另一把合格 key 重试一次，池健康时客户端不会看到它；
+`TEAM_BUDGET_EXCEEDED` 与 Exa `429` 从不重试，因为另一把 key 无法解除团队级限额。
 
 Exa 没有实时余额 API，Hikari 无法同步余额：管理端 `sync-usage` 会返回 typed `409 unsupported`，
 额度按本地计数管理。另有一个上限需要提前规划：Exa 团队级 QPS 上限（search/answer 约 10 QPS）
