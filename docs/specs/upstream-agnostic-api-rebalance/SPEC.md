@@ -22,7 +22,7 @@
 
 ### Non-goals
 
-- 不增加跨 key 自动重试；上游不可知模式不能假设请求幂等。
+- 不对不可重放表面做跨 key 自动重试；上游不可知模式不能假设请求幂等，可重试表面与触发白名单见「跨 key 重试契约」。
 - 不移除 `/api/tavily/*` façade、Tavily 请求体兼容或现有 token 配额/计费模型。
 - 不触达生产 Tavily endpoint；验证限定本地或 mock upstream。
 - 不改 MCP Rebalance 的既有实现。
