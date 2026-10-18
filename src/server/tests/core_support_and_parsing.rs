@@ -1216,9 +1216,11 @@
     }
 
     /// How the migration mock rejects a follow-up that arrives on the key the
-    /// session is pinned to. Both shapes are KEY-scoped rejections, which is
-    /// what makes them migration-eligible; neither is a 429, so the existing
-    /// wait + same-key retry never fires.
+    /// session is pinned to. The first two shapes are KEY-scoped rejections,
+    /// which is what makes them migration-eligible. `RateLimited429` is the
+    /// counter-example the todo-14 battery pins: a 429 is NOT key-scoped, so the
+    /// ladder keeps its wait + one same-key retry and must never migrate, even
+    /// with a spare key sitting in the pool.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) enum McpKeyMigrationRejection {
         /// Bare 403 with no quarantine keyword: the todo-1 auth-block family.
@@ -1226,6 +1228,8 @@
         /// HTTP 200 whose JSON-RPC envelope carries `status: 432` - Tavily's
         /// quota-exhausted shape, which never travels as an HTTP 432.
         QuotaExhausted432,
+        /// HTTP 429 with `retry-after: 0`, so the wait costs no wall clock.
+        RateLimited429,
     }
 
     /// Upstream session id the migrated key's re-`initialize` hands out.
@@ -1236,6 +1240,9 @@
     /// success bodies so the client-visible bytes prove WHICH attempt was
     /// served.
     pub(super) const MCP_KEY_MIGRATION_REJECTION_BODY: &str = r#"{"error":"Forbidden"}"#;
+    /// Body of the 429 a `RateLimited429` case is served, distinct from both the
+    /// key-scoped rejections and the success bodies.
+    pub(super) const MCP_KEY_MIGRATION_RATE_LIMIT_BODY: &str = r#"{"error":"Too Many Requests"}"#;
 
     /// Mock upstream for the todo-13 pinned-session key migration (plan
     /// provider-key-429-retry). The FIRST `initialize` pins the session to
@@ -1245,14 +1252,19 @@
     /// [`MCP_KEY_MIGRATION_UPSTREAM_SESSION`] and follow-ups on it succeed. With
     /// `reject_reinitialize` the second `initialize` is refused with a bare 403
     /// instead - the shape that must end in the original rejection, with no
-    /// replay and no loop.
+    /// replay and no loop. A `tools/call` follow-up on a live key answers the
+    /// charging search shape (`structuredContent.status` 200 + `usage.credits`),
+    /// so a case can count settlements. `pre_pinned_key` seeds the dead key for a
+    /// session that arrives already bound - an HA peer import, which never sends
+    /// an `initialize` of its own.
     pub(super) async fn spawn_mock_mcp_upstream_for_session_key_migration(
         pool_keys: Vec<String>,
         rejection: McpKeyMigrationRejection,
         reject_reinitialize: bool,
+        pre_pinned_key: Option<String>,
     ) -> (SocketAddr, Arc<Mutex<Vec<KeyMigrationSessionCall>>>) {
         let calls: Arc<Mutex<Vec<KeyMigrationSessionCall>>> = Arc::new(Mutex::new(Vec::new()));
-        let pinned_key: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let pinned_key: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(pre_pinned_key));
         let app = Router::new().route(
             "/mcp",
             any({
@@ -1364,7 +1376,32 @@
                                                 ))
                                                 .expect("build quota-exhausted rejection")
                                         }
+                                        McpKeyMigrationRejection::RateLimited429 => Response::builder()
+                                            .status(StatusCode::TOO_MANY_REQUESTS)
+                                            .header(CONTENT_TYPE, "application/json")
+                                            .header("retry-after", "0")
+                                            .body(Body::from(MCP_KEY_MIGRATION_RATE_LIMIT_BODY))
+                                            .expect("build rate-limit rejection"),
                                     };
+                                }
+                                if method == "tools/call" {
+                                    return Response::builder()
+                                        .status(StatusCode::OK)
+                                        .header(CONTENT_TYPE, "application/json")
+                                        .body(Body::from(
+                                            serde_json::json!({
+                                                "jsonrpc": "2.0",
+                                                "id": response_id,
+                                                "result": {
+                                                    "structuredContent": {
+                                                        "status": 200,
+                                                        "usage": { "credits": 1 }
+                                                    }
+                                                }
+                                            })
+                                            .to_string(),
+                                        ))
+                                        .expect("build tools/call success response");
                                 }
                                 Response::builder()
                                     .status(StatusCode::OK)
@@ -1397,6 +1434,50 @@
                 .unwrap();
         });
         (addr, calls)
+    }
+
+    /// Mock HA peer admin node for the todo-14 peer-imported session pin: it
+    /// answers the internal lookup `lookup_active_mcp_session_local_or_peer`
+    /// performs when the LOCAL store has no row for a proxy session id, and it
+    /// counts every lookup so a case can prove a migrated session stops asking
+    /// the peer. A wrong internal token or an unknown session id is a 404, which
+    /// is what the production lookup treats as "this peer does not have it".
+    pub(super) async fn spawn_mock_ha_peer_mcp_session_server(
+        binding: tavily_hikari::McpSessionBinding,
+        internal_token: String,
+    ) -> (SocketAddr, Arc<AtomicUsize>) {
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/api/internal/ha/mcp-sessions/:proxy_session_id",
+            any({
+                let lookups = lookups.clone();
+                move |headers: HeaderMap, path: axum::extract::Path<String>| {
+                    let binding = binding.clone();
+                    let internal_token = internal_token.clone();
+                    let lookups = lookups.clone();
+                    async move {
+                        lookups.fetch_add(1, Ordering::SeqCst);
+                        let presented = headers
+                            .get("x-ha-internal-token")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default();
+                        if presented != internal_token || path.0 != binding.proxy_session_id {
+                            return (StatusCode::NOT_FOUND, Json(Value::Null)).into_response();
+                        }
+                        (StatusCode::OK, Json(binding)).into_response()
+                    }
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        (addr, lookups)
     }
 
     pub(super) async fn spawn_mock_mcp_upstream_for_serialized_session_requests(
