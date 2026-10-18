@@ -131,6 +131,65 @@ SerpApi hosted MCP 直通。`rebalance_http` 会话、Exa/Brave 本地 MCP 路�
   reconcile/arm 路径完成）；计费由 handler 对梯子最终返回的响应一次性结算，
   迁移不重入计费缝。
 
+### 跨 key 重试契约（Cross-key retry contract）
+
+> 本节为 additive 修订（plan provider-key-429-retry）：把本文档早期「普通
+> POST/JSON 请求不做自动重试」的一揽子非幂等假设收窄为下述白名单契约。初版
+> 冻结契约为「仅明确拒绝」白名单；2026-10-16 用户批准的修订案把键级瞬时异常
+> 扩入允许集，并明确请求形态 4xx 的排除。Edge cases「selector 不做同请求自动
+> retry」字面不变——selector 仍单发，同请求重试发生在 executor 层；Non-goals
+> 「不增加跨 key 自动重试」按本节收窄：不可重放表面（/research、/crawl 与 MCP
+> 表面）仍然永不重试。MCP 429 等待语义不变。
+
+适用范围：Tavily HTTP 读端点（`/search`、`/extract`、`/map`）与 provider REST
+facade 读端点（SerpApi/Exa/Brave）。MCP 表面不进入本契约：Tavily `/mcp` 与
+SerpApi hosted pinned 会话走上一节的迁移语义；Exa/Brave 本地 MCP 路径 v1 保持
+单尝试。
+
+- 允许集（只有键级失败才可换 key 重试）：
+  - 键级明确拒绝：429 限速、432 配额耗尽、401/403 auth-block 家族（含裸
+    401/403）、402 键级耗尽；
+  - 键级瞬时异常：上游 5xx、超时与传输发送错误（2026-10-16 修订案扩入——它们
+    不是请求造成的，换 key 做一次有界尝试优于把失败原样抛给客户端）。
+  - 判定使用分析得出的 effective status：HTTP 200 包体内 envelope 形态的
+    `status:432` 同样计入耗尽；归一化信号优先于数字状态码（Brave 以 422 报无效
+    订阅 token 时按 auth-block 家族处理）。
+- 硬排除（永不重放、永不轮换）：
+  - `/research`（POST 提交与 GET 结果轮询）与 `/crawl` 永不重放——重试安全性
+    来自请求表面排除，而非触发类别；research GET 不 fallback 的既有条款不变；
+  - 请求形态 4xx（400/404/406/422 等白名单未认领的 4xx）不换 key、不标记
+    key——请求自身有错，轮换对它无意义，只会白白烧掉池里的好 key；
+  - Exa 429 与 Exa 团队级 402（TEAM_BUDGET_EXCEEDED）一律 veto——团队级限额
+    换一把 key 无法解除；Exa 402 仅当 body tag 明确为键级（NO_MORE_CREDITS /
+    API_KEY_BUDGET_EXCEEDED）才可重试，无 tag 证据时保守 veto。团队级作用域
+    未经上游文档确认，保守为默认，边界与假设见「跨 key 重试边界」ADR
+    （docs/adr/，todo 17）；
+  - SerpApi「run out of searches」429 不在 veto 之列——它是耗尽语义，换 key
+    有效。
+- 预算与节流：同一逻辑请求至多 2 次上游尝试（即至多一次换 key 重试）、总死线
+  5 秒、零睡眠；`RateLimited` 仅当已 arm 的 Retry-After ≤ 2 秒才即时重试，信号
+  内解析值与 arm 值不一致时取较长者，超过门槛即原样返回；该门同样约束瞬时臂。
+- 预算可调（仅 env）：`KEY_RETRY_MAX_ATTEMPTS`（默认 2，只可降到 1 即关闭重试，
+  不可超过 2）、`KEY_RETRY_DEADLINE_SECS`（默认 5，0-60）、
+  `KEY_RETRY_RATE_LIMIT_FAST_PATH_SECS`（默认 2，0-60）；v1 刻意不经
+  SystemSettings 与管理端 UI。
+- 无合格 key（池空或严格取 key 落空）：把首击已缓冲的响应逐字节返回客户端
+  （状态码、Retry-After 头、正文），绝不改写成 502。
+- 取 key 原语：严格谓词——本次被拒 key 与本请求已判死的 key 全部进排除集，
+  冷却/隔离/耗尽 key 跳过，绝不回退到冷却 key；沿用既有候选层次与排序，并按
+  本次请求 arm 的同一 backoff scope 过滤。
+- 标记与计费不变量：每次上游尝试各产生一条可见 `request_logs` 行；重试链以
+  `fallback_reason` 标记——败者行 `upstream_key_retry:attempted`、终局成功
+  `upstream_key_retry:succeeded`、终局拒绝 `upstream_key_retry:rejected`、首击
+  即无合格 key `upstream_key_retry:skipped_no_eligible_key`；单尝试结果不成链，
+  不写标记。计费仍只按最终响应结算一次，计费路径零改动。
+- 与 effect code 的关系：本契约不新增任何 effect code——`key_effect_*`、
+  `binding_effect_*`、`selection_effect_*` 的允许值清单维持
+  docs/specs/log-effect-bucket-split/SPEC.md Effect taxonomy 的边界不变，重试链
+  标记全部落在该规格未触及的 `fallback_reason` 列上。
+- 与 MCP 迁移的关系：pinned 会话的 Auth/Exhausted 迁移语义见上一节，此处不
+  重复；MCP 429 的「等待 Retry-After 后同 key 重试一次」语义不变。
+
 ### Edge cases / errors
 
 - 所有候选都在 cooldown 时，仍选择排序后“最不差”的可用 key，而不是直接失败。
@@ -227,7 +286,7 @@ SerpApi hosted MCP 直通。`rebalance_http` 会话、Exa/Brave 本地 MCP 路�
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
 
 - 风险：开关启用后，新 API 请求会整体切到 API Rebalance；需要依赖系统状态页、影子对账对比与维护窗口控制发布风险。
-- 假设：普通 Tavily POST/JSON 请求不做自动重试，避免对非幂等上游操作产生副作用。
+- 假设：请求重放安全性不再由「一律不自动重试」保证，而是由「跨 key 重试契约」的表面排除清单保证——`/research`（POST 与 GET）与 `/crawl` 永不重放，可重试表面限定为读端点，避免对非幂等上游操作产生副作用。
 
 ## 参考（References）
 
