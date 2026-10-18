@@ -25,6 +25,12 @@
 //!   depletion window is honored, the token affinity candidate wins without
 //!   any rebind write, and the `None` outcome leaves every marking table and
 //!   the whole `api_keys` image byte-identical.
+//! - MCP session key rebind write path (plan provider-key-429-retry todo 12):
+//!   one atomic UPDATE moves both `upstream_session_id` and `upstream_key_id`
+//!   while every other column (lease, rate-limit state, gateway mode, token /
+//!   user ownership) stays byte-identical, the key-scoped revocation filters
+//!   stop matching the old key and start matching the new one, and revoked or
+//!   unknown proxy session ids are a no-op that inserts nothing.
 
 use super::*;
 
@@ -1202,4 +1208,445 @@ async fn cross_key_retry_prefers_token_affinity_candidate_without_rebinding() {
         assert_eq!(before_count, after_count, "{table} gained a row");
     }
     std::println!("[task-5][affinity] marking tables unchanged across the whole run: {after}");
+}
+
+/// Column-ordered image of one `mcp_sessions` row, so a before/after diff can
+/// name exactly the columns a write touched.
+const MCP_SESSION_IMAGE_COLUMNS: &[&str] = &[
+    "proxy_session_id",
+    "upstream_session_id",
+    "upstream_key_id",
+    "auth_token_id",
+    "user_id",
+    "protocol_version",
+    "last_event_id",
+    "gateway_mode",
+    "experiment_variant",
+    "provider",
+    "ab_bucket",
+    "routing_subject_hash",
+    "fallback_reason",
+    "rate_limited_until",
+    "last_rate_limited_at",
+    "last_rate_limit_reason",
+    "created_at",
+    "updated_at",
+    "expires_at",
+    "revoked_at",
+    "revoke_reason",
+];
+
+async fn mcp_session_row_image(
+    pool: &sqlx::SqlitePool,
+    proxy_session_id: &str,
+) -> Vec<(String, String)> {
+    let select = MCP_SESSION_IMAGE_COLUMNS
+        .iter()
+        .map(|column| format!("COALESCE(CAST({column} AS TEXT), '-')"))
+        .collect::<Vec<_>>()
+        .join(" || ';' || ");
+    let flat: String = sqlx::query_scalar(&format!(
+        "SELECT {select} FROM mcp_sessions WHERE proxy_session_id = ?"
+    ))
+    .bind(proxy_session_id)
+    .fetch_one(pool)
+    .await
+    .expect("mcp session row image");
+    MCP_SESSION_IMAGE_COLUMNS
+        .iter()
+        .map(|column| column.to_string())
+        .zip(flat.split(';').map(str::to_string))
+        .collect()
+}
+
+fn changed_mcp_session_columns(
+    before: &[(String, String)],
+    after: &[(String, String)],
+) -> Vec<String> {
+    before
+        .iter()
+        .zip(after.iter())
+        .filter(|(before, after)| before.1 != after.1)
+        .map(|(before, _)| before.0.clone())
+        .collect()
+}
+
+/// A pinned upstream-mode session bound to `upstream_key_id`, written through
+/// the production create path (no hand-rolled INSERT) so the rebind pins run
+/// against the row shape the server actually produces.
+async fn seed_pinned_mcp_session(
+    store: &KeyStore,
+    proxy_session_id: &str,
+    upstream_session_id: &str,
+    upstream_key_id: &str,
+    token_id: &str,
+    user_id: &str,
+    now: i64,
+) {
+    store
+        .create_or_replace_mcp_session(&McpSessionBinding {
+            proxy_session_id: proxy_session_id.to_string(),
+            upstream_session_id: Some(upstream_session_id.to_string()),
+            upstream_key_id: Some(upstream_key_id.to_string()),
+            auth_token_id: Some(token_id.to_string()),
+            user_id: Some(user_id.to_string()),
+            protocol_version: Some("2025-06-18".to_string()),
+            last_event_id: None,
+            gateway_mode: MCP_GATEWAY_MODE_UPSTREAM.to_string(),
+            experiment_variant: MCP_EXPERIMENT_VARIANT_CONTROL.to_string(),
+            ab_bucket: None,
+            routing_subject_hash: None,
+            fallback_reason: None,
+            rate_limited_until: None,
+            last_rate_limited_at: None,
+            last_rate_limit_reason: None,
+            created_at: now,
+            updated_at: now,
+            expires_at: now + 3600,
+            revoked_at: None,
+            revoke_reason: None,
+        })
+        .await
+        .expect("seed pinned mcp session");
+}
+
+async fn mcp_session_revocation(pool: &sqlx::SqlitePool, proxy_session_id: &str) -> (i64, String) {
+    let flat: String = sqlx::query_scalar(
+        "SELECT COALESCE(revoked_at, -1) || ';' || COALESCE(revoke_reason, '-') \
+         FROM mcp_sessions WHERE proxy_session_id = ?",
+    )
+    .bind(proxy_session_id)
+    .fetch_one(pool)
+    .await
+    .expect("mcp session revocation state");
+    let mut parts = flat.splitn(2, ';');
+    let revoked_at = parts
+        .next()
+        .expect("revoked_at part")
+        .parse::<i64>()
+        .expect("revoked_at parses");
+    (
+        revoked_at,
+        parts.next().expect("revoke_reason part").to_string(),
+    )
+}
+
+/// Acceptance (plan todo 12, happy QA "rebind -> read-back consistent"): ONE
+/// atomic UPDATE moves BOTH identity columns; the proxy session id stays
+/// stable, no second row appears, and every other column - lease, rate-limit
+/// state, gateway mode, token / user ownership - is byte-identical.
+#[tokio::test]
+async fn mcp_session_rebind_writes_both_upstream_identity_columns_in_one_update() {
+    let db_path = temp_db_path("mcp-session-rebind-identity");
+    let db_str = db_path.to_string_lossy().to_string();
+    let (backend_time, clock) = BackendTime::manual(utc_ts("2026-03-15T12:00:00Z"));
+    let store = KeyStore::new_with_time(&db_str, backend_time)
+        .await
+        .expect("store");
+
+    seed_provider_keys(
+        &store,
+        ProviderId::Tavily,
+        &["tvly-rebind-old".to_string(), "tvly-rebind-new".to_string()],
+    )
+    .await;
+    let old_key = key_id(&store.pool, "tvly-rebind-old").await;
+    let new_key = key_id(&store.pool, "tvly-rebind-new").await;
+
+    let now = clock.now_ts();
+    let proxy_session_id = "psess-rebind-identity";
+    seed_pinned_mcp_session(
+        &store,
+        proxy_session_id,
+        "up-sess-old",
+        &old_key,
+        "tok-rebind-identity",
+        "user-rebind-identity",
+        now,
+    )
+    .await;
+
+    let before = mcp_session_row_image(&store.pool, proxy_session_id).await;
+    let bound = store
+        .get_active_mcp_session(proxy_session_id, now)
+        .await
+        .expect("read session")
+        .expect("seeded session is active");
+    assert_eq!(bound.upstream_session_id.as_deref(), Some("up-sess-old"));
+    assert_eq!(bound.upstream_key_id.as_deref(), Some(old_key.as_str()));
+
+    clock.set_now_ts(now + 30);
+    store
+        .rebind_mcp_session_upstream_key(proxy_session_id, "up-sess-new", &new_key)
+        .await
+        .expect("rebind mcp session");
+
+    let rebound = store
+        .get_active_mcp_session(proxy_session_id, now + 30)
+        .await
+        .expect("read session")
+        .expect("a rebind keeps the session active");
+    assert_eq!(
+        rebound.upstream_session_id.as_deref(),
+        Some("up-sess-new"),
+        "upstream_session_id must move to the re-initialized upstream session"
+    );
+    assert_eq!(
+        rebound.upstream_key_id.as_deref(),
+        Some(new_key.as_str()),
+        "upstream_key_id must move to the new key"
+    );
+    assert_eq!(
+        rebound.proxy_session_id, proxy_session_id,
+        "the proxy session id is stable across the migration"
+    );
+    assert_eq!(rebound.revoked_at, None);
+
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mcp_sessions")
+        .fetch_one(&store.pool)
+        .await
+        .expect("count mcp sessions");
+    assert_eq!(rows, 1, "a rebind updates the row, it never inserts one");
+
+    let after = mcp_session_row_image(&store.pool, proxy_session_id).await;
+    let changed = changed_mcp_session_columns(&before, &after);
+    assert_eq!(
+        changed,
+        ["upstream_session_id", "upstream_key_id", "updated_at"],
+        "the single UPDATE writes both identity columns and nothing else"
+    );
+    assert_eq!(rebound.created_at, now);
+    assert_eq!(
+        rebound.updated_at,
+        now + 30,
+        "updated_at follows the injected backend clock"
+    );
+    assert_eq!(
+        rebound.expires_at,
+        now + 3600,
+        "the rebind never touches the lease column"
+    );
+    assert_eq!(rebound.rate_limited_until, None);
+    assert_eq!(rebound.last_rate_limited_at, None);
+    assert_eq!(rebound.last_rate_limit_reason, None);
+    assert_eq!(rebound.protocol_version.as_deref(), Some("2025-06-18"));
+    assert_eq!(
+        rebound.auth_token_id.as_deref(),
+        Some("tok-rebind-identity")
+    );
+    assert_eq!(rebound.user_id.as_deref(), Some("user-rebind-identity"));
+    assert_eq!(rebound.gateway_mode, MCP_GATEWAY_MODE_UPSTREAM);
+    assert_eq!(rebound.experiment_variant, MCP_EXPERIMENT_VARIANT_CONTROL);
+    std::println!(
+        "[task-12][identity] {proxy_session_id} old_key={old_key} new_key={new_key} \
+         up-sess-old -> {} ; changed columns={changed:?}",
+        rebound.upstream_session_id.as_deref().unwrap_or("-")
+    );
+}
+
+/// Acceptance (plan todo 12): the key-scoped revocation filters follow the
+/// row. Failure QA "old key revoke -> session survives": after the rebind
+/// neither `revoke_mcp_sessions_for_token_key` nor
+/// `revoke_mcp_sessions_for_user_key` matches on the OLD key, while both match
+/// on the NEW key (one session pinned per filter).
+#[tokio::test]
+async fn mcp_session_rebind_moves_key_revocation_filters_to_the_new_key() {
+    let db_path = temp_db_path("mcp-session-rebind-revocation");
+    let db_str = db_path.to_string_lossy().to_string();
+    let (backend_time, clock) = BackendTime::manual(utc_ts("2026-03-15T12:00:00Z"));
+    let store = KeyStore::new_with_time(&db_str, backend_time)
+        .await
+        .expect("store");
+
+    seed_provider_keys(
+        &store,
+        ProviderId::Tavily,
+        &[
+            "tvly-rebind-revoked-old".to_string(),
+            "tvly-rebind-revoked-new".to_string(),
+        ],
+    )
+    .await;
+    let old_key = key_id(&store.pool, "tvly-rebind-revoked-old").await;
+    let new_key = key_id(&store.pool, "tvly-rebind-revoked-new").await;
+
+    let now = clock.now_ts();
+    let token_session = "psess-rebind-token-filter";
+    let user_session = "psess-rebind-user-filter";
+    seed_pinned_mcp_session(
+        &store,
+        token_session,
+        "up-sess-token-old",
+        &old_key,
+        "tok-rebind-token",
+        "user-rebind-token",
+        now,
+    )
+    .await;
+    seed_pinned_mcp_session(
+        &store,
+        user_session,
+        "up-sess-user-old",
+        &old_key,
+        "tok-rebind-user",
+        "user-rebind-user",
+        now,
+    )
+    .await;
+    store
+        .rebind_mcp_session_upstream_key(token_session, "up-sess-token-new", &new_key)
+        .await
+        .expect("rebind token-filter session");
+    store
+        .rebind_mcp_session_upstream_key(user_session, "up-sess-user-new", &new_key)
+        .await
+        .expect("rebind user-filter session");
+
+    // Old-key revocation no longer matches either session.
+    store
+        .revoke_mcp_sessions_for_token_key("tok-rebind-token", &old_key, "primary_api_key_rebound")
+        .await
+        .expect("revoke by old token key");
+    store
+        .revoke_mcp_sessions_for_user_key("user-rebind-user", &old_key, "primary_api_key_rebound")
+        .await
+        .expect("revoke by old user key");
+    for proxy_session_id in [token_session, user_session] {
+        let survived = store
+            .get_active_mcp_session(proxy_session_id, now)
+            .await
+            .expect("read session")
+            .unwrap_or_else(|| panic!("{proxy_session_id} must survive old-key revocation"));
+        assert_eq!(survived.revoked_at, None);
+        assert_eq!(survived.upstream_key_id.as_deref(), Some(new_key.as_str()));
+    }
+    let revoked_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM mcp_sessions WHERE revoked_at IS NOT NULL")
+            .fetch_one(&store.pool)
+            .await
+            .expect("count revoked sessions");
+    assert_eq!(
+        revoked_rows, 0,
+        "an old-key revocation filter must not match a rebound session"
+    );
+    std::println!(
+        "[task-12][revocation] old key {old_key} revoked via both filters -> 0 rows matched"
+    );
+
+    // New-key revocation matches: token filter first.
+    store
+        .revoke_mcp_sessions_for_token_key("tok-rebind-token", &new_key, "pinned_key_unavailable")
+        .await
+        .expect("revoke by new token key");
+    let (token_revoked_at, token_reason) = mcp_session_revocation(&store.pool, token_session).await;
+    assert!(
+        token_revoked_at > 0,
+        "the token filter revokes the rebound row"
+    );
+    assert_eq!(token_reason, "pinned_key_unavailable");
+    assert!(
+        store
+            .get_active_mcp_session(token_session, now)
+            .await
+            .expect("read session")
+            .is_none(),
+        "a revoked session is no longer active"
+    );
+    assert_eq!(
+        mcp_session_revocation(&store.pool, user_session).await.0,
+        -1,
+        "the token-scoped filter must not reach the other session"
+    );
+
+    // ... then the user filter.
+    store
+        .revoke_mcp_sessions_for_user_key("user-rebind-user", &new_key, "pinned_key_unavailable")
+        .await
+        .expect("revoke by new user key");
+    let (user_revoked_at, user_reason) = mcp_session_revocation(&store.pool, user_session).await;
+    assert!(
+        user_revoked_at > 0,
+        "the user filter revokes the rebound row"
+    );
+    assert_eq!(user_reason, "pinned_key_unavailable");
+    assert!(
+        store
+            .get_active_mcp_session(user_session, now)
+            .await
+            .expect("read session")
+            .is_none(),
+        "a revoked session is no longer active"
+    );
+    std::println!(
+        "[task-12][revocation] new key {new_key} matched both filters: \
+         token_session revoked_at={token_revoked_at} user_session revoked_at={user_revoked_at}"
+    );
+}
+
+/// Guard: the rebind only ever moves a LIVE row. A revoked session keeps its
+/// old identity and its revocation record byte-identically, and an unknown
+/// proxy session id is a no-op that inserts nothing.
+#[tokio::test]
+async fn mcp_session_rebind_ignores_revoked_and_unknown_sessions() {
+    let db_path = temp_db_path("mcp-session-rebind-guard");
+    let db_str = db_path.to_string_lossy().to_string();
+    let (backend_time, clock) = BackendTime::manual(utc_ts("2026-03-15T12:00:00Z"));
+    let store = KeyStore::new_with_time(&db_str, backend_time)
+        .await
+        .expect("store");
+
+    seed_provider_keys(
+        &store,
+        ProviderId::Tavily,
+        &[
+            "tvly-rebind-guard-old".to_string(),
+            "tvly-rebind-guard-new".to_string(),
+        ],
+    )
+    .await;
+    let old_key = key_id(&store.pool, "tvly-rebind-guard-old").await;
+    let new_key = key_id(&store.pool, "tvly-rebind-guard-new").await;
+
+    let now = clock.now_ts();
+    let proxy_session_id = "psess-rebind-guard";
+    seed_pinned_mcp_session(
+        &store,
+        proxy_session_id,
+        "up-sess-guard-old",
+        &old_key,
+        "tok-rebind-guard",
+        "user-rebind-guard",
+        now,
+    )
+    .await;
+    store
+        .revoke_mcp_session(proxy_session_id, "pinned_key_unavailable")
+        .await
+        .expect("revoke session");
+    let before = mcp_session_row_image(&store.pool, proxy_session_id).await;
+
+    clock.set_now_ts(now + 60);
+    store
+        .rebind_mcp_session_upstream_key(proxy_session_id, "up-sess-guard-new", &new_key)
+        .await
+        .expect("rebind of a revoked session is not an error");
+    let after = mcp_session_row_image(&store.pool, proxy_session_id).await;
+    assert_eq!(
+        before, after,
+        "a revoked session is never rebound: the row image must be byte-identical"
+    );
+
+    store
+        .rebind_mcp_session_upstream_key("psess-never-created", "up-sess-ghost", &new_key)
+        .await
+        .expect("rebind of an unknown session is not an error");
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mcp_sessions")
+        .fetch_one(&store.pool)
+        .await
+        .expect("count mcp sessions");
+    assert_eq!(rows, 1, "an unknown proxy session id inserts nothing");
+    std::println!(
+        "[task-12][guard] revoked row untouched (upstream_key_id={old_key}) and \
+         psess-never-created inserted nothing; rows={rows}"
+    );
 }

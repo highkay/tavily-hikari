@@ -348,6 +348,49 @@ impl KeyStore {
         Ok(())
     }
 
+    /// Migrate a live pinned MCP session onto a different upstream key (plan
+    /// provider-key-429-retry todo 12): ONE atomic UPDATE writes both identity
+    /// columns, so the row never exposes a torn pair where the upstream
+    /// session belongs to the new key while `upstream_key_id` still names the
+    /// old one.
+    ///
+    /// The proxy session id stays stable (clients never observe the migration)
+    /// and the key-scoped revocation filters follow the row: after the rebind
+    /// `revoke_mcp_sessions_for_token_key` / `revoke_mcp_sessions_for_user_key`
+    /// no longer match the old key and do match the new one. No quota, limit,
+    /// rate-limit or lease column is touched - callers keep using
+    /// `touch_mcp_session` for the lease - and a revoked or unknown row is a
+    /// silent no-op, like every sibling update in this module.
+    // Not wired into production yet: plan todo 13 calls this from the MCP
+    // follow-up ladder (Auth|Exhausted migration) through a Proxy facade.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn rebind_mcp_session_upstream_key(
+        &self,
+        proxy_session_id: &str,
+        upstream_session_id: &str,
+        upstream_key_id: &str,
+    ) -> Result<(), ProxyError> {
+        let now = self.backend_time.now_ts();
+        sqlx::query(
+            r#"
+            UPDATE mcp_sessions
+            SET
+                upstream_session_id = ?,
+                upstream_key_id = ?,
+                updated_at = ?
+            WHERE proxy_session_id = ?
+              AND revoked_at IS NULL
+            "#,
+        )
+        .bind(upstream_session_id)
+        .bind(upstream_key_id)
+        .bind(now)
+        .bind(proxy_session_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub(crate) async fn update_mcp_session_rebalance_metadata(
         &self,
         proxy_session_id: &str,
