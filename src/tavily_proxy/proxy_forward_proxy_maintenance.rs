@@ -1705,6 +1705,18 @@ impl TavilyProxy {
         {
             let mut manager = self.forward_proxy.lock().await;
             manager.record_attempt(proxy_key, success, latency_ms, failure_kind);
+            for transition in manager.drain_availability_transitions() {
+                tracing::info!(
+                    component = "forward_proxy",
+                    event = "proxy_availability_changed",
+                    proxy_key = %transition.proxy_key,
+                    from_available = transition.from_available,
+                    to_available = transition.to_available,
+                    consecutive_failures = transition.consecutive_failures,
+                    last_error = ?transition.last_error,
+                    "forward proxy availability changed"
+                );
+            }
             if let Some(runtime) = manager.runtime(proxy_key).cloned() {
                 let now = self.backend_time.now_utc();
                 let bucket_start = (now.timestamp() / 3600) * 3600;

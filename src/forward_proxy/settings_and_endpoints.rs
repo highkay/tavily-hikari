@@ -655,4 +655,5 @@ pub struct ForwardProxyManager {
     pub settings_updated_at: i64,
     pub(crate) backend_time: BackendTime,
     pub(crate) window_stats_cache: Arc<RwLock<Option<ForwardProxyWindowStatsSetCacheEntry>>>,
+    pub pending_transitions: Vec<ForwardProxyAvailabilityTransition>,
 }

@@ -205,6 +205,126 @@ mod tests {
     }
 
     #[test]
+    fn proxy_record_attempt_enqueues_one_transition_at_failure_threshold() {
+        let proxy_key = "http://198.51.100.25:8080";
+        let threshold = forward_proxy_unavailable_after_failures();
+        let mut manager = manager_with_single_forward_proxy(proxy_key);
+
+        for failure in 1..threshold {
+            manager.record_attempt(
+                proxy_key,
+                false,
+                None,
+                Some(FORWARD_PROXY_FAILURE_SEND_ERROR),
+            );
+            assert!(
+                manager.drain_availability_transitions().is_empty(),
+                "failure {failure} of {threshold} must not emit a transition"
+            );
+        }
+
+        manager.record_attempt(
+            proxy_key,
+            false,
+            None,
+            Some(FORWARD_PROXY_FAILURE_HANDSHAKE_TIMEOUT),
+        );
+
+        let transitions = manager.drain_availability_transitions();
+        assert_eq!(
+            transitions.len(),
+            1,
+            "the threshold-th failure is the only availability flip"
+        );
+        assert_eq!(
+            transitions[0],
+            ForwardProxyAvailabilityTransition {
+                proxy_key: proxy_key.to_string(),
+                from_available: true,
+                to_available: false,
+                consecutive_failures: threshold,
+                last_error: Some(FORWARD_PROXY_FAILURE_HANDSHAKE_TIMEOUT.to_string()),
+            }
+        );
+        assert!(
+            manager.drain_availability_transitions().is_empty(),
+            "draining must empty the pending transition queue"
+        );
+
+        manager.record_attempt(
+            proxy_key,
+            false,
+            None,
+            Some(FORWARD_PROXY_FAILURE_SEND_ERROR),
+        );
+        assert!(
+            manager.drain_availability_transitions().is_empty(),
+            "a repeated failure while unavailable must not emit another transition"
+        );
+    }
+
+    #[test]
+    fn proxy_record_attempt_enqueues_recovery_transition() {
+        let proxy_key = "http://198.51.100.26:8080";
+        let threshold = forward_proxy_unavailable_after_failures();
+        let mut manager = manager_with_single_forward_proxy(proxy_key);
+
+        for _ in 0..threshold {
+            manager.record_attempt(
+                proxy_key,
+                false,
+                None,
+                Some(FORWARD_PROXY_FAILURE_HANDSHAKE_TIMEOUT),
+            );
+        }
+        let transitions = manager.drain_availability_transitions();
+        assert_eq!(transitions.len(), 1);
+        assert!(!transitions[0].to_available);
+
+        manager.record_attempt(proxy_key, true, Some(25.0), None);
+
+        let transitions = manager.drain_availability_transitions();
+        assert_eq!(
+            transitions.len(),
+            1,
+            "a successful attempt must emit exactly one recovery transition"
+        );
+        assert_eq!(
+            transitions[0],
+            ForwardProxyAvailabilityTransition {
+                proxy_key: proxy_key.to_string(),
+                from_available: false,
+                to_available: true,
+                consecutive_failures: 0,
+                last_error: None,
+            }
+        );
+    }
+
+    #[test]
+    fn proxy_record_attempt_skips_transition_when_availability_does_not_change() {
+        let proxy_key = "http://198.51.100.27:8080";
+        let mut manager = manager_with_single_forward_proxy(proxy_key);
+
+        manager.record_attempt(proxy_key, true, Some(20.0), None);
+        assert!(
+            manager.drain_availability_transitions().is_empty(),
+            "a successful attempt on an available node stays available"
+        );
+
+        manager.record_attempt(
+            proxy_key,
+            false,
+            None,
+            Some(FORWARD_PROXY_FAILURE_SEND_ERROR),
+        );
+        assert!(
+            manager.drain_availability_transitions().is_empty(),
+            "a failure below the threshold must not flip availability"
+        );
+    }
+
+    #[test]
     fn derive_probe_url_uses_public_probe_endpoint() {
         let upstream = Url::parse("http://127.0.0.1:30014/mcp").expect("parse upstream");
         let probe = derive_probe_url(&upstream);

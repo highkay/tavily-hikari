@@ -38,6 +38,19 @@ fn forward_proxy_unavailable_after_failures() -> u32 {
     )
 }
 
+/// One availability flip observed by [`ForwardProxyManager::record_attempt`].
+///
+/// The manager only enqueues the event; the caller drains and emits it so the
+/// state machine stays independent from the logging transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardProxyAvailabilityTransition {
+    pub proxy_key: String,
+    pub from_available: bool,
+    pub to_available: bool,
+    pub consecutive_failures: u32,
+    pub last_error: Option<String>,
+}
+
 impl ForwardProxyManager {
     pub fn new(
         settings: ForwardProxySettings,
@@ -87,6 +100,7 @@ impl ForwardProxyManager {
             settings_updated_at,
             backend_time,
             window_stats_cache: Arc::new(RwLock::new(None)),
+            pending_transitions: Vec::new(),
         };
         manager.rebuild_endpoints(Vec::new());
         manager.restore_persisted_subscription_endpoints();
@@ -481,40 +495,62 @@ impl ForwardProxyManager {
         {
             return;
         }
-        let Some(runtime) = self.runtime.get_mut(proxy_key) else {
-            return;
+        let transition = {
+            let Some(runtime) = self.runtime.get_mut(proxy_key) else {
+                return;
+            };
+            let was_available = runtime.available;
+            update_runtime_ema(runtime, success, latency_ms);
+            if success {
+                runtime.consecutive_failures = 0;
+                runtime.available = true;
+                runtime.last_error = None;
+                let latency_penalty = runtime
+                    .latency_ema_ms
+                    .map(|value| (value / 2500.0).min(0.6))
+                    .unwrap_or(0.0);
+                runtime.weight += FORWARD_PROXY_WEIGHT_SUCCESS_BONUS - latency_penalty;
+                if runtime.weight <= 0.0 {
+                    runtime.weight = FORWARD_PROXY_PROBE_RECOVERY_WEIGHT;
+                }
+            } else {
+                runtime.consecutive_failures = runtime.consecutive_failures.saturating_add(1);
+                if runtime.consecutive_failures >= forward_proxy_unavailable_after_failures() {
+                    runtime.available = false;
+                }
+                runtime.last_error = failure_kind.map(ToOwned::to_owned);
+                let failure_penalty = FORWARD_PROXY_WEIGHT_FAILURE_PENALTY_BASE
+                    + f64::from(runtime.consecutive_failures.saturating_sub(1))
+                        * FORWARD_PROXY_WEIGHT_FAILURE_PENALTY_STEP;
+                runtime.weight -= failure_penalty;
+            }
+            runtime.weight = runtime
+                .weight
+                .clamp(FORWARD_PROXY_WEIGHT_MIN, FORWARD_PROXY_WEIGHT_MAX);
+            if success && runtime.weight < FORWARD_PROXY_WEIGHT_RECOVERY {
+                runtime.weight = runtime.weight.max(FORWARD_PROXY_WEIGHT_RECOVERY * 0.5);
+            }
+            if was_available == runtime.available {
+                None
+            } else {
+                Some(ForwardProxyAvailabilityTransition {
+                    proxy_key: proxy_key.to_string(),
+                    from_available: was_available,
+                    to_available: runtime.available,
+                    consecutive_failures: runtime.consecutive_failures,
+                    last_error: runtime.last_error.clone(),
+                })
+            }
         };
-        update_runtime_ema(runtime, success, latency_ms);
-        if success {
-            runtime.consecutive_failures = 0;
-            runtime.available = true;
-            runtime.last_error = None;
-            let latency_penalty = runtime
-                .latency_ema_ms
-                .map(|value| (value / 2500.0).min(0.6))
-                .unwrap_or(0.0);
-            runtime.weight += FORWARD_PROXY_WEIGHT_SUCCESS_BONUS - latency_penalty;
-            if runtime.weight <= 0.0 {
-                runtime.weight = FORWARD_PROXY_PROBE_RECOVERY_WEIGHT;
-            }
-        } else {
-            runtime.consecutive_failures = runtime.consecutive_failures.saturating_add(1);
-            if runtime.consecutive_failures >= forward_proxy_unavailable_after_failures() {
-                runtime.available = false;
-            }
-            runtime.last_error = failure_kind.map(ToOwned::to_owned);
-            let failure_penalty = FORWARD_PROXY_WEIGHT_FAILURE_PENALTY_BASE
-                + f64::from(runtime.consecutive_failures.saturating_sub(1))
-                    * FORWARD_PROXY_WEIGHT_FAILURE_PENALTY_STEP;
-            runtime.weight -= failure_penalty;
-        }
-        runtime.weight = runtime
-            .weight
-            .clamp(FORWARD_PROXY_WEIGHT_MIN, FORWARD_PROXY_WEIGHT_MAX);
-        if success && runtime.weight < FORWARD_PROXY_WEIGHT_RECOVERY {
-            runtime.weight = runtime.weight.max(FORWARD_PROXY_WEIGHT_RECOVERY * 0.5);
-        }
         self.ensure_non_zero_weight();
+        if let Some(transition) = transition {
+            self.pending_transitions.push(transition);
+        }
+    }
+
+    /// Drains availability flips recorded by [`Self::record_attempt`].
+    pub fn drain_availability_transitions(&mut self) -> Vec<ForwardProxyAvailabilityTransition> {
+        std::mem::take(&mut self.pending_transitions)
     }
 
     pub fn should_refresh_subscriptions(&self) -> bool {
