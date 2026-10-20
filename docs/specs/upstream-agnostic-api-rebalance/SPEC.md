@@ -169,6 +169,22 @@ SerpApi hosted pinned 会话走上一节的迁移语义；Exa/Brave 本地 MCP �
 - 预算与节流：同一逻辑请求至多 2 次上游尝试（即至多一次换 key 重试）、总死线
   5 秒、零睡眠；`RateLimited` 仅当已 arm 的 Retry-After ≤ 2 秒才即时重试，信号
   内解析值与 arm 值不一致时取较长者，超过门槛即原样返回；该门同样约束瞬时臂。
+- 每跳连接界限（2026-10-20 修订）：每次上游尝试的 CONNECT 阶段由
+  `FORWARD_PROXY_CONNECT_TIMEOUT_SECS` 界定（默认 4 秒，env 覆盖，钳制 1-30 秒，
+  `src/forward_proxy/relay_and_xray.rs`），确保 5 秒总死线对慢传输失败可达；默认
+  值 4 秒先于总死线触发，黑洞连接这类慢传输失败在重试预算内快速失败，跨 key
+  重试阶梯得以接管并留下标记。2026-10-19 生产事故反例：直连客户端没有连接超
+  时，黑洞连接烧穿整个死线，请求到达内核否决点时已超期，不轮换且
+  `fallback_reason` 为 NULL。
+- 代理可用性语义（2026-10-20 修订）：代理节点仅在连续
+  `FORWARD_PROXY_UNAVAILABLE_AFTER_FAILURES` 次失败后才标记不可用（默认 3，env
+  覆盖，钳制 1-10，`src/forward_proxy/manager.rs`），单次瞬时失败不把它踢出轮
+  换；恢复探针覆盖全部不可用节点，不再只覆盖被惩罚（penalized）节点；探针成
+  功判定为「经代理收到任何 HTTP 响应」，传输类失败（超时、连接错误）是唯一死
+  因，目标站路由异常不算代理死（mihomo 对默认探针目标 example.com 路由回答
+  502 时，代理仍判活）；探针目标 `FORWARD_PROXY_PROBE_URL`（默认
+  `http://example.com/`），探针超时 `FORWARD_PROXY_VALIDATION_TIMEOUT_SECS`（默
+  认 5 秒，env 覆盖，钳制 2-60 秒）。
 - 预算可调（仅 env）：`KEY_RETRY_MAX_ATTEMPTS`（默认 2，只可降到 1 即关闭重试，
   不可超过 2）、`KEY_RETRY_DEADLINE_SECS`（默认 5，0-60）、
   `KEY_RETRY_RATE_LIMIT_FAST_PATH_SECS`（默认 2，0-60）；v1 刻意不经

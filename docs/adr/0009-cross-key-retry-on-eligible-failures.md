@@ -135,6 +135,20 @@ Risk register:
   cooldown those cases arm is the 30s ladder floor (`MCP_SESSION_INIT_BACKOFF_MIN_SECS` in
   `src/lib.rs`). If that floor ever drops below 20s, a wait-out implementation could pass the pin;
   the bound must be re-derived with the constant.
+- (e) First-failure exile and penalized-only recovery probes (2026-10-19 incident class): a
+  forward-proxy node was marked unavailable on its first failed attempt, and the maintenance loop
+  only probed penalized nodes, so an unavailable node whose weight stayed intact never received a
+  recovery probe. Only a process restart or a settings rewrite reset that state, which let one
+  transient failure exile a healthy node from rotation. On 2026-10-19 this dead-zoned two healthy
+  proxies for about 18 hours while Brave, GFW-blocked on the direct path, had no egress at all.
+  Probe-target health also masqueraded as proxy health: the mihomo gateway's example.com route
+  answered the probe URL with a ~5s 502, which the old predicate read as the proxy being dead.
+  The wave-1 fixes replace this with a consecutive-failure threshold
+  (`FORWARD_PROXY_UNAVAILABLE_AFTER_FAILURES`, default 3, clamp 1-10) before a node goes
+  unavailable, recovery probes covering every unavailable node (not only penalized ones),
+  any-HTTP-response probe success, and env-tunable `FORWARD_PROXY_PROBE_URL` (default
+  `http://example.com/`) and `FORWARD_PROXY_VALIDATION_TIMEOUT_SECS` (default 5, clamp 2-60).
+  Evidence: `.omo/evidence/prod-request-errors/`.
 
 Conflict disclosure:
 
