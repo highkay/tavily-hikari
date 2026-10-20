@@ -1,3 +1,43 @@
+/// Consecutive failures required before a node is marked unavailable. A single
+/// transient failure must not remove a healthy node from rotation.
+const FORWARD_PROXY_UNAVAILABLE_AFTER_FAILURES_DEFAULT: u32 = 3;
+const FORWARD_PROXY_UNAVAILABLE_AFTER_FAILURES_MIN: u32 = 1;
+const FORWARD_PROXY_UNAVAILABLE_AFTER_FAILURES_MAX: u32 = 10;
+const FORWARD_PROXY_UNAVAILABLE_AFTER_FAILURES_ENV: &str =
+    "FORWARD_PROXY_UNAVAILABLE_AFTER_FAILURES";
+
+/// Pure parser behind [`forward_proxy_unavailable_after_failures`]: missing or
+/// empty values keep the default, unparsable values warn and keep the default,
+/// and numeric values are clamped to the supported range.
+fn parse_forward_proxy_unavailable_after_failures(raw: Option<&str>) -> u32 {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return FORWARD_PROXY_UNAVAILABLE_AFTER_FAILURES_DEFAULT;
+    };
+    match raw.parse::<u32>() {
+        Ok(value) => value.clamp(
+            FORWARD_PROXY_UNAVAILABLE_AFTER_FAILURES_MIN,
+            FORWARD_PROXY_UNAVAILABLE_AFTER_FAILURES_MAX,
+        ),
+        Err(_) => {
+            eprintln!(
+                "warning: {FORWARD_PROXY_UNAVAILABLE_AFTER_FAILURES_ENV} must be an integer in {}..={}; using default {}",
+                FORWARD_PROXY_UNAVAILABLE_AFTER_FAILURES_MIN,
+                FORWARD_PROXY_UNAVAILABLE_AFTER_FAILURES_MAX,
+                FORWARD_PROXY_UNAVAILABLE_AFTER_FAILURES_DEFAULT
+            );
+            FORWARD_PROXY_UNAVAILABLE_AFTER_FAILURES_DEFAULT
+        }
+    }
+}
+
+fn forward_proxy_unavailable_after_failures() -> u32 {
+    parse_forward_proxy_unavailable_after_failures(
+        std::env::var(FORWARD_PROXY_UNAVAILABLE_AFTER_FAILURES_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
 impl ForwardProxyManager {
     pub fn new(
         settings: ForwardProxySettings,
@@ -459,7 +499,9 @@ impl ForwardProxyManager {
             }
         } else {
             runtime.consecutive_failures = runtime.consecutive_failures.saturating_add(1);
-            runtime.available = false;
+            if runtime.consecutive_failures >= forward_proxy_unavailable_after_failures() {
+                runtime.available = false;
+            }
             runtime.last_error = failure_kind.map(ToOwned::to_owned);
             let failure_penalty = FORWARD_PROXY_WEIGHT_FAILURE_PENALTY_BASE
                 + f64::from(runtime.consecutive_failures.saturating_sub(1))
@@ -487,12 +529,16 @@ impl ForwardProxyManager {
         (self.backend_time.now_ts() - last_refresh_at) >= interval
     }
 
-    pub fn should_probe_penalized_proxy(&self) -> bool {
+    /// A node needs a recovery probe when it is unavailable or penalized; the
+    /// penalized-only predicate left unavailable nodes with a restored weight
+    /// stranded until a restart.
+    pub fn should_probe_unavailable_proxy(&self) -> bool {
         let selectable_keys = self.selectable_endpoint_keys();
-        let has_penalized = self.runtime.values().any(|entry| {
-            selectable_keys.contains(entry.proxy_key.as_str()) && entry.is_penalized()
+        let has_recovery_candidate = self.runtime.values().any(|entry| {
+            selectable_keys.contains(entry.proxy_key.as_str())
+                && (!entry.available || entry.is_penalized())
         });
-        if !has_penalized || self.probe_in_flight {
+        if !has_recovery_candidate || self.probe_in_flight {
             return false;
         }
         self.requests_since_probe >= FORWARD_PROXY_PROBE_EVERY_REQUESTS
@@ -500,7 +546,7 @@ impl ForwardProxyManager {
     }
 
     pub fn mark_probe_started(&mut self) -> Option<SelectedForwardProxy> {
-        if !self.should_probe_penalized_proxy() {
+        if !self.should_probe_unavailable_proxy() {
             return None;
         }
         let selectable_keys = self.selectable_endpoint_keys();
@@ -508,7 +554,8 @@ impl ForwardProxyManager {
             .runtime
             .values()
             .filter(|entry| {
-                entry.is_penalized() && selectable_keys.contains(entry.proxy_key.as_str())
+                (!entry.available || entry.is_penalized())
+                    && selectable_keys.contains(entry.proxy_key.as_str())
             })
             .max_by(|lhs, rhs| lhs.weight.total_cmp(&rhs.weight))
             .and_then(|entry| {

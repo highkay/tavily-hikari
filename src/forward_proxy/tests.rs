@@ -12,6 +12,198 @@ mod tests {
         time::Duration,
     };
 
+    fn manager_with_single_forward_proxy(proxy_key: &str) -> ForwardProxyManager {
+        ForwardProxyManager::new(
+            ForwardProxySettings {
+                proxy_urls: vec![proxy_key.to_string()],
+                subscription_urls: Vec::new(),
+                subscription_update_interval_secs: 3600,
+                insert_direct: false,
+                egress_socks5_enabled: false,
+                egress_socks5_url: String::new(),
+            },
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn forward_proxy_unavailable_after_failures_parse_uses_default_for_missing_or_garbage_values() {
+        for raw in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("not-a-number"),
+            Some("1.5"),
+            Some("-1"),
+        ] {
+            assert_eq!(
+                parse_forward_proxy_unavailable_after_failures(raw),
+                FORWARD_PROXY_UNAVAILABLE_AFTER_FAILURES_DEFAULT,
+                "raw value {raw:?} should fall back to the default"
+            );
+        }
+    }
+
+    #[test]
+    fn forward_proxy_unavailable_after_failures_parse_accepts_values_in_range() {
+        assert_eq!(parse_forward_proxy_unavailable_after_failures(Some("1")), 1);
+        assert_eq!(parse_forward_proxy_unavailable_after_failures(Some("5")), 5);
+        assert_eq!(
+            parse_forward_proxy_unavailable_after_failures(Some(" 5 ")),
+            5
+        );
+        assert_eq!(
+            parse_forward_proxy_unavailable_after_failures(Some("10")),
+            FORWARD_PROXY_UNAVAILABLE_AFTER_FAILURES_MAX
+        );
+    }
+
+    #[test]
+    fn forward_proxy_unavailable_after_failures_parse_clamps_out_of_range_values() {
+        assert_eq!(
+            parse_forward_proxy_unavailable_after_failures(Some("0")),
+            FORWARD_PROXY_UNAVAILABLE_AFTER_FAILURES_MIN
+        );
+        assert_eq!(
+            parse_forward_proxy_unavailable_after_failures(Some("11")),
+            FORWARD_PROXY_UNAVAILABLE_AFTER_FAILURES_MAX
+        );
+        assert_eq!(
+            parse_forward_proxy_unavailable_after_failures(Some("999")),
+            FORWARD_PROXY_UNAVAILABLE_AFTER_FAILURES_MAX
+        );
+    }
+
+    #[test]
+    fn proxy_record_attempt_keeps_node_available_below_failure_threshold() {
+        let proxy_key = "http://198.51.100.21:8080";
+        let threshold = forward_proxy_unavailable_after_failures();
+        let mut manager = manager_with_single_forward_proxy(proxy_key);
+
+        for failure in 1..threshold {
+            manager.record_attempt(
+                proxy_key,
+                false,
+                None,
+                Some(FORWARD_PROXY_FAILURE_SEND_ERROR),
+            );
+            let runtime = manager.runtime(proxy_key).expect("proxy runtime");
+            assert_eq!(runtime.consecutive_failures, failure);
+            assert!(
+                runtime.available,
+                "failure {failure} of {threshold} must keep the node available"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_record_attempt_marks_node_unavailable_at_failure_threshold() {
+        let proxy_key = "http://198.51.100.22:8080";
+        let threshold = forward_proxy_unavailable_after_failures();
+        let mut manager = manager_with_single_forward_proxy(proxy_key);
+
+        for _ in 0..threshold {
+            manager.record_attempt(
+                proxy_key,
+                false,
+                None,
+                Some(FORWARD_PROXY_FAILURE_HANDSHAKE_TIMEOUT),
+            );
+        }
+
+        let runtime = manager.runtime(proxy_key).expect("proxy runtime");
+        assert_eq!(runtime.consecutive_failures, threshold);
+        assert!(
+            !runtime.available,
+            "the threshold-th failure must take the node out of rotation"
+        );
+        assert_eq!(
+            runtime.last_error.as_deref(),
+            Some(FORWARD_PROXY_FAILURE_HANDSHAKE_TIMEOUT)
+        );
+
+        manager.record_attempt(
+            proxy_key,
+            false,
+            None,
+            Some(FORWARD_PROXY_FAILURE_SEND_ERROR),
+        );
+        assert!(!manager.runtime(proxy_key).expect("proxy runtime").available);
+    }
+
+    #[test]
+    fn proxy_record_attempt_success_resets_failures_and_availability() {
+        let proxy_key = "http://198.51.100.23:8080";
+        let threshold = forward_proxy_unavailable_after_failures();
+        let mut manager = manager_with_single_forward_proxy(proxy_key);
+
+        for _ in 0..threshold {
+            manager.record_attempt(
+                proxy_key,
+                false,
+                None,
+                Some(FORWARD_PROXY_FAILURE_SEND_ERROR),
+            );
+        }
+        assert!(!manager.runtime(proxy_key).expect("proxy runtime").available);
+
+        manager.record_attempt(proxy_key, true, Some(25.0), None);
+
+        let runtime = manager.runtime(proxy_key).expect("proxy runtime");
+        assert_eq!(runtime.consecutive_failures, 0);
+        assert!(runtime.available);
+        assert_eq!(runtime.last_error, None);
+        assert!(runtime.weight > 0.0);
+    }
+
+    #[test]
+    fn proxy_mark_probe_started_selects_unavailable_unpenalized_node_and_recovers() {
+        let proxy_key = "http://198.51.100.24:8080";
+        let threshold = forward_proxy_unavailable_after_failures();
+        let mut manager = manager_with_single_forward_proxy(proxy_key);
+
+        assert!(
+            manager.mark_probe_started().is_none(),
+            "a healthy, unpenalized node must not be probed"
+        );
+
+        for _ in 0..threshold {
+            manager.record_attempt(
+                proxy_key,
+                false,
+                None,
+                Some(FORWARD_PROXY_FAILURE_HANDSHAKE_TIMEOUT),
+            );
+        }
+        let runtime = manager.runtime(proxy_key).expect("proxy runtime");
+        assert!(!runtime.available);
+        assert!(
+            !runtime.is_penalized(),
+            "the unavailable node must be unpenalized for this regression test"
+        );
+
+        let probe = manager
+            .mark_probe_started()
+            .expect("unavailable node must be selected for a recovery probe");
+        assert_eq!(probe.key, proxy_key);
+        assert!(manager.probe_in_flight);
+
+        manager.record_attempt(proxy_key, true, Some(30.0), None);
+        manager.mark_probe_finished();
+
+        let runtime = manager.runtime(proxy_key).expect("proxy runtime");
+        assert!(
+            runtime.available,
+            "a successful probe must restore the node"
+        );
+        assert_eq!(runtime.consecutive_failures, 0);
+        assert_eq!(runtime.last_error, None);
+        assert!(
+            manager.mark_probe_started().is_none(),
+            "a recovered node must not remain a probe candidate"
+        );
+    }
+
     #[test]
     fn derive_probe_url_uses_public_probe_endpoint() {
         let upstream = Url::parse("http://127.0.0.1:30014/mcp").expect("parse upstream");
