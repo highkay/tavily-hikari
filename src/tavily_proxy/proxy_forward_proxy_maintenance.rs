@@ -230,7 +230,9 @@ impl TavilyProxy {
             let probe_result = self
                 .probe_forward_proxy_endpoint(
                     &endpoint,
-                    Duration::from_secs(forward_proxy::FORWARD_PROXY_VALIDATION_TIMEOUT_SECS),
+                    forward_proxy::forward_proxy_validation_timeout(
+                        forward_proxy::ForwardProxyValidationKind::ProxyUrl,
+                    ),
                     &probe_url,
                     None,
                 )

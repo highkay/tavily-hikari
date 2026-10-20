@@ -1071,17 +1071,53 @@ pub fn decode_subscription_payload(raw: &str) -> String {
     trimmed.to_string()
 }
 
-fn is_validation_probe_reachable_status(status: StatusCode) -> bool {
-    status.is_success()
-        || status == StatusCode::UNAUTHORIZED
-        || status == StatusCode::FORBIDDEN
-        || status == StatusCode::NOT_FOUND
+fn is_validation_probe_reachable_status(_status: StatusCode) -> bool {
+    // A probe measures the forward proxy's transport health, not the probe
+    // target's routing health: any HTTP response at all proves the proxy carried
+    // the request and returned a response. Only transport-level failures
+    // (timeouts, connection errors) mean the proxy is dead.
+    true
 }
 
-fn forward_proxy_validation_timeout(kind: ForwardProxyValidationKind) -> Duration {
+const FORWARD_PROXY_VALIDATION_TIMEOUT_ENV: &str = "FORWARD_PROXY_VALIDATION_TIMEOUT_SECS";
+const FORWARD_PROXY_VALIDATION_TIMEOUT_MIN_SECS: u64 = 2;
+const FORWARD_PROXY_VALIDATION_TIMEOUT_MAX_SECS: u64 = 60;
+
+impl ForwardProxySettings {
+    /// Pure resolver behind the env-configurable probe timeout.
+    ///
+    /// Unset, empty, or unparsable overrides keep the built-in default; parsed
+    /// values are clamped to the supported range. Keeping the override explicit
+    /// lets tests cover it without mutating the process environment.
+    pub fn resolve_validation_timeout_secs(configured: Option<&str>) -> u64 {
+        let Some(raw) = configured.map(str::trim).filter(|value| !value.is_empty()) else {
+            return FORWARD_PROXY_VALIDATION_TIMEOUT_SECS;
+        };
+        match raw.parse::<u64>() {
+            Ok(secs) => secs.clamp(
+                FORWARD_PROXY_VALIDATION_TIMEOUT_MIN_SECS,
+                FORWARD_PROXY_VALIDATION_TIMEOUT_MAX_SECS,
+            ),
+            Err(_) => {
+                eprintln!(
+                    "ignoring invalid FORWARD_PROXY_VALIDATION_TIMEOUT_SECS={raw:?}; \
+                     using default {FORWARD_PROXY_VALIDATION_TIMEOUT_SECS}s"
+                );
+                FORWARD_PROXY_VALIDATION_TIMEOUT_SECS
+            }
+        }
+    }
+}
+
+pub(crate) fn forward_proxy_validation_timeout(kind: ForwardProxyValidationKind) -> Duration {
     match kind {
         ForwardProxyValidationKind::ProxyUrl => {
-            Duration::from_secs(FORWARD_PROXY_VALIDATION_TIMEOUT_SECS)
+            let secs = ForwardProxySettings::resolve_validation_timeout_secs(
+                std::env::var(FORWARD_PROXY_VALIDATION_TIMEOUT_ENV)
+                    .ok()
+                    .as_deref(),
+            );
+            Duration::from_secs(secs)
         }
         ForwardProxyValidationKind::SubscriptionUrl => {
             Duration::from_secs(FORWARD_PROXY_SUBSCRIPTION_VALIDATION_TIMEOUT_SECS)

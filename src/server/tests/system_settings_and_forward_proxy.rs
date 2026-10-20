@@ -1134,7 +1134,7 @@ use super::upstream_support_and_manual_jobs::*;
         let db_path = temp_db_path("admin-forward-proxy-validate-subscription-all-nodes");
         let db_str = db_path.to_string_lossy().to_string();
         let upstream_addr = spawn_forward_proxy_probe_upstream().await;
-        let failing_proxy_addr = spawn_fake_forward_proxy(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let failing_proxy_addr = spawn_refusing_forward_proxy().await;
         let healthy_proxy_addr = spawn_fake_forward_proxy(StatusCode::NOT_FOUND).await;
         let subscription_addr = spawn_forward_proxy_subscription_server(format!(
             "http://{}\nhttp://{}\n",
@@ -1328,7 +1328,7 @@ use super::upstream_support_and_manual_jobs::*;
         let db_path = temp_db_path("admin-forward-proxy-validate-subscription-failure");
         let db_str = db_path.to_string_lossy().to_string();
         let upstream_addr = spawn_forward_proxy_probe_upstream().await;
-        let fake_proxy_addr = spawn_fake_forward_proxy(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let fake_proxy_addr = spawn_refusing_forward_proxy().await;
         let subscription_addr =
             spawn_forward_proxy_subscription_server(format!("http://{}\n", fake_proxy_addr)).await;
         let upstream = format!("http://{}/mcp", upstream_addr);
@@ -1361,8 +1361,8 @@ use super::upstream_support_and_manual_jobs::*;
             "expected subscription probe failure context, got: {message}"
         );
         assert!(
-            message.contains("validation probe returned status 500 Internal Server Error"),
-            "expected concrete 500 failure context, got: {message}"
+            message.contains("no entry passed validation"),
+            "expected concrete transport failure context, got: {message}"
         );
 
         let _ = std::fs::remove_file(db_path);
@@ -3030,3 +3030,5 @@ use super::upstream_support_and_manual_jobs::*;
 
         let _ = std::fs::remove_file(db_path);
     }
+
+    include!("system_settings_and_forward_proxy/proxy_probe_tests.rs");

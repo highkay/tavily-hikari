@@ -10,9 +10,46 @@ pub fn default_xray_runtime_dir(database_path: &str) -> PathBuf {
         .join(DEFAULT_XRAY_RUNTIME_DIR)
 }
 
-pub fn derive_probe_url(_upstream: &Url) -> Url {
+const FORWARD_PROXY_PROBE_URL_ENV: &str = "FORWARD_PROXY_PROBE_URL";
+
+fn default_forward_proxy_probe_url() -> Url {
     Url::parse(FORWARD_PROXY_VALIDATION_PROBE_URL)
         .expect("forward proxy validation probe url should be a valid absolute url")
+}
+
+pub fn derive_probe_url(_upstream: &Url) -> Url {
+    ForwardProxySettings::resolve_probe_url(
+        std::env::var(FORWARD_PROXY_PROBE_URL_ENV).ok().as_deref(),
+    )
+}
+
+impl ForwardProxySettings {
+    /// Pure resolver behind [`derive_probe_url`].
+    ///
+    /// `FORWARD_PROXY_PROBE_URL` may override the built-in probe target; empty or
+    /// malformed values fall back to it. Keeping the override explicit lets tests
+    /// cover the parsing without mutating the process environment.
+    pub fn resolve_probe_url(configured: Option<&str>) -> Url {
+        let Some(raw) = configured.map(str::trim).filter(|value| !value.is_empty()) else {
+            return default_forward_proxy_probe_url();
+        };
+        match Url::parse(raw) {
+            Ok(url) if matches!(url.scheme(), "http" | "https") && url.has_host() => url,
+            Ok(url) => {
+                eprintln!(
+                    "ignoring FORWARD_PROXY_PROBE_URL={raw:?}: probe target must be an absolute http(s) url, got scheme {:?}",
+                    url.scheme()
+                );
+                default_forward_proxy_probe_url()
+            }
+            Err(err) => {
+                eprintln!(
+                    "ignoring invalid FORWARD_PROXY_PROBE_URL={raw:?}: {err}; using default probe target"
+                );
+                default_forward_proxy_probe_url()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
