@@ -1,5 +1,6 @@
 use super::*;
     use super::core_support_and_parsing::*;
+    use super::upstream_support_and_manual_jobs::spawn_proxy_server;
     use tavily_hikari::providers::ProviderId;
 
     /// Plan todo 11 bin coverage: table-driven resolver, dual-slot client auth
@@ -1612,7 +1613,7 @@ use super::*;
     }
 
     #[tokio::test]
-    async fn exa_facade_429_is_vetoed_into_a_single_unmarked_attempt() {
+    async fn exa_facade_429_veto_marks_the_consulted_rejection() {
         // Retry-After: 1 stays INSIDE the 2s fast-path window and the pool holds
         // a second key the mock would serve, so the ONLY thing that can explain a
         // single attempt is the Exa 429 veto (a team-level limit another key
@@ -1659,9 +1660,10 @@ use super::*;
         assert_eq!(rows.len(), 1, "the rejected attempt stays visible: {rows:?}");
         assert_eq!(rows[0].provider.as_deref(), Some("exa"));
         assert_eq!(rows[0].status_code, Some(429));
-        assert!(
-            rows[0].fallback_reason.is_none(),
-            "a veto is not a chain, so the row stays unmarked: {rows:?}"
+        assert_eq!(
+            rows[0].fallback_reason.as_deref(),
+            Some("upstream_key_retry:rejected"),
+            "the kernel was consulted and refused the replay: {rows:?}"
         );
 
         // The veto stops ROTATION, not marking: the 429 still arms the shared
@@ -1725,9 +1727,10 @@ use super::*;
         assert_eq!(rows.len(), 1, "the rejected attempt stays visible: {rows:?}");
         assert_eq!(rows[0].status_code, Some(402));
         assert_eq!(rows[0].result_status, "quota_exhausted");
-        assert!(
-            rows[0].fallback_reason.is_none(),
-            "a veto is not a chain, so the row stays unmarked: {rows:?}"
+        assert_eq!(
+            rows[0].fallback_reason.as_deref(),
+            Some("upstream_key_retry:rejected"),
+            "the team veto is a consulted decision, so it is marked rejected: {rows:?}"
         );
         // Marking is untouched by the veto: the key is still flipped exhausted.
         let key_id = rows[0].api_key_id.clone().expect("row names its key");
@@ -1823,8 +1826,8 @@ use super::*;
     /// amendment, request-shaped 4xx half and the Retry-After gate half): exactly
     /// one upstream attempt, the buffered bytes back to the client (status,
     /// Retry-After, content type, content length, body), ONE `request_logs` row
-    /// that stays unmarked because a non-chain attempt is not a chain, the key
-    /// neither marked nor cooled, and one settlement on the served status.
+    /// marked `rejected` because the kernel WAS consulted and refused the replay,
+    /// the key neither marked nor cooled, and one settlement on the served status.
     async fn assert_facade_served_as_is(
         harness: &ProviderFacadeRetryHarness,
         resp: reqwest::Response,
@@ -1877,9 +1880,10 @@ use super::*;
         assert_eq!(rows[0].provider.as_deref(), Some(provider));
         assert_eq!(rows[0].status_code, Some(expected_code));
         assert_eq!(rows[0].result_status, "error");
-        assert!(
-            rows[0].fallback_reason.is_none(),
-            "an attempt that is not part of a chain stays unmarked: {rows:?}"
+        assert_eq!(
+            rows[0].fallback_reason.as_deref(),
+            Some("upstream_key_retry:rejected"),
+            "a consulted refusal is marked, never NULL: {rows:?}"
         );
         assert_eq!(
             rows[0].key_effect_code, "none",
@@ -2391,7 +2395,8 @@ use super::*;
         // The Retry-After gate spans BOTH kernel arms: a 5xx is normally
         // retryable, but this one asks the caller to wait 30s and the kernel never
         // sleeps, so the wait is never absorbed silently. One attempt, buffered
-        // bytes back to the client, no chain marker.
+        // bytes back to the client, and the consulted refusal is marked
+        // `rejected` rather than left NULL.
         let harness = spawn_provider_facade_retry_harness(
             "provider-facade-retry-brave-5xx-retry-after",
             FacadeRetryMockPlan::rotating_after_rejection(
@@ -2429,8 +2434,9 @@ use super::*;
         // The amendment's other half: a request-shaped 4xx proves the upstream
         // answered and blamed the REQUEST, so rotating would burn a second key on
         // a call the caller got wrong. One attempt, buffered bytes back, key
-        // neither marked nor cooled, no chain marker - even though the pool holds
-        // a second eligible key and the mock would have served it.
+        // neither marked nor cooled, and the consulted refusal is marked
+        // `rejected` - even though the pool holds a second eligible key and the
+        // mock would have served it.
         let harness = spawn_provider_facade_retry_harness(
             "provider-facade-retry-serpapi-400",
             FacadeRetryMockPlan::rotating_after_rejection(
@@ -2942,3 +2948,5 @@ use super::*;
         assert_eq!(revoked_at, None, "a migrated session is never revoked");
         pool.close().await;
     }
+
+    include!("provider_facade_routing/fallback_reason_marker_tests.rs");

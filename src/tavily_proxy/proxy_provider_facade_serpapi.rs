@@ -126,8 +126,9 @@ impl ProviderFacadeAttemptRecord {
     }
 }
 
-/// Where one buffered provider-facade attempt sits inside a bounded cross-key
-/// retry chain (plan provider-key-429-retry todo 9).
+/// Where one buffered provider-facade attempt sits relative to the bounded
+/// cross-key retry kernel (plan provider-key-429-retry todo 9; marker semantics
+/// pinned by plan prod-request-errors todo 5).
 ///
 /// The marker rides into THIS attempt's own `request_logs` row through
 /// `fallback_reason`, so every attempt of one logical request stays visible and
@@ -136,23 +137,35 @@ impl ProviderFacadeAttemptRecord {
 /// `succeeded` or `rejected`, and a first hit whose pool probe came back empty
 /// is `skipped_no_eligible_key`.
 ///
+/// Every CONSULTED decision is non-NULL: when the kernel refuses to replay a
+/// failed attempt (an ineligible outcome, a Retry-After beyond the fast path,
+/// or the deadline spent) the row carries `rejected`, because that attempt is
+/// the final rejection of the logical request. Only a genuinely unconsulted
+/// attempt stays `None`: `NotInChain` is reserved for a structurally
+/// single-attempt surface (the Exa/Brave LOCAL MCP facades, which stay
+/// single-attempt in v1 and whose session rebind is owned by the todo-13 MCP
+/// ladder), a first attempt under a one-attempt budget, a successful attempt
+/// (the kernel is asked pro forma but no retry decision exists), and Tavily
+/// REST (which never routes through this facade). The SerpApi hosted MCP
+/// passthrough and the rebalance executors never reach a record path at all, so
+/// they are excluded structurally.
+///
 /// The terminal variant resolves INSIDE the record path from the very
 /// `analysis.status` that row persists, so `succeeded` can never disagree with
-/// `result_status`. The Exa/Brave LOCAL MCP facades construct `NotInChain`: they
-/// stay single-attempt in v1 (plan todo 9 Must-NOT) and the todo-13 MCP ladder
-/// owns session rebind. The SerpApi hosted MCP passthrough and the rebalance
-/// executors never reach a record path at all, so they are excluded
-/// structurally.
+/// `result_status`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ProviderFacadeRetryMarker {
-    /// Single-attempt surface, or an attempt the kernel serves unchanged: the
-    /// row keeps today's `fallback_reason: None`.
+    /// Never consulted by the retry kernel: single-attempt surface, one-attempt
+    /// budget, success, or Tavily REST. The row keeps `fallback_reason: None`.
     NotInChain,
     /// This attempt lost and the chain replayed on another key.
     Attempted,
     /// The pool probe found no eligible key, so the buffered attempt is served
     /// to the client byte-for-byte.
     SkippedNoEligibleKey,
+    /// The kernel was consulted and refused the replay: this attempt is served
+    /// unchanged as the final rejection of the logical request.
+    Rejected,
     /// This attempt ends a chain of `attempts_used` upstream calls.
     Terminal { attempts_used: u32 },
 }
@@ -176,6 +189,7 @@ impl ProviderFacadeRetryMarker {
             Self::NotInChain => None,
             Self::Attempted => Some(UPSTREAM_KEY_RETRY_ATTEMPTED),
             Self::SkippedNoEligibleKey => Some(UPSTREAM_KEY_RETRY_SKIPPED_NO_ELIGIBLE_KEY),
+            Self::Rejected => Some(UPSTREAM_KEY_RETRY_REJECTED),
             Self::Terminal { attempts_used } => {
                 upstream_key_retry_terminal_marker(attempts_used, client_success)
             }

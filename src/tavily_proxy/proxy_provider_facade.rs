@@ -472,9 +472,12 @@ impl TavilyProxy {
     /// (plan provider-key-429-retry todo 9; the todo-6 Tavily HTTP isomorph).
     ///
     /// Returns the retry-chain marker for THIS attempt's log row plus the lease
-    /// to replay on when the verdict is `Retry`. `NotInChain` with no lease means
-    /// the attempt is served to the client unchanged - the buffered response on
-    /// the `Ok` arm, today's `Err(err)` on the transport arm, never the 502 path.
+    /// to replay on when the verdict is `Retry`. A consulted decision that does
+    /// not replay is `Rejected` (the attempt is served unchanged as the final
+    /// rejection) or `SkippedNoEligibleKey`; only an unconsulted attempt is
+    /// `NotInChain`. The response itself is never rewritten: the buffered
+    /// response on the `Ok` arm, today's `Err(err)` on the transport arm, never
+    /// the 502 path.
     ///
     /// The kernel is pure and zero-I/O, so it is asked twice: first with the pool
     /// flag optimistically true - that call settles every non-pool gate (the Exa
@@ -491,6 +494,8 @@ impl TavilyProxy {
         // retry, so a Tavily id is never retried through this path even if a
         // future caller routed one here.
         if probe.provider == providers::ProviderId::Tavily {
+            // Structurally unconsulted: no retry decision exists on this seam
+            // for Tavily REST, so the row deliberately stays unmarked.
             return Ok((ProviderFacadeRetryMarker::NotInChain, None));
         }
         let verdict = |eligible_key_available: bool| {
@@ -517,7 +522,20 @@ impl TavilyProxy {
             )
         };
         if verdict(true) != RetryDecision::Retry {
-            return Ok((ProviderFacadeRetryMarker::NotInChain, None));
+            // The kernel WAS consulted and refused the replay: an ineligible
+            // outcome (request-shaped 4xx, Exa veto, Retry-After beyond the
+            // fast path) or a spent deadline. A success is the one consulted
+            // "no retry" that is not a rejection - it needs no marker because
+            // there was never a retry decision to record. Every failed attempt
+            // is the final rejection of this logical request and carries
+            // `rejected`, so a quota/auth rejection can never again surface with
+            // a NULL marker (GAP-5).
+            let marker = if matches!(probe.signal, ProviderFailureSignal::Ok) {
+                ProviderFacadeRetryMarker::NotInChain
+            } else {
+                ProviderFacadeRetryMarker::Rejected
+            };
+            return Ok((marker, None));
         }
 
         // Strict primitive: the key this attempt just failed on plus every key
@@ -545,9 +563,11 @@ impl TavilyProxy {
                 None,
             )),
             // Unreachable: the two verdicts differ only in the pool flag, which
-            // can solely produce `NoEligibleKey`. Serving the attempt unmarked is
-            // the safe reading either way.
-            RetryDecision::ServeOriginal(_) => Ok((ProviderFacadeRetryMarker::NotInChain, None)),
+            // can solely produce `NoEligibleKey`. Treat it as the consulted final
+            // rejection rather than silently dropping the marker.
+            RetryDecision::ServeOriginal(_) => {
+                Ok((ProviderFacadeRetryMarker::Rejected, None))
+            }
         }
     }
 
