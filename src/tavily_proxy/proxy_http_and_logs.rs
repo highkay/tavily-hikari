@@ -874,9 +874,12 @@ impl TavilyProxy {
     /// provider-key-429-retry todo 6).
     ///
     /// Returns the `fallback_reason` marker for THIS attempt's log row plus the
-    /// lease to replay on when the verdict is `Retry`. `(None, None)` means the
-    /// attempt is served to the client unchanged - the buffered response on the
-    /// `Ok` arm, today's `Err(err)` on the transport arm, never the 502 path.
+    /// lease to replay on when the verdict is `Retry`. A consulted decision that
+    /// does not replay is `rejected` (the attempt is served unchanged as the
+    /// final rejection) or `skipped_no_eligible_key`; a success stays unmarked
+    /// because no retry decision exists. The response itself is never rewritten:
+    /// the buffered response on the `Ok` arm, today's `Err(err)` on the transport
+    /// arm, never the 502 path.
     ///
     /// The kernel is pure and zero-I/O, so it is asked twice: first with the pool
     /// flag optimistically true - that call settles every non-pool gate (request
@@ -905,7 +908,20 @@ impl TavilyProxy {
             )
         };
         if verdict(true) != RetryDecision::Retry {
-            return Ok((None, None));
+            // The kernel WAS consulted and refused the replay: an ineligible
+            // outcome (request-shaped 4xx, a long Retry-After, an excluded
+            // surface, a spent attempt budget) or a spent deadline. A success is
+            // the one consulted "no retry" that is not a rejection - it needs no
+            // marker because there was never a retry decision to record. Every
+            // failed attempt is the final rejection of this logical request and
+            // carries `rejected`, so a consulted refusal can never again surface
+            // with a NULL marker (GAP-5).
+            let marker = if matches!(probe.signal, ProviderFailureSignal::Ok) {
+                None
+            } else {
+                Some(UPSTREAM_KEY_RETRY_REJECTED)
+            };
+            return Ok((marker, None));
         }
 
         // Strict primitive: the key this attempt just failed on plus every key
@@ -931,9 +947,9 @@ impl TavilyProxy {
                 None,
             )),
             // Unreachable: the two verdicts differ only in the pool flag, which
-            // can solely produce `NoEligibleKey`. Serving the attempt unmarked is
-            // the safe reading either way.
-            RetryDecision::ServeOriginal(_) => Ok((None, None)),
+            // can solely produce `NoEligibleKey`. Treat it as the consulted final
+            // rejection rather than silently dropping the marker.
+            RetryDecision::ServeOriginal(_) => Ok((Some(UPSTREAM_KEY_RETRY_REJECTED), None)),
         }
     }
 

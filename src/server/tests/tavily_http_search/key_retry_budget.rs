@@ -929,14 +929,13 @@
         );
         assert_eq!(rows[0].status_code, Some(429));
         assert_eq!(rows[0].result_status, "error");
-        // The deadline arm serves the buffered hit UNMARKED: `skipped_no_eligible_key`
-        // belongs to the pool arm alone, and an operator must be able to tell "the pool
-        // was empty" from "the budget ran out" (the latter shows up as a slow single
-        // attempt with no chain marker).
-        assert!(
-            rows[0].fallback_reason.is_none(),
-            "a spent deadline carries no retry-chain marker, got {:?}",
-            rows[0].fallback_reason
+        // The deadline arm serves the buffered hit and marks the consulted refusal
+        // `rejected`: `skipped_no_eligible_key` belongs to the pool arm alone, so an
+        // operator can still tell "the pool was empty" from "the budget ran out".
+        assert_eq!(
+            rows[0].fallback_reason.as_deref(),
+            Some("upstream_key_retry:rejected"),
+            "a spent deadline is a consulted refusal, never NULL: {rows:?}"
         );
 
         // The key that was never tried stays eligible - proof the pool, not its own

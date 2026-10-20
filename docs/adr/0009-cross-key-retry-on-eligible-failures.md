@@ -71,6 +71,7 @@ rejection only".
   `upstream_key_retry:skipped_no_eligible_key` (first hit served because no eligible key existed).
   A single-attempt result is not a chain and carries no marker. Billing settles once on the final
   response through the unchanged settlement path.
+  Exception (2026-10-20): a consulted refusal that serves the first hit is marked `rejected`.
 - Concurrency acceptance: two racing logical requests may be handed the same replacement key. The
   strict acquire is a read plus an LRU touch, not a claim, so it offers no mutual exclusion, and
   the plan accepts that - the cost of the race is one extra upstream call, never a correctness

@@ -852,7 +852,8 @@
         // Retry-After: 45 is beyond the kernel's 2s fast-path window and the
         // kernel never sleeps, so the chain must not start even though this pool
         // HAS a second eligible key: one attempt, the buffered rejection served
-        // byte-for-byte including its Retry-After header, and an unmarked row.
+        // byte-for-byte including its Retry-After header, and a consulted refusal
+        // marked `rejected`.
         let (upstream_addr, attempts) = spawn_http_cross_key_retry_mock(
             CrossKeyRetryMockPlan::rotating_after_rejection(
                 CrossKeyRetryRejectedRoute::JsonPost("/search"),
@@ -909,10 +910,10 @@
         let rows = fetch_cross_key_retry_request_log_rows(&pool).await;
         assert_eq!(rows.len(), 1, "one attempt, one visible row: {rows:?}");
         assert_eq!(rows[0].status_code, Some(429));
-        assert!(
-            rows[0].fallback_reason.is_none(),
-            "an ineligible outcome carries no retry-chain marker, got {:?}",
-            rows[0].fallback_reason
+        assert_eq!(
+            rows[0].fallback_reason.as_deref(),
+            Some("upstream_key_retry:rejected"),
+            "a Retry-After beyond the fast path is a consulted refusal, never NULL: {rows:?}"
         );
 
         let _ = std::fs::remove_file(db_path);
@@ -1241,10 +1242,10 @@
 
     /// Shared pin for the amendment's request-shaped 4xx boundary: `status` must
     /// reach the client unchanged on a SINGLE upstream attempt, with the key
-    /// neither marked nor cooled and no retry-chain marker - even though the pool
-    /// holds a second eligible key and the mock would have served that retry
-    /// successfully. Rotating here would burn the pool for a request the upstream
-    /// blamed on the caller.
+    /// neither marked nor cooled and the consulted refusal marked `rejected` -
+    /// even though the pool holds a second eligible key and the mock would have
+    /// served that retry successfully. Rotating here would burn the pool for a
+    /// request the upstream blamed on the caller.
     async fn assert_request_shaped_client_error_is_served_as_is(
         status: u16,
         db_prefix: &str,
@@ -1310,10 +1311,10 @@
             rows[0].result_status, "success",
             "a request-shaped {status} is not a success"
         );
-        assert!(
-            rows[0].fallback_reason.is_none(),
-            "an excluded request error carries no retry-chain marker, got {:?}",
-            rows[0].fallback_reason
+        assert_eq!(
+            rows[0].fallback_reason.as_deref(),
+            Some("upstream_key_retry:rejected"),
+            "a consulted request-shaped {status} is marked rejected, never NULL: {rows:?}"
         );
         assert_eq!(
             rows[0].key_effect_code, "none",
@@ -1635,10 +1636,10 @@
             .collect();
         assert_eq!(crawl_rows.len(), 1, "one attempt, one visible row: {rows:?}");
         assert_eq!(crawl_rows[0].status_code, Some(429));
-        assert!(
-            crawl_rows[0].fallback_reason.is_none(),
-            "an excluded surface carries no retry-chain marker, got {:?}",
-            crawl_rows[0].fallback_reason
+        assert_eq!(
+            crawl_rows[0].fallback_reason.as_deref(),
+            Some("upstream_key_retry:rejected"),
+            "a consulted surface exclusion is marked rejected, never NULL: {rows:?}"
         );
 
         let token_logs = fetch_cross_key_retry_token_logs(&pool, &token.id).await;

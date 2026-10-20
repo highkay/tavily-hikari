@@ -3220,3 +3220,6 @@ use tower::ServiceExt;
     // plan provider-key-429-retry todo 8: the budget/deadline/concurrency gates, for the
     // same line-budget reason and with the same manifest prefix inheritance.
     include!("tavily_http_search/key_retry_budget.rs");
+    // plan prod-request-errors todo 11: consulted-refusal markers on the legacy executor,
+    // for the same line-budget reason and with the same manifest prefix inheritance.
+    include!("tavily_http_search/consulted_refusal_marker_tests.rs");
