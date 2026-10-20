@@ -181,9 +181,11 @@
         "--lib"
       ],
       "serial_prefixes": [
+        "forward_proxy::relay_and_xray_tests::",
         "forward_proxy::tests::"
       ],
       "include_prefixes": [
+        "forward_proxy::relay_and_xray_tests::",
         "forward_proxy::tests::"
       ]
     },

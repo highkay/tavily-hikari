@@ -1,3 +1,57 @@
+/// Per-attempt connect-phase bound for forward-proxy egress clients.
+///
+/// Kept below the cross-key retry deadline (5s by default) so a connect that
+/// black-holes the transport fails fast enough for the retry ladder to take
+/// over instead of timing out past the deadline.
+pub(crate) const FORWARD_PROXY_CONNECT_TIMEOUT_SECS_DEFAULT: u64 = 4;
+
+/// Lower clamp bound for [`FORWARD_PROXY_CONNECT_TIMEOUT_SECS_ENV`].
+pub(crate) const FORWARD_PROXY_CONNECT_TIMEOUT_SECS_MIN: u64 = 1;
+
+/// Upper clamp bound for [`FORWARD_PROXY_CONNECT_TIMEOUT_SECS_ENV`].
+pub(crate) const FORWARD_PROXY_CONNECT_TIMEOUT_SECS_MAX: u64 = 30;
+
+/// Env override for the per-attempt connect-phase bound, in seconds.
+pub(crate) const FORWARD_PROXY_CONNECT_TIMEOUT_SECS_ENV: &str =
+    "FORWARD_PROXY_CONNECT_TIMEOUT_SECS";
+
+/// Pure parser behind [`forward_proxy_connect_timeout`].
+///
+/// Missing or blank values keep the default, numeric values are clamped into
+/// `[MIN, MAX]`, and anything unparsable warns and keeps the default.
+pub(crate) fn parse_forward_proxy_connect_timeout_secs(raw: Option<&str>) -> u64 {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return FORWARD_PROXY_CONNECT_TIMEOUT_SECS_DEFAULT;
+    };
+    match raw.parse::<u64>() {
+        Ok(value) => value.clamp(
+            FORWARD_PROXY_CONNECT_TIMEOUT_SECS_MIN,
+            FORWARD_PROXY_CONNECT_TIMEOUT_SECS_MAX,
+        ),
+        Err(_) => {
+            eprintln!(
+                "warning: {} must be an integer in {}..={}; using default {}",
+                FORWARD_PROXY_CONNECT_TIMEOUT_SECS_ENV,
+                FORWARD_PROXY_CONNECT_TIMEOUT_SECS_MIN,
+                FORWARD_PROXY_CONNECT_TIMEOUT_SECS_MAX,
+                FORWARD_PROXY_CONNECT_TIMEOUT_SECS_DEFAULT
+            );
+            FORWARD_PROXY_CONNECT_TIMEOUT_SECS_DEFAULT
+        }
+    }
+}
+
+/// Configured per-attempt connect-phase bound. The env is read here and
+/// nowhere else so tests can exercise [`parse_forward_proxy_connect_timeout_secs`]
+/// without touching process state.
+pub(crate) fn forward_proxy_connect_timeout() -> Duration {
+    Duration::from_secs(parse_forward_proxy_connect_timeout_secs(
+        std::env::var(FORWARD_PROXY_CONNECT_TIMEOUT_SECS_ENV)
+            .ok()
+            .as_deref(),
+    ))
+}
+
 impl SelectedForwardProxy {
     pub fn from_endpoint(endpoint: &ForwardProxyEndpoint) -> Self {
         Self {
@@ -129,6 +183,7 @@ impl ForwardProxyClientPool {
         Client::builder()
             .pool_idle_timeout(Duration::from_secs(90))
             .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(forward_proxy_connect_timeout())
             .build()
             .map_err(ProxyError::Http)
     }
@@ -223,6 +278,7 @@ impl ForwardProxyClientPool {
         let built = Client::builder()
             .pool_idle_timeout(Duration::from_secs(90))
             .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(forward_proxy_connect_timeout())
             .proxy(Proxy::all(proxy_url.as_str()).map_err(|err| {
                 ProxyError::Other(format!("invalid forward proxy endpoint {proxy_url}: {err}"))
             })?)
@@ -1282,5 +1338,69 @@ impl XraySupervisor {
             stable_hash_u64(route_key),
             self.handle_nonce,
         )
+    }
+}
+
+#[cfg(test)]
+mod relay_and_xray_tests {
+    use super::{
+        FORWARD_PROXY_CONNECT_TIMEOUT_SECS_DEFAULT, FORWARD_PROXY_CONNECT_TIMEOUT_SECS_MAX,
+        FORWARD_PROXY_CONNECT_TIMEOUT_SECS_MIN, parse_forward_proxy_connect_timeout_secs,
+    };
+
+    fn parsed(raw: Option<&str>) -> u64 {
+        parse_forward_proxy_connect_timeout_secs(raw)
+    }
+
+    #[test]
+    fn connect_timeout_defaults_when_env_is_unset_or_blank() {
+        for raw in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                parsed(raw),
+                FORWARD_PROXY_CONNECT_TIMEOUT_SECS_DEFAULT,
+                "raw={raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn connect_timeout_accepts_an_explicit_override() {
+        assert_eq!(parsed(Some("7")), 7);
+        assert_eq!(parsed(Some(" 12 ")), 12);
+    }
+
+    #[test]
+    fn connect_timeout_clamps_below_the_minimum() {
+        assert_eq!(parsed(Some("0")), FORWARD_PROXY_CONNECT_TIMEOUT_SECS_MIN);
+    }
+
+    #[test]
+    fn connect_timeout_clamps_above_the_maximum() {
+        assert_eq!(parsed(Some("31")), FORWARD_PROXY_CONNECT_TIMEOUT_SECS_MAX);
+        assert_eq!(parsed(Some("3600")), FORWARD_PROXY_CONNECT_TIMEOUT_SECS_MAX);
+    }
+
+    #[test]
+    fn connect_timeout_falls_back_to_default_for_garbage() {
+        for raw in [Some("four"), Some("4.5"), Some("-1"), Some("4s")] {
+            assert_eq!(
+                parsed(raw),
+                FORWARD_PROXY_CONNECT_TIMEOUT_SECS_DEFAULT,
+                "raw={raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn connect_timeout_default_stays_below_the_retry_deadline() {
+        // Literal on purpose: KEY_RETRY_DEADLINE_SECS_DEFAULT lives in the
+        // private tavily_proxy kernel module, and this lane must not widen its
+        // visibility. The invariant is that the 4s connect bound fires before
+        // the kernel's 5s deadline so slow transports stay retry-eligible.
+        let connect_timeout_secs = parse_forward_proxy_connect_timeout_secs(None);
+        assert!(
+            connect_timeout_secs < 5,
+            "the connect bound must fire before the cross-key retry deadline"
+        );
     }
 }
