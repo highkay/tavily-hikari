@@ -2118,7 +2118,9 @@ impl TavilyProxy {
             .direct_client_via_egress(Some(egress_socks5_url))
             .await?;
         let response = tokio::time::timeout(
-            Duration::from_secs(forward_proxy::FORWARD_PROXY_VALIDATION_TIMEOUT_SECS),
+            forward_proxy::forward_proxy_validation_timeout(
+                forward_proxy::ForwardProxyValidationKind::ProxyUrl,
+            ),
             client.get(probe_url).send(),
         )
         .await
@@ -2278,7 +2280,9 @@ impl TavilyProxy {
                         &endpoint,
                         "settings_update",
                         None,
-                        Duration::from_secs(forward_proxy::FORWARD_PROXY_VALIDATION_TIMEOUT_SECS),
+                        forward_proxy::forward_proxy_validation_timeout(
+                            forward_proxy::ForwardProxyValidationKind::ProxyUrl,
+                        ),
                         None,
                     )
                     .await;
@@ -2332,7 +2336,9 @@ impl TavilyProxy {
                     &endpoint,
                     "revalidate",
                     None,
-                    Duration::from_secs(forward_proxy::FORWARD_PROXY_VALIDATION_TIMEOUT_SECS),
+                    forward_proxy::forward_proxy_validation_timeout(
+                        forward_proxy::ForwardProxyValidationKind::ProxyUrl,
+                    ),
                     None,
                 )
                 .await;
@@ -2421,7 +2427,9 @@ impl TavilyProxy {
             match self
                 .probe_forward_proxy_endpoint(
                     &endpoint,
-                    Duration::from_secs(forward_proxy::FORWARD_PROXY_VALIDATION_TIMEOUT_SECS),
+                    forward_proxy::forward_proxy_validation_timeout(
+                        forward_proxy::ForwardProxyValidationKind::ProxyUrl,
+                    ),
                     &probe_url,
                     cancellation,
                 )
@@ -2661,8 +2669,9 @@ impl TavilyProxy {
         let probe_url = forward_proxy::derive_probe_url(&self.upstream);
         let mut last_error: Option<ProxyError> = None;
         let probe_total = endpoints.len();
-        let validation_timeout =
-            Duration::from_secs(forward_proxy::FORWARD_PROXY_VALIDATION_TIMEOUT_SECS);
+        let validation_timeout = forward_proxy::forward_proxy_validation_timeout(
+            forward_proxy::ForwardProxyValidationKind::ProxyUrl,
+        );
         let probe_sample_total = 1usize;
         let mut completed_nodes = 0usize;
         let mut latency_samples = vec![Vec::<f64>::new(); probe_total];

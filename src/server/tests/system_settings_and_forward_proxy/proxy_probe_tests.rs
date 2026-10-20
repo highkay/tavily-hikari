@@ -246,3 +246,60 @@
             default_secs
         );
     }
+
+    #[tokio::test]
+    async fn proxy_probe_admin_validate_honors_env_timeout() {
+        let db_path = temp_db_path("proxy-probe-admin-env-timeout");
+        let db_str = db_path.to_string_lossy().to_string();
+        let upstream_addr = spawn_forward_proxy_probe_upstream().await;
+        let stalled_proxy_addr = spawn_stalled_forward_proxy().await;
+        let upstream = format!("http://{}/mcp", upstream_addr);
+        let usage_base = format!("http://{}", upstream_addr);
+        let proxy =
+            TavilyProxy::with_endpoint::<Vec<String>, String>(Vec::new(), &upstream, &db_str)
+                .await
+                .expect("create proxy");
+        let addr = spawn_admin_forward_proxy_server(proxy, usage_base, true).await;
+
+        // Hold the process env lock and the override across the request so the
+        // admin validate call site must read the resolver while this guard lives.
+        let _env_guard = EnvVarGuard::set("FORWARD_PROXY_VALIDATION_TIMEOUT_SECS", "2");
+        let client = Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .expect("build validation client");
+        let response = client
+            .post(format!("http://{addr}/api/settings/forward-proxy/validate"))
+            .json(&serde_json::json!({
+                "kind": "proxyUrl",
+                "value": format!("http://{}", stalled_proxy_addr),
+            }))
+            .send()
+            .await
+            .expect("validate stalled proxy");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .json::<serde_json::Value>()
+            .await
+            .expect("decode validation");
+        assert_eq!(body["ok"].as_bool(), Some(false));
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("validation timed out after 2000ms"),
+            "admin validate must use the env-resolved 2s budget, got: {body}"
+        );
+
+        // The resolver behind the call site keeps the floor/clamp semantics.
+        assert_eq!(
+            tavily_hikari::ForwardProxySettings::resolve_validation_timeout_secs(Some("2")),
+            2
+        );
+        assert_eq!(
+            tavily_hikari::ForwardProxySettings::resolve_validation_timeout_secs(Some("600")),
+            60
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
