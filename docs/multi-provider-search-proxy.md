@@ -443,3 +443,39 @@ Brave ToS §3(b) 禁止长期保留搜索结果数据。Hikari 的现有 body-re
   “同一组织自有密钥、在已购配额内池化”是文档化边界；多账号刷量、转售裸 key 不在支持范围。
 - 测试与 CI 只允许 stub/sandbox 上游；既有 “never hit production endpoints” 规则扩展至
   SerpApi/Exa/Brave（AGENTS.md incident rule）。
+
+---
+
+## 9. 运维注记：配额压力信号与出站代理探针
+
+### 9.1 客户端可见 432/429 即配额容量信号
+
+客户端在换 key 重试之后仍持续收到 432（Tavily 月配额）或耗尽语义 429（SerpApi
+`run out of searches`，判定见 §3.4 被拒 key 标记表），说明问题不在单个 key，而是该
+provider 池的月度配额整体承压。这是扩容信号。运营侧用两个已有读端点取数：
+
+- 池内耗尽计数：`GET /api/keys?provider=<p>&status=exhausted&per_page=1`，响应的
+  `total` 即该 provider 当前 `exhausted` 状态的 key 数；
+- 滚动窗口：`GET /api/analysis/providers`，按 provider 给出最近 24h/7d/30d 的
+  `requests` / `success` / `errors` / `quota_exhausted` 行（读面口径见 §6）。
+
+参照快照：2026-10-20 生产实例 tavily 615/2080、serpapi 196/631 为 exhausted
+（证据 `.omo/evidence/prod-request-errors/2026-10-20T01-21-20-keys-facets.txt`）。
+
+### 9.2 出站代理探针目标与超时
+
+出站代理健康探针默认请求 `http://example.com/`。判活规则由
+`src/forward_proxy/responses_and_validation.rs` 的 `is_validation_probe_reachable_status`
+固定：经代理收到任何 HTTP 响应（含 4xx/5xx）即判存活，只有传输层失败（连接错误、超时）
+才计死。探针反映代理的转发能力，不反映默认目标站点自身的路由健康。
+
+若出口网关对默认目标路由异常，就换一个探针目标或放宽超时。本站 2026-10-20 生产实例的
+mihomo 曾对 example.com 返回 502、时延约 5 秒，探针因此把两个健康代理判成假死：
+
+- `FORWARD_PROXY_PROBE_URL`：换用任意绝对 http(s) URL 作为探针目标；空值或解析失败
+  回退默认目标（`src/forward_proxy/settings_and_endpoints.rs` `resolve_probe_url`）；
+- `FORWARD_PROXY_VALIDATION_TIMEOUT_SECS`：探针超时秒数，默认 5，取值钳制在 2..=60
+  （`src/forward_proxy/responses_and_validation.rs` `resolve_validation_timeout_secs`）。
+
+出口网关（mihomo）配置本身不在本仓库管理范围；要改目标路由需在网关侧处理，本仓库只提供
+应用侧这两个旋钮。代理接入的既有约定见 `docs/high-anonymity-proxy.md`。
