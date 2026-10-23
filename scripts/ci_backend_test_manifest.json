@@ -175,7 +175,7 @@
       "id": "lib-forward-proxy",
       "kind": "lib",
       "name": "Lib Forward Proxy",
-      "estimated_seconds": 200,
+      "estimated_seconds": 110,
       "coverage_target": "lib",
       "run_args": [
         "--lib"
@@ -186,7 +186,20 @@
       ],
       "include_prefixes": [
         "forward_proxy::relay_and_xray_tests::",
-        "forward_proxy::tests::",
+        "forward_proxy::tests::"
+      ]
+    },
+    {
+      "id": "lib-provider-egress-policy",
+      "kind": "lib",
+      "name": "Lib Provider Egress Policy",
+      "estimated_seconds": 30,
+      "coverage_target": "lib",
+      "run_args": [
+        "--lib"
+      ],
+      "serial_prefixes": [],
+      "include_prefixes": [
         "tests::provider_egress_policy::"
       ]
     },
