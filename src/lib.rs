@@ -90,7 +90,6 @@ use serde::Serialize;
 use serde_json::Value;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Executor, QueryBuilder, Sqlite, SqlitePool, Transaction};
-use thiserror::Error;
 use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
 use tokio::time::Instant;
 use url::form_urlencoded;

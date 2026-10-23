@@ -382,6 +382,7 @@ mod alert_models;
 mod client_ip_tests;
 mod dashboard_month_series;
 mod monthly_quota_rebase;
+mod proxy_error;
 mod quota_views;
 
 pub use alert_models::*;
@@ -391,6 +392,7 @@ pub(crate) use monthly_quota_rebase::{
     maybe_rebase_current_month_business_quota_with_pool,
     rebase_current_month_business_quota_with_pool,
 };
+pub use proxy_error::ProxyError;
 pub use quota_views::*;
 
 #[derive(Debug)]
@@ -2181,67 +2183,6 @@ pub struct TokenHourlyBucket {
     pub success_count: i64,
     pub system_failure_count: i64,
     pub external_failure_count: i64,
-}
-
-#[derive(Debug, Error)]
-pub enum ProxyError {
-    #[error("invalid upstream endpoint '{endpoint}': {source}")]
-    InvalidEndpoint {
-        endpoint: String,
-        #[source]
-        source: url::ParseError,
-    },
-    #[error("no API keys available in the store")]
-    NoAvailableKeys,
-    /// Every forward-proxy egress candidate for a provider that cannot use the
-    /// synthetic direct egress is unavailable (exiled, disabled, or unweighted).
-    ///
-    /// Distinct from [`ProxyError::Http`] on purpose: this failure happens
-    /// BEFORE any upstream socket is opened, so it must never be recorded as an
-    /// upstream transport error (the 2026-10-22 Brave audit showed 340 such
-    /// rows that were really proxy-pool exile) and must never be replayed on
-    /// another key - the key was never the problem.
-    #[error(
-        "no forward-proxy egress available for {provider}: {configured_nodes} configured node(s), none selectable"
-    )]
-    ForwardProxyEgressUnavailable {
-        provider: &'static str,
-        configured_nodes: usize,
-    },
-    #[error("pinned MCP session key is unavailable")]
-    PinnedMcpSessionUnavailable,
-    #[error("database error: {0}")]
-    Database(#[from] sqlx::Error),
-    #[error("http error: {0}")]
-    Http(reqwest::Error),
-    #[error("missing usage data: {reason}")]
-    QuotaDataMissing { reason: String },
-    #[error("usage http error {status}: {body}")]
-    UsageHttp {
-        status: reqwest::StatusCode,
-        body: String,
-    },
-    #[error("cannot remove the final admin login method")]
-    LastAdminLoginMethod,
-    #[error("scheduled job {job_id} claim generation {claim_generation} is stale")]
-    StaleClaim { job_id: i64, claim_generation: i64 },
-    #[error("deferred {operation}: {reason}")]
-    Deferred {
-        operation: &'static str,
-        reason: String,
-    },
-    #[error("other error: {0}")]
-    Other(String),
-}
-
-impl ProxyError {
-    pub fn is_stale_claim(&self) -> bool {
-        matches!(self, Self::StaleClaim { .. })
-    }
-
-    pub fn is_deferred(&self) -> bool {
-        matches!(self, Self::Deferred { .. })
-    }
 }
 
 pub async fn audit_business_quota_ledger(
