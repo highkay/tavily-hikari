@@ -1873,7 +1873,7 @@ if __name__ == "__main__":
 
         proxy
             .send_with_forward_proxy_plan(
-                "subject",
+                crate::providers::ProviderId::Tavily,
                 None,
                 "request",
                 vec![stale_candidate],
@@ -2520,7 +2520,7 @@ if __name__ == "__main__":
         }
 
         let err = proxy
-            .send_with_forward_proxy_plan("subject", None, "request", vec![candidate], |client| {
+            .send_with_forward_proxy_plan(crate::providers::ProviderId::Tavily, None, "request", vec![candidate], |client| {
                 client.get("http://127.0.0.1:9/")
             })
             .await
@@ -2595,7 +2595,7 @@ if __name__ == "__main__":
         let send_task = tokio::spawn(async move {
             proxy_for_task
                 .send_with_forward_proxy_plan(
-                    "subject",
+                    crate::providers::ProviderId::Tavily,
                     None,
                     "request",
                     vec![candidate],

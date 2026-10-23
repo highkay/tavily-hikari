@@ -1210,6 +1210,9 @@ use super::*;
         token_id: String,
         db_str: String,
         db_path: PathBuf,
+        /// Live proxy behind the served router, so a test can reconfigure the
+        /// forward-proxy pool (and exile every node) between spawn and request.
+        proxy: TavilyProxy,
     }
 
     impl Drop for ProviderFacadeRetryHarness {
@@ -1330,7 +1333,7 @@ use super::*;
             .await
             .expect("create access token");
         let state = Arc::new(AppState {
-            proxy,
+            proxy: proxy.clone(),
             static_dir: None,
             forward_auth: ForwardAuthConfig::new(None, None, None, None),
             forward_auth_enabled: true,
@@ -1361,6 +1364,7 @@ use super::*;
             token_id: access_token.id,
             db_str,
             db_path,
+            proxy,
         }
     }
 
@@ -1376,6 +1380,9 @@ use super::*;
         /// `api_keys` health effect of this attempt. A transient failure or a
         /// request-shaped 4xx must leave it `none`: rotating is not marking.
         key_effect_code: String,
+        /// Operator-facing diagnosis. A transport row that never reached the
+        /// upstream must still name WHY, not fall back to a generic kind.
+        failure_kind: Option<String>,
     }
 
     async fn fetch_facade_retry_request_log_rows(
@@ -1384,7 +1391,7 @@ use super::*;
         let rows = sqlx::query(
             r#"
             SELECT provider, status_code, result_status, fallback_reason, api_key_id,
-                   key_effect_code
+                   key_effect_code, failure_kind
             FROM observability.request_logs
             ORDER BY id ASC
             "#,
@@ -1402,6 +1409,7 @@ use super::*;
                     .unwrap(),
                 api_key_id: row.try_get::<Option<String>, _>("api_key_id").unwrap(),
                 key_effect_code: row.try_get::<String, _>("key_effect_code").unwrap(),
+                failure_kind: row.try_get::<Option<String>, _>("failure_kind").unwrap(),
             })
             .collect()
     }

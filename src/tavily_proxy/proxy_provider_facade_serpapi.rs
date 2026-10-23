@@ -395,7 +395,7 @@ impl TavilyProxy {
                 request_body: &redacted_request_body,
                 response_body: &redacted_empty,
                 outcome: OUTCOME_ERROR,
-                failure_kind: None,
+                failure_kind: failure_kind_from_proxy_error(err),
                 key_effect_code: KEY_EFFECT_NONE,
                 key_effect_summary: None,
                 binding_effect_code: KEY_EFFECT_NONE,

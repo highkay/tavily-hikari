@@ -229,7 +229,7 @@ impl TavilyProxy {
         let request_body = request.body.clone();
         let request_url = url.clone();
         let response = self
-            .send_with_forward_proxy(&lease.id, operation, |client| {
+            .send_with_forward_proxy(request.provider, &lease.id, operation, |client| {
                 let mut builder = client.request(request_method.clone(), request_url.clone());
                 for (name, value) in sanitized_headers.headers.iter() {
                     if name == HOST || name == CONTENT_LENGTH {
@@ -426,7 +426,7 @@ impl TavilyProxy {
                         request_body: &redacted_request_body,
                         response_body: &redacted_empty,
                         outcome: OUTCOME_ERROR,
-                        failure_kind: None,
+                        failure_kind: failure_kind_from_proxy_error(&err),
                         key_effect_code: KEY_EFFECT_NONE,
                         key_effect_summary: None,
                         binding_effect_code: KEY_EFFECT_NONE,

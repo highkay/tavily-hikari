@@ -26,6 +26,34 @@ impl ProviderFailureSignal {
     }
 }
 
+/// Typed transport-failure classification for an audit row that never got an
+/// upstream response.
+///
+/// The store's fallback (`classify_failure_kind`) reads the SAME diagnosis back
+/// out of the error's `Display` text, so a wording change there would silently
+/// downgrade every row to `transport_send_error` - exactly the misdiagnosis the
+/// 2026-10-22 Brave audit had to unwind by hand. Rows that already hold the
+/// typed error therefore stamp the kind themselves and let `Display` stay prose.
+///
+/// `None` keeps today's behavior for variants whose kind is genuinely decided
+/// by status/body rather than by the error alone.
+///
+/// The `Http` arm is deliberately narrow: only a failure that never got a
+/// response (connect / request-send) is transport evidence. A body or decode
+/// error carries a different diagnosis and must keep falling through to the
+/// classifier instead of being relabelled as a send failure.
+pub(crate) fn failure_kind_from_proxy_error(err: &ProxyError) -> Option<&'static str> {
+    match err {
+        ProxyError::ForwardProxyEgressUnavailable { .. } => {
+            Some(FAILURE_KIND_FORWARD_PROXY_EGRESS_UNAVAILABLE)
+        }
+        ProxyError::Http(source) if source.is_connect() || source.is_request() => {
+            Some(FAILURE_KIND_TRANSPORT_SEND_ERROR)
+        }
+        _ => None,
+    }
+}
+
 /// Key-migration signal for the bin-side MCP follow-up ladders (plan
 /// provider-key-429-retry todo 13).
 ///

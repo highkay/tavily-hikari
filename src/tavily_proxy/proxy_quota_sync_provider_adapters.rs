@@ -134,7 +134,7 @@ impl TavilyProxy {
         let request_url = url.clone();
         let send_result = self
             .send_with_forward_proxy_plan(
-                key_id,
+                providers::ProviderId::Serpapi,
                 Some(key_id),
                 "quota_sync",
                 plan,

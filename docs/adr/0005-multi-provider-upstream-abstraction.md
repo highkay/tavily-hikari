@@ -85,6 +85,22 @@ Tavily behavior. Substantive terms are recorded in `CONTEXT.md` under Multi-Prov
   then the only possible egress. An exhausted pool for a `ProxyRequired` provider fails before any
   upstream socket exists and records `forward_proxy_egress_unavailable`, never
   `transport_send_error`.
+- The registry stance describes the networks this fork is normally deployed behind, not a law. A
+  deployment whose network CAN reach a provider directly declares that with
+  `PROVIDER_EGRESS_OVERRIDES` (`provider=direct|proxy_required`, comma-separated). Unset keeps
+  every provider on its registry stance, so existing deployments are byte-identical; a malformed
+  entry warns and is ignored instead of aborting startup. The override is read once into the
+  proxy runtime, never per request.
+- The gate takes the provider as a PARAMETER rather than resolving it from the routing subject.
+  Every caller already holds one (`request.provider` in the facades, a literal in the Tavily-only
+  seams), and the previous `SELECT provider FROM api_keys WHERE id = ?` ran up to four times per
+  direct-candidate request while silently answering `Tavily` for a subject that was not an
+  `api_keys.id` at all - a fail-open default on the one field that decides whether a request may
+  leave through the blocked egress.
+- `failure_kind` is stamped from the typed `ProxyError` at the audit-row call site
+  (`failure_kind_from_proxy_error`) instead of being re-derived from the error's `Display` text.
+  The text classifier stays as the fallback for every other row, but a wording change can no
+  longer silently downgrade these diagnoses to `transport_send_error`.
 
 ## Consequences
 

@@ -886,6 +886,11 @@ pub struct TavilyProxy {
     pub(crate) upstream_origin: String,
     pub(crate) provider_upstreams: ProviderUpstreams,
     pub(crate) api_key_geo_origin: String,
+    /// Deployment-level `provider=direct|proxy_required` overrides of the
+    /// registry's egress stance. Empty means "every provider keeps its
+    /// registry stance", which is what every existing deployment gets.
+    pub(crate) provider_egress_overrides:
+        Arc<std::collections::HashMap<providers::ProviderId, providers::EgressPolicy>>,
     token_quota: TokenQuota,
     token_request_limit: TokenRequestLimit,
     user_business_calls_1h_window: UserBusinessCalls1hWindow,
@@ -1232,6 +1237,12 @@ fn default_forward_proxy_trace_url() -> Url {
         .unwrap_or_else(|| Url::parse(FORWARD_PROXY_TRACE_URL).expect("valid trace url"))
 }
 
+/// Deployment-wide egress overrides, `provider=direct|proxy_required`,
+/// comma-separated (e.g. `brave=direct`). Empty/unset keeps every provider on
+/// its registry stance, so this env var can only ever relax or tighten one
+/// provider explicitly named by the operator.
+const PROVIDER_EGRESS_OVERRIDES_ENV: &str = "PROVIDER_EGRESS_OVERRIDES";
+
 pub fn parse_low_quota_depletion_threshold(raw: Option<&str>, source: &str) -> i64 {
     let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
         return LOW_QUOTA_DEPLETION_THRESHOLD_DEFAULT;
@@ -1245,6 +1256,62 @@ pub fn parse_low_quota_depletion_threshold(raw: Option<&str>, source: &str) -> i
             LOW_QUOTA_DEPLETION_THRESHOLD_DEFAULT
         }
     }
+}
+
+/// Parse one `provider=policy` deployment override such as `brave=direct`.
+///
+/// The registry stance in [`crate::providers::spec_for`] is a statement about
+/// the networks Hikari is normally deployed behind, not a law: a deployment
+/// whose network CAN reach the provider directly must be able to say so.
+/// Missing/empty input means "no overrides"; an unparsable entry warns and is
+/// ignored rather than aborting startup, matching every other env tunable.
+pub(crate) fn parse_provider_egress_overrides(
+    raw: Option<&str>,
+    source: &str,
+) -> std::collections::HashMap<crate::providers::ProviderId, crate::providers::EgressPolicy> {
+    let mut overrides = std::collections::HashMap::new();
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return overrides;
+    };
+    for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let Some((provider_raw, policy_raw)) = entry.split_once('=') else {
+            eprintln!(
+                "warning: {source} entry '{entry}' must be provider=direct|proxy_required; ignoring it"
+            );
+            continue;
+        };
+        let provider = match crate::providers::ProviderId::from_sql_text(
+            provider_raw.trim().to_ascii_lowercase().as_str(),
+        ) {
+            Ok(provider) => provider,
+            Err(_) => {
+                eprintln!(
+                    "warning: {source} entry '{entry}' names an unknown provider; ignoring it"
+                );
+                continue;
+            }
+        };
+        let policy = match policy_raw.trim().to_ascii_lowercase().as_str() {
+            "direct" | "direct_allowed" => crate::providers::EgressPolicy::DirectAllowed,
+            "proxy_required" | "proxy" => crate::providers::EgressPolicy::ProxyRequired,
+            _ => {
+                eprintln!(
+                    "warning: {source} entry '{entry}' must be provider=direct|proxy_required; ignoring it"
+                );
+                continue;
+            }
+        };
+        overrides.insert(provider, policy);
+    }
+    overrides
+}
+
+fn provider_egress_overrides_from_env()
+-> std::collections::HashMap<crate::providers::ProviderId, crate::providers::EgressPolicy> {
+    parse_provider_egress_overrides(
+        std::env::var(PROVIDER_EGRESS_OVERRIDES_ENV).ok().as_deref(),
+        PROVIDER_EGRESS_OVERRIDES_ENV,
+    )
 }
 
 fn low_quota_depletion_threshold_from_env() -> i64 {

@@ -2619,7 +2619,7 @@ impl TavilyProxy {
             (Some(api_key_id), _, Some(remote_attempt)) => {
                 let plan = prepared_plan.unwrap_or_default();
                 self.send_with_forward_proxy_plan(
-                    api_key_id,
+                    providers::ProviderId::Tavily,
                     Some(api_key_id),
                     request_kind,
                     plan,
@@ -2638,7 +2638,11 @@ impl TavilyProxy {
                 .map(|(response, relay_lease)| (response, Some(relay_lease)))?
             }
             (Some(api_key_id), _, None) => self
-                .send_with_forward_proxy(api_key_id, request_kind, |client| {
+                .send_with_forward_proxy(
+                    providers::ProviderId::Tavily,
+                    api_key_id,
+                    request_kind,
+                    |client| {
                     let mut req = client
                         .get(request_url.clone())
                         .header("Authorization", format!("Bearer {}", secret_header));
@@ -2650,7 +2654,12 @@ impl TavilyProxy {
                 .await
                 .map(|(response, relay_lease)| (response, Some(relay_lease)))?,
             (None, Some((subject, proxy_affinity)), _) => self
-                .send_with_forward_proxy_affinity(subject, request_kind, proxy_affinity, |client| {
+                .send_with_forward_proxy_affinity(
+                    providers::ProviderId::Tavily,
+                    subject,
+                    request_kind,
+                    proxy_affinity,
+                    |client| {
                     let mut req = client
                         .get(request_url.clone())
                         .header("Authorization", format!("Bearer {}", secret_header));

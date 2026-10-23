@@ -229,7 +229,7 @@ impl TavilyProxy {
         let request_url = url.clone();
         let tavily_secret = lease.secret.clone();
         let response = self
-            .send_with_forward_proxy(&lease.id, "mcp", |client| {
+            .send_with_forward_proxy(providers::ProviderId::Tavily, &lease.id, "mcp", |client| {
                 let mut builder = client.request(request_method.clone(), request_url.clone());
                 for (name, value) in sanitized_headers.headers.iter() {
                     if name == HOST || name == CONTENT_LENGTH {
@@ -380,7 +380,7 @@ impl TavilyProxy {
                         request_body: &request.body,
                         response_body: &[],
                         outcome: OUTCOME_ERROR,
-                        failure_kind: None,
+                        failure_kind: failure_kind_from_proxy_error(&err),
                         key_effect_code: KEY_EFFECT_NONE,
                         key_effect_summary: None,
                         binding_effect_code: KEY_EFFECT_NONE,
@@ -496,6 +496,7 @@ impl TavilyProxy {
             let upstream_secret = attempt_lease.secret.clone();
             let response = self
                 .send_with_forward_proxy(
+                    providers::ProviderId::Tavily,
                     &attempt_key_id,
                     upstream_path.trim_start_matches('/'),
                     |client| {
@@ -791,7 +792,7 @@ impl TavilyProxy {
                             request_body: &redacted_request_body,
                             response_body: &redacted_empty,
                             outcome: OUTCOME_ERROR,
-                            failure_kind: None,
+                            failure_kind: failure_kind_from_proxy_error(&err),
                             key_effect_code: KEY_EFFECT_NONE,
                             key_effect_summary: None,
                             binding_effect_code: KEY_EFFECT_NONE,
@@ -1080,7 +1081,11 @@ impl TavilyProxy {
         let request_url = url.clone();
         let upstream_secret = lease.secret.clone();
         let response = self
-            .send_with_forward_proxy(&lease.id, upstream_path.trim_start_matches('/'), |client| {
+            .send_with_forward_proxy(
+                providers::ProviderId::Tavily,
+                &lease.id,
+                upstream_path.trim_start_matches('/'),
+                |client| {
                 let mut builder = client.request(request_method.clone(), request_url.clone());
                 for (name, value) in sanitized_headers.headers.iter() {
                     if name == HOST || name == CONTENT_LENGTH {
@@ -1327,7 +1332,7 @@ impl TavilyProxy {
         let request_url = url.clone();
         let upstream_secret = lease.secret.clone();
         let response = self
-            .send_with_forward_proxy(&lease.id, "research", |client| {
+            .send_with_forward_proxy(providers::ProviderId::Tavily, &lease.id, "research", |client| {
                 let mut builder = client.request(request_method.clone(), request_url.clone());
                 for (name, value) in sanitized_headers.headers.iter() {
                     if name == HOST || name == CONTENT_LENGTH {
@@ -1603,7 +1608,7 @@ impl TavilyProxy {
         let request_url = url.clone();
         let upstream_secret = lease.secret.clone();
         let response = self
-            .send_with_forward_proxy(&lease.id, "research", |client| {
+            .send_with_forward_proxy(providers::ProviderId::Tavily, &lease.id, "research", |client| {
                 let mut builder = client.request(request_method.clone(), request_url.clone());
                 for (name, value) in sanitized_headers.headers.iter() {
                     if name == HOST || name == CONTENT_LENGTH {
@@ -1792,7 +1797,7 @@ impl TavilyProxy {
                         request_body: &redacted_request_body,
                         response_body: &redacted_empty,
                         outcome: OUTCOME_ERROR,
-                        failure_kind: None,
+                        failure_kind: failure_kind_from_proxy_error(&err),
                         key_effect_code: KEY_EFFECT_NONE,
                         key_effect_summary: None,
                         binding_effect_code: KEY_EFFECT_NONE,
@@ -1865,7 +1870,7 @@ impl TavilyProxy {
         let request_url = url.clone();
         let upstream_secret = lease.secret.clone();
         let response = self
-            .send_with_forward_proxy(&lease.id, "research_result", |client| {
+            .send_with_forward_proxy(providers::ProviderId::Tavily, &lease.id, "research_result", |client| {
                 let mut builder = client.request(request_method.clone(), request_url.clone());
                 for (name, value) in sanitized_headers.headers.iter() {
                     if name == HOST || name == CONTENT_LENGTH {
@@ -2041,7 +2046,7 @@ impl TavilyProxy {
                         request_body: &redacted_request_body,
                         response_body: &redacted_empty,
                         outcome: OUTCOME_ERROR,
-                        failure_kind: None,
+                        failure_kind: failure_kind_from_proxy_error(&err),
                         key_effect_code: KEY_EFFECT_NONE,
                         key_effect_summary: None,
                         binding_effect_code: KEY_EFFECT_NONE,

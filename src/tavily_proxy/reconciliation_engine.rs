@@ -1029,7 +1029,7 @@ impl TavilyProxy {
             Some(remaining) => {
                 let request_lease = remote_attempt.as_ref();
                 let outbound = self.send_with_forward_proxy_plan(
-                    key_id,
+                    providers::ProviderId::Tavily,
                     Some(key_id),
                     "period_reconciliation",
                     plan,
@@ -1069,7 +1069,7 @@ impl TavilyProxy {
             None => {
                 let request_lease = remote_attempt.as_ref();
                 self.send_with_forward_proxy_plan(
-                    key_id,
+                    providers::ProviderId::Tavily,
                     Some(key_id),
                     "period_reconciliation",
                     plan,
@@ -1222,7 +1222,7 @@ impl TavilyProxy {
             Some(remaining) => {
                 let request_lease = remote_attempt.as_ref();
                 let outbound = self.send_with_forward_proxy_plan(
-                    key_id,
+                    providers::ProviderId::Tavily,
                     Some(key_id),
                     "period_reconciliation",
                     plan,
@@ -1260,7 +1260,7 @@ impl TavilyProxy {
             None => {
                 let request_lease = remote_attempt.as_ref();
                 self.send_with_forward_proxy_plan(
-                    key_id,
+                    providers::ProviderId::Tavily,
                     Some(key_id),
                     "period_reconciliation",
                     plan,

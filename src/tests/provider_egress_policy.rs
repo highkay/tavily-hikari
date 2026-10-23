@@ -67,8 +67,10 @@ async fn apply_proxy_settings(proxy: &TavilyProxy, proxy_urls: Vec<String>) {
         .apply_settings(proxy_settings(proxy_urls));
 }
 
+/// A CLOSED loopback port: the plan/dial paths must stay inside this machine.
+/// A public address here would make the suite depend on the internet.
 fn configured_proxy() -> Vec<String> {
-    vec!["http://18.183.246.69:8080".to_string()]
+    vec!["http://127.0.0.1:9".to_string()]
 }
 
 #[tokio::test]
@@ -87,25 +89,43 @@ async fn provider_egress_policy_gates_brave_and_preserves_direct_fallbacks() {
     // with a direct-only plan; it is exactly the state the gate must veto.
     apply_proxy_settings(&proxy, configured_proxy()).await;
 
+    // The plan builder is provider-agnostic on purpose: it lists egress
+    // candidates for a KEY, and only the send choke point knows the provider.
+    // Two branches must hold, and the first one is what makes the strip safe:
+    // a plan that still carries __direct__ must send the proxy candidate only,
+    // and its failure must stay the proxy's own transport error.
     let brave_plan = proxy
         .build_proxy_attempt_plan(&brave_id)
         .await
         .expect("build brave plan");
+    let plan_err = proxy
+        .send_with_forward_proxy_plan(
+            ProviderId::Brave,
+            Some(&brave_id),
+            "web",
+            brave_plan,
+            |client| client.get("http://127.0.0.1:9/"),
+        )
+        .await
+        .expect_err("a dead proxy candidate must still fail the request");
     assert!(
-        brave_plan
-            .iter()
-            .all(|candidate| candidate.key != forward_proxy::FORWARD_PROXY_DIRECT_KEY),
-        "a proxy-required provider must never plan __direct__ while a proxy is configured: {:?}",
-        brave_plan
-            .iter()
-            .map(|c| c.key.as_str())
-            .collect::<Vec<_>>()
+        matches!(plan_err, ProxyError::Http(_)),
+        "a proxy that was actually dialled reports its own transport error, got {plan_err:?}"
+    );
+    assert_eq!(
+        direct_attempt_count(&proxy).await,
+        0,
+        "a proxy-required provider must never record a direct attempt while a proxy is configured"
     );
 
     let err = proxy
-        .send_with_forward_proxy_plan(&brave_id, Some(&brave_id), "web", Vec::new(), |client| {
-            client.get("http://127.0.0.1:9/")
-        })
+        .send_with_forward_proxy_plan(
+            ProviderId::Brave,
+            Some(&brave_id),
+            "web",
+            Vec::new(),
+            |client| client.get("http://127.0.0.1:9/"),
+        )
         .await
         .expect_err("an empty proxy plan must not silently become a direct Brave attempt");
     assert_eq!(
@@ -127,9 +147,13 @@ async fn provider_egress_policy_gates_brave_and_preserves_direct_fallbacks() {
     );
     apply_proxy_settings(&proxy, configured_proxy()).await;
     let stale_err = proxy
-        .send_with_forward_proxy_plan(&brave_id, Some(&brave_id), "web", stale_plan, |client| {
-            client.get("http://127.0.0.1:9/")
-        })
+        .send_with_forward_proxy_plan(
+            ProviderId::Brave,
+            Some(&brave_id),
+            "web",
+            stale_plan,
+            |client| client.get("http://127.0.0.1:9/"),
+        )
         .await
         .expect_err("the stale direct candidate must be stripped before send");
     assert!(
@@ -145,22 +169,18 @@ async fn provider_egress_policy_gates_brave_and_preserves_direct_fallbacks() {
         crate::providers::spec_for(ProviderId::Tavily).egress,
         EgressPolicy::DirectAllowed
     );
+    let (brave_direct, brave_nodes) = proxy.direct_egress_decision(ProviderId::Brave).await;
     assert!(
-        !proxy
-            .direct_egress_permitted_for_subject(&brave_id)
-            .await
-            .expect("brave permission")
+        !brave_direct,
+        "brave must not use the direct egress while a proxy is configured"
     );
-    assert!(
-        proxy
-            .direct_egress_permitted_for_subject(&tavily_id)
-            .await
-            .expect("tavily permission")
-    );
+    assert_eq!(brave_nodes, 1);
+    let (tavily_direct, _) = proxy.direct_egress_decision(ProviderId::Tavily).await;
+    assert!(tavily_direct, "tavily keeps its historical direct fallback");
 
     let tavily_outcome = proxy
         .send_with_forward_proxy_plan(
-            &tavily_id,
+            ProviderId::Tavily,
             Some(&tavily_id),
             "search",
             Vec::new(),
@@ -193,9 +213,13 @@ async fn provider_egress_policy_gates_brave_and_preserves_direct_fallbacks() {
         "proxy-less deployments must keep the direct egress for every provider"
     );
     let brave_proxy_less = proxy
-        .send_with_forward_proxy_plan(&brave_id, Some(&brave_id), "web", Vec::new(), |client| {
-            client.get("http://127.0.0.1:9/")
-        })
+        .send_with_forward_proxy_plan(
+            ProviderId::Brave,
+            Some(&brave_id),
+            "web",
+            Vec::new(),
+            |client| client.get("http://127.0.0.1:9/"),
+        )
         .await;
     if let Err(err) = &brave_proxy_less {
         assert!(
@@ -210,4 +234,90 @@ async fn provider_egress_policy_gates_brave_and_preserves_direct_fallbacks() {
     );
 
     let _ = std::fs::remove_file(db_path);
+}
+
+#[test]
+fn provider_egress_override_parses_only_named_entries_and_keeps_the_registry_default() {
+    // The registry stance is a statement about the networks Hikari is normally
+    // deployed behind. A deployment whose network CAN reach the provider must be
+    // able to say so without patching code, and a typo must degrade to the
+    // registry default instead of silently disabling the guard.
+    let parsed = parse_provider_egress_overrides(Some(" brave=direct "), "TEST");
+    assert_eq!(
+        parsed.get(&ProviderId::Brave),
+        Some(&EgressPolicy::DirectAllowed),
+        "an explicit deployment override must beat the registry stance"
+    );
+
+    assert!(
+        parse_provider_egress_overrides(None, "TEST").is_empty(),
+        "unset means every provider keeps its registry stance"
+    );
+    assert!(
+        parse_provider_egress_overrides(Some("   "), "TEST").is_empty(),
+        "blank input is unset, not an error"
+    );
+
+    // Unparsable entries are ignored one by one; valid siblings still apply.
+    let mixed = parse_provider_egress_overrides(
+        Some("brave=proxy_required,not-a-provider=direct,tavily=banana,tavily=direct"),
+        "TEST",
+    );
+    assert_eq!(
+        mixed.get(&ProviderId::Brave),
+        Some(&EgressPolicy::ProxyRequired)
+    );
+    assert_eq!(
+        mixed.get(&ProviderId::Tavily),
+        Some(&EgressPolicy::DirectAllowed),
+        "a later valid entry must survive an earlier invalid one for the same provider"
+    );
+    assert_eq!(
+        mixed.len(),
+        2,
+        "unknown providers and bad policies are dropped: {mixed:?}"
+    );
+}
+
+#[test]
+fn transport_failure_kinds_come_from_the_error_type_not_its_wording() {
+    // The store derives failure_kind from the error's Display text as a
+    // fallback. Rows that still hold the typed error must not depend on that
+    // prose: reword the Display and the diagnosis has to stay identical.
+    assert_eq!(
+        failure_kind_from_proxy_error(&ProxyError::ForwardProxyEgressUnavailable {
+            provider: "brave",
+            configured_nodes: 2,
+        }),
+        Some("forward_proxy_egress_unavailable")
+    );
+
+    // A REAL connect failure: an address that can never be dialled. This is
+    // the shape every transport row in the audit had, so it is what the mapping
+    // must recognise - without depending on the error's wording.
+    let connect_err = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(async {
+            reqwest::Client::new()
+                .get("http://127.0.0.1:9/")
+                .send()
+                .await
+                .expect_err("closed port must fail")
+        });
+    assert!(connect_err.is_connect(), "precondition: {connect_err:?}");
+    assert_eq!(
+        failure_kind_from_proxy_error(&ProxyError::Http(connect_err)),
+        Some("transport_send_error")
+    );
+
+    // A non-transport variant keeps falling through to the store classifier:
+    // stamping it here would freeze a diagnosis the classifier derives from
+    // status and body instead.
+    assert_eq!(
+        failure_kind_from_proxy_error(&ProxyError::NoAvailableKeys),
+        None,
+        "variants whose kind is decided by status or body must keep the fallback"
+    );
 }

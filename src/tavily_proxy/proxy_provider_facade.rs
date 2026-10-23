@@ -232,6 +232,7 @@ impl TavilyProxy {
             let request_url = url.clone();
             let response = self
                 .send_with_forward_proxy(
+                    request.provider,
                     &attempt_key_id,
                     request.upstream_operation,
                     |client| {

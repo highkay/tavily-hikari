@@ -109,7 +109,7 @@ impl TavilyProxy {
         let request_url = url.clone();
         let upstream_operation = request.upstream_operation;
         let response = self
-            .send_with_forward_proxy(&lease.id, upstream_operation, |client| {
+            .send_with_forward_proxy(request.provider, &lease.id, upstream_operation, |client| {
                 let mut builder = client.request(Method::GET, request_url.clone());
                 for (name, value) in sanitized_headers.headers.iter() {
                     if name == HOST || name == CONTENT_LENGTH {

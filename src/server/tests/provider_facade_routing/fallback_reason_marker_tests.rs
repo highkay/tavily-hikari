@@ -497,3 +497,90 @@
         assert_eq!(token_logs[0].http_status, Some(432));
         pool.close().await;
     }
+
+    #[tokio::test]
+    async fn brave_facade_with_every_proxy_node_exiled_returns_502_and_names_the_egress_gap() {
+        // 2026-10-22 Brave audit, operator-facing contract: when the LAN cannot
+        // reach the provider directly and every forward-proxy node is exiled,
+        // the request must (a) never be rerouted to the blocked direct egress,
+        // (b) surface as 502, and (c) leave a row whose failure_kind NAMES the
+        // proxy gap. Before the egress policy, this same state produced a
+        // transport_send_error row that read as a network fault.
+        let harness = spawn_provider_facade_retry_harness_with_pool(
+            "provider-facade-egress-brave-all-nodes-exiled",
+            FacadeRetryMockPlan::rotating_after_rejection(
+                "/res/v1/web/search",
+                200,
+                None,
+                "{}",
+            ),
+            FacadeRetryPoolKeys::single_brave_key(),
+        )
+        .await;
+
+        let proxy_url = "http://127.0.0.1:9".to_string();
+        harness
+            .proxy
+            .update_forward_proxy_settings(
+                ForwardProxySettings {
+                    proxy_urls: vec![proxy_url.clone()],
+                    subscription_urls: Vec::new(),
+                    subscription_update_interval_secs: 3600,
+                    // No direct candidate may even be planned: that is the
+                    // deployment shape the policy exists for.
+                    insert_direct: false,
+                    egress_socks5_enabled: false,
+                    egress_socks5_url: String::new(),
+                },
+                true,
+            )
+            .await
+            .expect("configure the forward-proxy pool");
+        harness
+            .proxy
+            .set_forward_proxy_nodes_disabled(vec![proxy_url], true)
+            .await
+            .expect("exile the only proxy node");
+
+        let resp = Client::new()
+            .get(format!(
+                "http://{}/api/brave/res/v1/web/search?q=rust",
+                harness.addr
+            ))
+            .header("x-subscription-token", harness.token.clone())
+            .send()
+            .await
+            .expect("brave request");
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_GATEWAY,
+            "an exhausted proxy pool is a gateway failure, not a client error"
+        );
+        let seen = facade_retry_seen(&harness);
+        assert!(
+            seen.is_empty(),
+            "nothing may reach the upstream while every proxy node is exiled: {seen:?}"
+        );
+
+        let pool = connect_sqlite_test_pool(&harness.db_str).await;
+        let rows = fetch_facade_retry_request_log_rows(&pool).await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "the refused attempt still keeps exactly one audit row: {rows:?}"
+        );
+        assert_eq!(rows[0].provider.as_deref(), Some("brave"));
+        assert_eq!(rows[0].result_status, "error");
+        assert_eq!(
+            rows[0].failure_kind.as_deref(),
+            Some("forward_proxy_egress_unavailable"),
+            "the row must name the proxy gap instead of a transport fault: {rows:?}"
+        );
+        assert!(
+            rows[0].status_code.is_none(),
+            "nothing was sent, so there is no upstream status: {rows:?}"
+        );
+        assert_eq!(rows[0].key_effect_code, "none");
+        pool.close().await;
+    }
