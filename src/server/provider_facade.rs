@@ -740,6 +740,7 @@ async fn provider_rest_facade(
             let status = match err {
                 ProxyError::Http(_)
                 | ProxyError::NoAvailableKeys
+                | ProxyError::ForwardProxyEgressUnavailable { .. }
                 | ProxyError::PinnedMcpSessionUnavailable
                 | ProxyError::QuotaDataMissing { .. }
                 | ProxyError::UsageHttp { .. } => StatusCode::BAD_GATEWAY,

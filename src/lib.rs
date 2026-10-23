@@ -1672,6 +1672,11 @@ const FAILURE_KIND_UPSTREAM_RATE_LIMITED_429: &str = "upstream_rate_limited_429"
 const FAILURE_KIND_UPSTREAM_UNKNOWN_403: &str = "upstream_unknown_403";
 const FAILURE_KIND_UPSTREAM_ACCOUNT_DEACTIVATED_401: &str = "upstream_account_deactivated_401";
 const FAILURE_KIND_TRANSPORT_SEND_ERROR: &str = "transport_send_error";
+/// Every forward-proxy node for a direct-egress-incapable provider was
+/// unavailable, so the request was never sent. Distinct from
+/// `transport_send_error` so an exiled proxy pool cannot masquerade as a
+/// network failure (2026-10-22 Brave audit).
+const FAILURE_KIND_FORWARD_PROXY_EGRESS_UNAVAILABLE: &str = "forward_proxy_egress_unavailable";
 const FAILURE_KIND_MCP_ACCEPT_406: &str = "mcp_accept_406";
 const FAILURE_KIND_MCP_METHOD_405: &str = "mcp_method_405";
 const FAILURE_KIND_MCP_PATH_404: &str = "mcp_path_404";

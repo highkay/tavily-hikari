@@ -41,12 +41,38 @@ pub enum RecoveryPolicy {
     RateLimitResetWindow,
 }
 
+/// Whether a provider's upstream can be reached through the synthetic
+/// `__direct__` egress at all.
+///
+/// The forward-proxy plan uses this stance to decide whether `__direct__` may
+/// be a candidate and whether the post-plan direct fallback may run. Tavily,
+/// SerpApi, and Exa are reachable directly from the deployment networks Hikari
+/// runs on, so they keep the historical direct fallback byte-for-byte. Brave's
+/// REST host is DNS-poisoned and TCP-blocked from the GFW-side networks this
+/// fork is deployed on, so a direct Brave attempt can only ever fail as a
+/// transport error while hiding the real cause (every proxy node exiled).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EgressPolicy {
+    /// `__direct__` is a legitimate last-resort candidate (historical behavior).
+    DirectAllowed,
+    /// Never plan `__direct__` and never fall back to it while at least one
+    /// forward-proxy endpoint is configured. With no proxy configured at all,
+    /// direct remains the only possible egress and is still used (proxy-less
+    /// deployments must keep working).
+    ProxyRequired,
+}
+
 /// Metadata-only description of one provider (ADR 0005).
 ///
 /// Recording a value here never rewires an existing flow: the Tavily entry
 /// mirrors constants the live request path already hardcodes, and the new
 /// providers bind to it in later todos (classification, header policy, config,
 /// routing).
+///
+/// `egress` is the one field that is deliberately CONSUMED by a live seam: the
+/// forward-proxy plan builder and its direct fallback read it through
+/// [`crate::providers::spec_for`]. The Tavily entry stays `DirectAllowed`, so
+/// the Tavily request path remains byte-stable.
 ///
 /// Intentionally no `PartialEq`/`Eq` derive: the `credits` field is a function
 /// pointer, and comparing function pointers is unreliable across codegen units
@@ -63,6 +89,7 @@ pub struct ProviderSpec {
     pub credits: fn(op: &str) -> u32,
     pub supports_quota_sync: bool,
     pub recovery: RecoveryPolicy,
+    pub egress: EgressPolicy,
 }
 
 /// DOCUMENTED CHOICE: plan todo 2 leaves Tavily's credit table unspecified
@@ -120,6 +147,7 @@ pub const TAVILY: ProviderSpec = ProviderSpec {
     credits: tavily_credits,
     supports_quota_sync: true,
     recovery: RecoveryPolicy::UtcMonth,
+    egress: EgressPolicy::DirectAllowed,
 };
 
 /// SerpApi — hosted MCP passthrough with Bearer injection (ADR 0005).
@@ -136,6 +164,7 @@ pub const SERPAPI: ProviderSpec = ProviderSpec {
     credits: serpapi_credits,
     supports_quota_sync: true,
     recovery: RecoveryPolicy::RenewalDate,
+    egress: EgressPolicy::DirectAllowed,
 };
 
 /// Exa — local MCP facade only; hosted passthrough deferred (ADR 0005).
@@ -151,6 +180,7 @@ pub const EXA: ProviderSpec = ProviderSpec {
     // No live remaining-balance API exists — local counting only.
     supports_quota_sync: false,
     recovery: RecoveryPolicy::SuccessOnly,
+    egress: EgressPolicy::DirectAllowed,
 };
 
 /// Brave — local MCP facade (Brave hosts no MCP server, ADR 0005).
@@ -169,4 +199,7 @@ pub const BRAVE: ProviderSpec = ProviderSpec {
     // response — zero extra requests.
     supports_quota_sync: true,
     recovery: RecoveryPolicy::RateLimitResetWindow,
+    // Brave is GFW-blocked on the deployment LAN: direct attempts always die
+    // as transport errors while masking proxy-node exile (2026-10-22 audit).
+    egress: EgressPolicy::ProxyRequired,
 };

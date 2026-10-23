@@ -59,6 +59,9 @@ fn http_json_retry_backoff_scope(
 /// `NotRetryableOutcome` and the existing error path unchanged.
 fn key_retry_transport_evidence(err: &ProxyError) -> KeyRetryAttemptEvidence {
     let ProxyError::Http(source) = err else {
+        // `ForwardProxyEgressUnavailable` is deliberately NOT transport
+        // evidence: nothing was sent, so rotating keys cannot help and the
+        // retry ladder must not burn another key's attempt on it.
         return KeyRetryAttemptEvidence::none();
     };
     let kind = if source.is_timeout() {

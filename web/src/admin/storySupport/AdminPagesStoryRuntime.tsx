@@ -3105,6 +3105,10 @@ function requestFailureGuidance(kind: string | null | undefined, language: 'en' 
       return language === 'zh'
         ? '这是链路发送失败，建议检查 DNS、TLS、代理和网络连通性。'
         : 'This is a transport send failure. Check DNS, TLS, proxy settings, and network connectivity.'
+    case 'forward_proxy_egress_unavailable':
+      return language === 'zh'
+        ? '该上游只能用代理出口，但所有代理节点当前都不可用；请求没有发出，也没有消耗上游额度。'
+        : 'This provider can only egress through a forward proxy, and every proxy node is unavailable. Nothing was sent and no upstream quota was consumed.'
     case 'mcp_accept_406':
       return language === 'zh'
         ? '客户端需要同时接受 application/json 和 text/event-stream。'

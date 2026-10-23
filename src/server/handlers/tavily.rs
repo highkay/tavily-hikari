@@ -672,6 +672,7 @@ async fn tavily_http_research_result(
             let status = match err {
                 ProxyError::Http(_)
                 | ProxyError::NoAvailableKeys
+                | ProxyError::ForwardProxyEgressUnavailable { .. }
                 | ProxyError::PinnedMcpSessionUnavailable => StatusCode::BAD_GATEWAY,
                 ProxyError::Database(_)
                 | ProxyError::InvalidEndpoint { .. }
@@ -1278,6 +1279,7 @@ async fn proxy_tavily_http_endpoint(
                 let status = match err {
                     ProxyError::Http(_)
                     | ProxyError::NoAvailableKeys
+                    | ProxyError::ForwardProxyEgressUnavailable { .. }
                     | ProxyError::PinnedMcpSessionUnavailable
                     | ProxyError::QuotaDataMissing { .. }
                     | ProxyError::UsageHttp { .. } => StatusCode::BAD_GATEWAY,
@@ -1550,6 +1552,7 @@ async fn proxy_tavily_http_endpoint(
             let status = match err {
                 ProxyError::Http(_)
                 | ProxyError::NoAvailableKeys
+                | ProxyError::ForwardProxyEgressUnavailable { .. }
                 | ProxyError::PinnedMcpSessionUnavailable => StatusCode::BAD_GATEWAY,
                 ProxyError::Database(_)
                 | ProxyError::InvalidEndpoint { .. }

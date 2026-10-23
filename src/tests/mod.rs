@@ -39,6 +39,7 @@ mod maintenance_queue_performance;
 mod observability_and_lifecycle;
 mod observability_sidecar_provider;
 mod provider_config_bootstrap;
+mod provider_egress_policy;
 mod provider_failure_classification;
 mod provider_health_matrix;
 mod provider_pool_scoping;

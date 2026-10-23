@@ -1,8 +1,8 @@
 use std::str::FromStr;
 
 use crate::providers::{
-    BRAVE, EXA, KeyAuthInjection, McpMode, ProviderId, RecoveryPolicy, SERPAPI, TAVILY,
-    UnknownProviderId,
+    BRAVE, EXA, EgressPolicy, KeyAuthInjection, McpMode, ProviderId, RecoveryPolicy, SERPAPI,
+    TAVILY, UnknownProviderId,
 };
 
 /// Display, the SQLTEXT helper `as_str`, and FromStr must agree on one stable
@@ -161,4 +161,32 @@ fn brave_spec_defaults_and_credits() {
     assert_eq!((BRAVE.credits)("news"), 1);
     assert_eq!((BRAVE.credits)("llm_context"), 2);
     assert_eq!((BRAVE.credits)("images"), 0);
+}
+
+/// The egress stance is the ONE registry field consumed by a live seam: the
+/// forward-proxy plan builder and its direct fallback. Pin it so a provider
+/// cannot silently regain the doomed direct attempt that produced 340
+/// `transport_send_error` rows during the 2026-10-22 Brave audit (Brave direct
+/// egress is GFW-blocked; only proxy egress works).
+#[test]
+fn brave_requires_proxy_egress_while_other_providers_allow_direct() {
+    assert_eq!(BRAVE.egress, EgressPolicy::ProxyRequired);
+    assert_eq!(TAVILY.egress, EgressPolicy::DirectAllowed);
+    assert_eq!(SERPAPI.egress, EgressPolicy::DirectAllowed);
+    assert_eq!(EXA.egress, EgressPolicy::DirectAllowed);
+}
+
+/// Negative arm: the registry lookup is the only stance source, so a provider
+/// id must never resolve to a proxy-required policy without an explicit entry.
+#[test]
+fn spec_for_returns_the_registry_stance_for_every_provider() {
+    for (id, expected) in [
+        (ProviderId::Tavily, EgressPolicy::DirectAllowed),
+        (ProviderId::Serpapi, EgressPolicy::DirectAllowed),
+        (ProviderId::Exa, EgressPolicy::DirectAllowed),
+        (ProviderId::Brave, EgressPolicy::ProxyRequired),
+    ] {
+        assert_eq!(crate::providers::spec_for(id).egress, expected);
+        assert_eq!(crate::providers::spec_for(id).id, id);
+    }
 }

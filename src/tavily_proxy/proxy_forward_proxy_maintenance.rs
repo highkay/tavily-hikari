@@ -1597,6 +1597,17 @@ impl TavilyProxy {
         })
     }
 
+    /// Build the ordered egress candidate plan for one key.
+    ///
+    /// `allow_direct_fallback` is the CALLER's structural permission (explicit
+    /// empty affinity markers may plan direct). The provider's
+    /// [`providers::EgressPolicy`] narrows it further at the end of the build:
+    /// a `ProxyRequired` provider never plans `__direct__` while at least one
+    /// forward-proxy endpoint is configured, because that attempt could only
+    /// ever fail as a transport error and would hide the real cause (every
+    /// proxy node exiled). The narrowing is evaluated ONLY when the assembled
+    /// plan actually contains a direct candidate, so the normal proxy-served
+    /// path pays no extra store read.
     pub(crate) async fn build_proxy_attempt_plan_for_record(
         &self,
         subject: &str,
@@ -1654,6 +1665,13 @@ impl TavilyProxy {
                 ));
             }
         }
+        if plan
+            .iter()
+            .any(|candidate| candidate.key == forward_proxy::FORWARD_PROXY_DIRECT_KEY)
+            && !self.direct_egress_permitted_for_subject(subject).await?
+        {
+            plan.retain(|candidate| candidate.key != forward_proxy::FORWARD_PROXY_DIRECT_KEY);
+        }
         Ok(plan)
     }
 
@@ -1670,6 +1688,30 @@ impl TavilyProxy {
         let record = self.resolve_proxy_affinity_record(api_key_id, true).await?;
         self.build_proxy_attempt_plan_for_record(api_key_id, &record, false)
             .await
+    }
+
+    /// Whether this subject's provider may use the synthetic `__direct__`
+    /// egress at all.
+    ///
+    /// Two inputs decide it: the provider registry's [`providers::EgressPolicy`]
+    /// and whether ANY forward-proxy endpoint is configured. A
+    /// `ProxyRequired` provider still falls back to direct when the deployment
+    /// has no proxies at all - otherwise a proxy-less install would lose that
+    /// provider entirely, and direct is then the only possible egress.
+    pub(crate) async fn direct_egress_permitted_for_subject(
+        &self,
+        subject: &str,
+    ) -> Result<bool, ProxyError> {
+        let provider = self
+            .key_store
+            .fetch_api_key_provider_by_id(subject)
+            .await?
+            .unwrap_or(providers::ProviderId::Tavily);
+        if providers::spec_for(provider).egress == providers::EgressPolicy::DirectAllowed {
+            return Ok(true);
+        }
+        let manager = self.forward_proxy.lock().await;
+        Ok(manager.endpoints.iter().all(|endpoint| endpoint.is_direct()))
     }
 
     pub(crate) async fn record_forward_proxy_attempt(
@@ -1741,7 +1783,7 @@ impl TavilyProxy {
 
     pub(crate) async fn send_with_forward_proxy_plan<F>(
         &self,
-        _subject: &str,
+        subject: &str,
         affinity_owner_key_id: Option<&str>,
         request_kind: &str,
         plan: Vec<forward_proxy::SelectedForwardProxy>,
@@ -1752,6 +1794,19 @@ impl TavilyProxy {
     {
         let result = async {
             let mut last_error: Option<ProxyError> = None;
+            // A plan built while no proxy was configured can still carry the
+            // direct candidate after proxies appear. Strip it at this ONE choke
+            // point so a `ProxyRequired` provider can never send direct, even
+            // when the caller supplied a stale plan. The store read happens only
+            // when a direct candidate is actually present.
+            let mut plan = plan;
+            if plan
+                .iter()
+                .any(|candidate| candidate.key == forward_proxy::FORWARD_PROXY_DIRECT_KEY)
+                && !self.direct_egress_permitted_for_subject(subject).await?
+            {
+                plan.retain(|candidate| candidate.key != forward_proxy::FORWARD_PROXY_DIRECT_KEY);
+            }
             // The synthetic `__direct__` candidate and the post-loop direct
             // fallback send through the SAME direct client, so running both
             // replays one logical upstream attempt twice BELOW the caller's
@@ -1875,6 +1930,37 @@ impl TavilyProxy {
                 return Err(last_error.unwrap_or_else(|| {
                     ProxyError::Other("direct forward-proxy attempt failed".to_string())
                 }));
+            }
+            // PROVIDER EGRESS GATE: a `ProxyRequired` provider must never reach
+            // the synthetic direct egress while forward proxies are configured
+            // (a proxy-less deployment has no alternative, so direct stays).
+            // Without this, an exiled proxy pool turns into doomed direct
+            // attempts that log as `transport_send_error` and mask the real
+            // cause (2026-10-22 Brave audit: 340 such rows, 0 proxy attempts).
+            let configured_nodes = {
+                let manager = self.forward_proxy.lock().await;
+                manager
+                    .endpoints
+                    .iter()
+                    .filter(|endpoint| !endpoint.is_direct())
+                    .count()
+            };
+            if configured_nodes > 0 && !self.direct_egress_permitted_for_subject(subject).await? {
+                let provider = self
+                    .key_store
+                    .fetch_api_key_provider_by_id(subject)
+                    .await?
+                    .unwrap_or(providers::ProviderId::Tavily);
+                // If a proxy candidate was already tried and failed, its
+                // transport error is the accurate cause; the gate only forbids
+                // the direct retry after it.
+                return Err(match last_error {
+                    Some(err) => err,
+                    None => ProxyError::ForwardProxyEgressUnavailable {
+                        provider: provider.as_str(),
+                        configured_nodes,
+                    },
+                });
             }
             let direct = {
             let manager = self.forward_proxy.lock().await;

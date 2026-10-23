@@ -163,6 +163,10 @@ export function failureKindGuidance(
       return language === 'zh'
         ? '这是链路发送失败，建议检查 DNS、TLS、代理链路和上游可达性。'
         : 'This request failed before getting an upstream response. Check DNS, TLS, proxy routing, and upstream reachability.'
+    case 'forward_proxy_egress_unavailable':
+      return language === 'zh'
+        ? '该上游只能用代理出口，但所有代理节点当前都不可用；请求没有发出，也没有消耗上游额度。请检查代理节点健康状态并重新探测。'
+        : 'This provider can only egress through a forward proxy, and every proxy node is unavailable. The request was never sent and consumed no upstream quota; restore or re-probe the proxy nodes.'
     case 'mcp_accept_406':
       return language === 'zh'
         ? '客户端需要同时接受 application/json 与 text/event-stream，请修正 Accept 请求头。'

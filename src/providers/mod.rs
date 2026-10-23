@@ -13,7 +13,8 @@ mod tests;
 
 pub use id::{ProviderId, UnknownProviderId};
 pub use spec::{
-    BRAVE, EXA, KeyAuthInjection, McpMode, ProviderSpec, RecoveryPolicy, SERPAPI, TAVILY,
+    BRAVE, EXA, EgressPolicy, KeyAuthInjection, McpMode, ProviderSpec, RecoveryPolicy, SERPAPI,
+    TAVILY,
 };
 
 /// Exhaustive registry lookup (plan todo 11): the ONE path from a runtime

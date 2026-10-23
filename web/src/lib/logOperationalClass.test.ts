@@ -80,6 +80,8 @@ describe('log operational class helpers', () => {
     expect(failureKindGuidance('upstream_rate_limited_429', 'en')).toContain('rate limiting')
     expect(failureKindGuidance('upstream_account_deactivated_401', 'zh')).toContain('账户停用')
     expect(failureKindGuidance('upstream_gateway_5xx', 'en')).toContain('gateway')
+    expect(failureKindGuidance('forward_proxy_egress_unavailable', 'en')).toContain('forward proxy')
+    expect(failureKindGuidance('forward_proxy_egress_unavailable', 'zh')).toContain('代理节点')
     expect(operationalClassTone('quota_exhausted')).toBe('warning')
   })
 

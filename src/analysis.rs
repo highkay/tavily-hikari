@@ -246,6 +246,15 @@ pub(crate) fn classify_failure_kind(
     let normalized = combined.to_ascii_lowercase();
     let effective_status = tavily_status.or(http_status);
 
+    // An exhausted forward-proxy pool for a provider that cannot use the direct
+    // egress fails before any upstream socket exists. It is not a transport
+    // error: the fix is restoring/re-probing proxy nodes, not DNS/TLS triage.
+    // Checked FIRST so a message that also mentions transport wording keeps the
+    // precise egress diagnosis.
+    if normalized.contains("no forward-proxy egress available") {
+        return Some(FAILURE_KIND_FORWARD_PROXY_EGRESS_UNAVAILABLE.to_string());
+    }
+
     if normalized.contains("error sending request for url")
         || normalized.contains("dns error")
         || normalized.contains("connection refused")
@@ -371,6 +380,11 @@ pub fn failure_kind_solution_guidance(kind: &str, prefer_zh: bool) -> Option<&'s
         } else {
             "Suggested handling: this request failed before getting an upstream response. Check DNS, TLS, proxy routing, and upstream reachability."
         }),
+        FAILURE_KIND_FORWARD_PROXY_EGRESS_UNAVAILABLE => Some(if prefer_zh {
+            "建议：该上游只能用代理出口，但所有代理节点当前都不可用；请求没有发出去，也没有消耗上游额度。请检查代理节点健康状态并重新探测。"
+        } else {
+            "Suggested handling: this provider can only egress through a forward proxy, and every proxy node is currently unavailable. The request was never sent and consumed no upstream quota; restore or re-probe the proxy nodes."
+        }),
         FAILURE_KIND_MCP_ACCEPT_406 => Some(if prefer_zh {
             "建议：客户端需要同时接受 application/json 与 text/event-stream，请修正 Accept 请求头。"
         } else {
@@ -387,6 +401,7 @@ pub fn should_append_solution_guidance(kind: &str) -> bool {
             | FAILURE_KIND_UPSTREAM_RATE_LIMITED_429
             | FAILURE_KIND_UPSTREAM_ACCOUNT_DEACTIVATED_401
             | FAILURE_KIND_TRANSPORT_SEND_ERROR
+            | FAILURE_KIND_FORWARD_PROXY_EGRESS_UNAVAILABLE
             | FAILURE_KIND_MCP_ACCEPT_406
     )
 }
@@ -2709,6 +2724,45 @@ pub(crate) fn redact_api_key_bytes(bytes: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 2026-10-22 Brave audit: an exiled proxy pool used to surface as
+    /// `transport_send_error` because the request was silently rerouted to the
+    /// blocked direct egress. The new error must keep its own kind so operators
+    /// triage proxy health instead of DNS/TLS.
+    #[test]
+    fn forward_proxy_egress_unavailable_is_not_classified_as_transport_error() {
+        let message =
+            "no forward-proxy egress available for brave: 2 configured node(s), none selectable";
+
+        assert_eq!(
+            classify_failure_kind(
+                "/api/brave/res/v1/web/search",
+                None,
+                None,
+                Some(message),
+                &[]
+            )
+            .as_deref(),
+            Some(FAILURE_KIND_FORWARD_PROXY_EGRESS_UNAVAILABLE)
+        );
+        // Even when the text also carries transport wording, the precise
+        // egress diagnosis wins.
+        assert_eq!(
+            classify_failure_kind(
+                "/api/brave/res/v1/web/search",
+                None,
+                None,
+                Some("no forward-proxy egress available for brave (error sending request for url)"),
+                &[]
+            )
+            .as_deref(),
+            Some(FAILURE_KIND_FORWARD_PROXY_EGRESS_UNAVAILABLE)
+        );
+        assert!(
+            should_append_solution_guidance(FAILURE_KIND_FORWARD_PROXY_EGRESS_UNAVAILABLE),
+            "operators need the proxy-restore guidance on this row"
+        );
+    }
 
     #[test]
     fn bare_403_is_classified_as_auth_block_without_quarantine_reason() {

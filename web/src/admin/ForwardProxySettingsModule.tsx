@@ -639,6 +639,7 @@ const ERROR_KIND_COLORS: Record<string, string> = {
   upstream_usage_limit_432: 'hsl(199 86% 56%)',
   upstream_gateway_5xx: 'hsl(0 84% 60%)',
   transport_send_error: 'hsl(172 66% 45%)',
+  forward_proxy_egress_unavailable: 'hsl(43 92% 56%)',
   unknown: 'hsl(var(--muted-foreground))',
 }
 

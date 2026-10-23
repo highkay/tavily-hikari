@@ -76,6 +76,15 @@ Tavily behavior. Substantive terms are recorded in `CONTEXT.md` under Multi-Prov
 - Sync quota from what each provider offers. SerpApi uses an active `/account` adapter inside the
   existing sync lanes. Brave uses a passive header harvest. Exa uses none, because no live balance
   read exists.
+- Declare each provider's direct-egress stance in the registry (`EgressPolicy`). Brave is
+  `ProxyRequired`: `api.search.brave.com` is DNS-poisoned and TCP-blocked on the GFW-side networks
+  this fork serves, so a direct attempt can only fail as a transport error while hiding the real
+  cause (every proxy node exiled). Tavily, SerpApi, and Exa stay `DirectAllowed`. The stance is
+  consumed by the forward-proxy plan builder and its post-plan direct fallback; it degrades to
+  `DirectAllowed` when the deployment has no forward proxy configured at all, because direct is
+  then the only possible egress. An exhausted pool for a `ProxyRequired` provider fails before any
+  upstream socket exists and records `forward_proxy_egress_unavailable`, never
+  `transport_send_error`.
 
 ## Consequences
 

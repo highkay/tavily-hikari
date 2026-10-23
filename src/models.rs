@@ -2193,6 +2193,21 @@ pub enum ProxyError {
     },
     #[error("no API keys available in the store")]
     NoAvailableKeys,
+    /// Every forward-proxy egress candidate for a provider that cannot use the
+    /// synthetic direct egress is unavailable (exiled, disabled, or unweighted).
+    ///
+    /// Distinct from [`ProxyError::Http`] on purpose: this failure happens
+    /// BEFORE any upstream socket is opened, so it must never be recorded as an
+    /// upstream transport error (the 2026-10-22 Brave audit showed 340 such
+    /// rows that were really proxy-pool exile) and must never be replayed on
+    /// another key - the key was never the problem.
+    #[error(
+        "no forward-proxy egress available for {provider}: {configured_nodes} configured node(s), none selectable"
+    )]
+    ForwardProxyEgressUnavailable {
+        provider: &'static str,
+        configured_nodes: usize,
+    },
     #[error("pinned MCP session key is unavailable")]
     PinnedMcpSessionUnavailable,
     #[error("database error: {0}")]
