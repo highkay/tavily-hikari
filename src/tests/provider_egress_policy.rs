@@ -237,49 +237,6 @@ async fn provider_egress_policy_gates_brave_and_preserves_direct_fallbacks() {
 }
 
 #[test]
-fn provider_egress_override_parses_only_named_entries_and_keeps_the_registry_default() {
-    // The registry stance is a statement about the networks Hikari is normally
-    // deployed behind. A deployment whose network CAN reach the provider must be
-    // able to say so without patching code, and a typo must degrade to the
-    // registry default instead of silently disabling the guard.
-    let parsed = parse_provider_egress_overrides(Some(" brave=direct "), "TEST");
-    assert_eq!(
-        parsed.get(&ProviderId::Brave),
-        Some(&EgressPolicy::DirectAllowed),
-        "an explicit deployment override must beat the registry stance"
-    );
-
-    assert!(
-        parse_provider_egress_overrides(None, "TEST").is_empty(),
-        "unset means every provider keeps its registry stance"
-    );
-    assert!(
-        parse_provider_egress_overrides(Some("   "), "TEST").is_empty(),
-        "blank input is unset, not an error"
-    );
-
-    // Unparsable entries are ignored one by one; valid siblings still apply.
-    let mixed = parse_provider_egress_overrides(
-        Some("brave=proxy_required,not-a-provider=direct,tavily=banana,tavily=direct"),
-        "TEST",
-    );
-    assert_eq!(
-        mixed.get(&ProviderId::Brave),
-        Some(&EgressPolicy::ProxyRequired)
-    );
-    assert_eq!(
-        mixed.get(&ProviderId::Tavily),
-        Some(&EgressPolicy::DirectAllowed),
-        "a later valid entry must survive an earlier invalid one for the same provider"
-    );
-    assert_eq!(
-        mixed.len(),
-        2,
-        "unknown providers and bad policies are dropped: {mixed:?}"
-    );
-}
-
-#[test]
 fn transport_failure_kinds_come_from_the_error_type_not_its_wording() {
     // The store derives failure_kind from the error's Display text as a
     // fallback. Rows that still hold the typed error must not depend on that

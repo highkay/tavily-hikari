@@ -674,7 +674,6 @@ impl TavilyProxy {
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| "https://api.country.is".to_string()),
-            provider_egress_overrides: Arc::new(provider_egress_overrides_from_env()),
             token_quota,
             token_request_limit,
             user_business_calls_1h_window,

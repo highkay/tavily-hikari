@@ -85,12 +85,13 @@ Tavily behavior. Substantive terms are recorded in `CONTEXT.md` under Multi-Prov
   then the only possible egress. An exhausted pool for a `ProxyRequired` provider fails before any
   upstream socket exists and records `forward_proxy_egress_unavailable`, never
   `transport_send_error`.
-- The registry stance describes the networks this fork is normally deployed behind, not a law. A
-  deployment whose network CAN reach a provider directly declares that with
-  `PROVIDER_EGRESS_OVERRIDES` (`provider=direct|proxy_required`, comma-separated). Unset keeps
-  every provider on its registry stance, so existing deployments are byte-identical; a malformed
-  entry warns and is ignored instead of aborting startup. The override is read once into the
-  proxy runtime, never per request.
+- The registry stance is the ONLY source of egress policy; there is no per-deployment override.
+  An override env var (`PROVIDER_EGRESS_OVERRIDES`) was built, tested, and then removed: nothing
+  set it, and it let one deployment switch off the exact guard the 2026-10-22 audit added. The
+  accepted cost is that a deployment which has forward proxies configured AND can also reach
+  `api.search.brave.com` directly still cannot use direct for Brave - it must drop the proxy
+  config entirely, which would then cost the providers that genuinely need the proxy. Change
+  `BRAVE.egress` in the registry if that deployment ever becomes real.
 - The gate takes the provider as a PARAMETER rather than resolving it from the routing subject.
   Every caller already holds one (`request.provider` in the facades, a literal in the Tavily-only
   seams), and the previous `SELECT provider FROM api_keys WHERE id = ?` ran up to four times per

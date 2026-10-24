@@ -1683,26 +1683,10 @@ impl TavilyProxy {
             .await
     }
 
-    /// The provider's effective egress stance, after the deployment override.
-    ///
-    /// The registry stance ([`providers::spec_for`]) describes the networks
-    /// Hikari is normally deployed behind; `PROVIDER_EGRESS_OVERRIDES` lets one
-    /// deployment state its own reachability without patching code. Unset means
-    /// every provider keeps its registry stance.
-    pub(crate) fn effective_egress_policy(
-        &self,
-        provider: providers::ProviderId,
-    ) -> providers::EgressPolicy {
-        self.provider_egress_overrides
-            .get(&provider)
-            .copied()
-            .unwrap_or(providers::spec_for(provider).egress)
-    }
-
     /// Whether this provider may use the synthetic `__direct__` egress at all,
     /// and how many forward-proxy nodes are configured.
     ///
-    /// Two inputs decide permission: the provider's effective
+    /// Two inputs decide permission: the provider's registry
     /// [`providers::EgressPolicy`] and whether ANY forward-proxy endpoint is
     /// configured. A `ProxyRequired` provider still falls back to direct when
     /// the deployment has no proxies at all - otherwise a proxy-less install
@@ -1729,7 +1713,7 @@ impl TavilyProxy {
                 .filter(|endpoint| !endpoint.is_direct())
                 .count()
         };
-        if self.effective_egress_policy(provider) == providers::EgressPolicy::DirectAllowed {
+        if providers::spec_for(provider).egress == providers::EgressPolicy::DirectAllowed {
             return (true, configured_nodes);
         }
         (configured_nodes == 0, configured_nodes)
