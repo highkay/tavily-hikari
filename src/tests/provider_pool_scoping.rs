@@ -66,6 +66,17 @@ async fn seed_provider_keys(store: &KeyStore, provider: ProviderId, keys: &[Stri
         .expect("seed provider keys");
 }
 
+/// Mirror the quota-sync write path: sync (or any other writer) setting
+/// `quota_remaining` must be honored by every key selection site.
+async fn set_quota_remaining(pool: &sqlx::SqlitePool, secret: &str, remaining: Option<i64>) {
+    sqlx::query("UPDATE api_keys SET quota_remaining = ? WHERE api_key = ?")
+        .bind(remaining)
+        .bind(secret)
+        .execute(pool)
+        .await
+        .expect("set quota_remaining");
+}
+
 /// QA happy path: a mixed pool leases ONLY the requested provider's keys.
 #[tokio::test]
 async fn acquire_leases_only_requested_provider_keys() {
@@ -1649,4 +1660,331 @@ async fn mcp_session_rebind_ignores_revoked_and_unknown_sessions() {
         "[task-12][guard] revoked row untouched (upstream_key_id={old_key}) and \
          psess-never-created inserted nothing; rows={rows}"
     );
+}
+
+/// Zombie-key regression (plan tavily-zombie-key-exclusion todo 1): an ACTIVE
+/// key whose synced `quota_remaining` is 0 must be excluded from EVERY
+/// selection path - the 3-tier acquire, the backoff-aware acquire (and its
+/// `acquire_active_key_excluding` fallback), the strict cross-key retry, the
+/// retry-eligibility precheck, and the MCP rebind candidate listing. The
+/// healthy sibling with a positive remaining keeps being leased.
+#[tokio::test]
+async fn zero_remaining_active_keys_are_never_selected_by_any_acquire_path() {
+    let db_path = temp_db_path("zombie-key-zero-remaining-unselectable");
+    let db_str = db_path.to_string_lossy().to_string();
+    let (backend_time, _clock) = BackendTime::manual(utc_ts("2026-03-15T12:00:00Z"));
+    let store = KeyStore::new_with_time(&db_str, backend_time)
+        .await
+        .expect("store");
+
+    seed_provider_keys(
+        &store,
+        ProviderId::Tavily,
+        &["tvly-zk-dead".to_string(), "tvly-zk-live".to_string()],
+    )
+    .await;
+    set_quota_remaining(&store.pool, "tvly-zk-dead", Some(0)).await;
+    set_quota_remaining(&store.pool, "tvly-zk-live", Some(500)).await;
+
+    let dead_id = key_id(&store.pool, "tvly-zk-dead").await;
+    let live_id = key_id(&store.pool, "tvly-zk-live").await;
+
+    // acquire_key_for_provider tier-1 never leases the zero-remaining key.
+    let lease = store
+        .acquire_key_for_provider(ProviderId::Tavily)
+        .await
+        .expect("acquire_key_for_provider leases the healthy key");
+    assert_eq!(lease.id, live_id);
+
+    // The backoff-aware acquire (QueryBuilder site) also skips it.
+    let lease = store
+        .acquire_key_avoiding_transient_backoff_excluding(
+            ProviderId::Tavily,
+            HTTP_GLOBAL_BACKOFF_SCOPE,
+            None,
+        )
+        .await
+        .expect("backoff-aware acquire leases the healthy key");
+    assert_eq!(lease.id, live_id);
+
+    // With the healthy key excluded the zombie is NOT a hidden fallback
+    // (exercises acquire_active_key_excluding via the excluded branch).
+    let err = store
+        .acquire_key_avoiding_transient_backoff_excluding(
+            ProviderId::Tavily,
+            HTTP_GLOBAL_BACKOFF_SCOPE,
+            Some(&live_id),
+        )
+        .await
+        .expect_err("only the zombie remains: no lease");
+    assert!(matches!(err, ProxyError::NoAvailableKeys));
+
+    // select_cross_key_retry_key via its public caller: excluding the zombie
+    // leases the healthy key; excluding the healthy key returns None instead
+    // of resurrecting the zombie.
+    let retry = store
+        .acquire_key_for_cross_key_retry(
+            ProviderId::Tavily,
+            None,
+            HTTP_GLOBAL_BACKOFF_SCOPE,
+            std::slice::from_ref(&dead_id),
+        )
+        .await
+        .expect("strict retry acquire");
+    assert_eq!(
+        retry.map(|lease| lease.id),
+        Some(live_id.clone()),
+        "retry skips the zero-remaining key and leases the healthy one"
+    );
+    let retry = store
+        .acquire_key_for_cross_key_retry(
+            ProviderId::Tavily,
+            None,
+            HTTP_GLOBAL_BACKOFF_SCOPE,
+            std::slice::from_ref(&live_id),
+        )
+        .await
+        .expect("strict retry acquire");
+    assert!(
+        retry.is_none(),
+        "zero-remaining key must never be a retry candidate"
+    );
+
+    // acquire_active_key_excluding agrees on both branches.
+    let lease = store
+        .acquire_active_key_excluding(ProviderId::Tavily, None)
+        .await
+        .expect("active acquire leases the healthy key");
+    assert_eq!(lease.id, live_id);
+    let err = store
+        .acquire_active_key_excluding(ProviderId::Tavily, Some(&live_id))
+        .await
+        .expect_err("excluding the healthy key leaves only the zombie");
+    assert!(matches!(err, ProxyError::NoAvailableKeys));
+
+    // has_available_active_key_excluding (retry eligibility precheck) agrees
+    // with the acquire paths.
+    assert!(
+        store
+            .has_available_active_key_excluding(ProviderId::Tavily, None)
+            .await
+            .expect("availability check")
+    );
+    assert!(
+        !store
+            .has_available_active_key_excluding(ProviderId::Tavily, Some(&live_id))
+            .await
+            .expect("availability check"),
+        "with the healthy key excluded only the zombie remains"
+    );
+
+    // MCP rebind candidates skip the zombie too.
+    let candidates = store
+        .list_mcp_session_candidate_key_ids(ProviderId::Tavily)
+        .await
+        .expect("mcp candidate listing");
+    assert_eq!(candidates, vec![live_id.clone()]);
+
+    std::eprintln!(
+        "[zombie][mixed-pool] dead={dead_id} excluded everywhere; live={live_id} leased on all paths"
+    );
+}
+
+/// Zombie-only pool: the zombie is still ACTIVE (not exhausted), so the
+/// tier-2/3 exhausted fallbacks stay empty and every path reports the pool
+/// as unusable instead of burning a guaranteed-432 request.
+#[tokio::test]
+async fn zero_remaining_only_pool_reports_unavailable_on_every_path() {
+    let db_path = temp_db_path("zombie-key-only-pool-unavailable");
+    let db_str = db_path.to_string_lossy().to_string();
+    let (backend_time, _clock) = BackendTime::manual(utc_ts("2026-03-15T12:00:00Z"));
+    let store = KeyStore::new_with_time(&db_str, backend_time)
+        .await
+        .expect("store");
+
+    seed_provider_keys(&store, ProviderId::Tavily, &["tvly-zk-only".to_string()]).await;
+    set_quota_remaining(&store.pool, "tvly-zk-only", Some(0)).await;
+
+    assert!(
+        !store
+            .has_available_active_key_excluding(ProviderId::Tavily, None)
+            .await
+            .expect("availability check"),
+        "a pool of zero-remaining keys only is not available"
+    );
+    let err = store
+        .acquire_key_for_provider(ProviderId::Tavily)
+        .await
+        .expect_err("zombie-only pool has no lease");
+    assert!(matches!(err, ProxyError::NoAvailableKeys));
+    let err = store
+        .acquire_active_key_excluding(ProviderId::Tavily, None)
+        .await
+        .expect_err("zombie-only pool has no active lease");
+    assert!(matches!(err, ProxyError::NoAvailableKeys));
+    assert!(
+        store
+            .list_mcp_session_candidate_key_ids(ProviderId::Tavily)
+            .await
+            .expect("mcp candidate listing")
+            .is_empty()
+    );
+    let retry = store
+        .acquire_key_for_cross_key_retry(ProviderId::Tavily, None, HTTP_GLOBAL_BACKOFF_SCOPE, &[])
+        .await
+        .expect("strict retry acquire");
+    assert!(retry.is_none(), "zombie-only pool yields no retry key");
+
+    std::eprintln!("[zombie][only-pool] every selection path reports empty");
+}
+
+/// NULL `quota_remaining` means never synced - or an unlimited provider month
+/// (Brave convention) - and MUST stay selectable.
+#[tokio::test]
+async fn null_quota_remaining_keys_stay_selectable() {
+    let db_path = temp_db_path("zombie-key-null-remaining-selectable");
+    let db_str = db_path.to_string_lossy().to_string();
+    let (backend_time, _clock) = BackendTime::manual(utc_ts("2026-03-15T12:00:00Z"));
+    let store = KeyStore::new_with_time(&db_str, backend_time)
+        .await
+        .expect("store");
+
+    seed_provider_keys(&store, ProviderId::Brave, &["brv-zk-null".to_string()]).await;
+    let remaining: Option<i64> =
+        sqlx::query_scalar("SELECT quota_remaining FROM api_keys WHERE api_key = ?")
+            .bind("brv-zk-null")
+            .fetch_one(&store.pool)
+            .await
+            .expect("quota_remaining lookup");
+    assert_eq!(remaining, None, "freshly synced keys start unsynced (NULL)");
+
+    let lease = store
+        .acquire_key_for_provider(ProviderId::Brave)
+        .await
+        .expect("NULL-remaining key stays selectable");
+    assert_eq!(lease.secret, "brv-zk-null");
+    assert!(
+        store
+            .has_available_active_key_excluding(ProviderId::Brave, None)
+            .await
+            .expect("availability check")
+    );
+
+    std::eprintln!(
+        "[zombie][null-passes] NULL remaining leased id={}",
+        lease.id
+    );
+}
+
+/// No sticky state: once a later sync raises `quota_remaining` above 0 the
+/// key becomes selectable again without any status-machine involvement.
+#[tokio::test]
+async fn zero_remaining_key_becomes_selectable_again_after_positive_sync() {
+    let db_path = temp_db_path("zombie-key-positive-sync-recovers");
+    let db_str = db_path.to_string_lossy().to_string();
+    let (backend_time, _clock) = BackendTime::manual(utc_ts("2026-03-15T12:00:00Z"));
+    let store = KeyStore::new_with_time(&db_str, backend_time)
+        .await
+        .expect("store");
+
+    seed_provider_keys(&store, ProviderId::Tavily, &["tvly-zk-heal".to_string()]).await;
+    set_quota_remaining(&store.pool, "tvly-zk-heal", Some(0)).await;
+
+    let err = store
+        .acquire_key_for_provider(ProviderId::Tavily)
+        .await
+        .expect_err("zero remaining: no lease");
+    assert!(matches!(err, ProxyError::NoAvailableKeys));
+
+    set_quota_remaining(&store.pool, "tvly-zk-heal", Some(250)).await;
+    let lease = store
+        .acquire_key_for_provider(ProviderId::Tavily)
+        .await
+        .expect("positive remaining restores selectability");
+    assert_eq!(lease.secret, "tvly-zk-heal");
+
+    std::eprintln!(
+        "[zombie][heal] 0 -> 250 remaining re-enabled leasing id={}",
+        lease.id
+    );
+}
+
+/// Month-flip regression: `reset_monthly` at the UTC month start flips an
+/// exhausted key back to active and the depletion NOT EXISTS window resets
+/// with the new month_start - exactly the resurrection path that created the
+/// zombie fleet. A resurrected key whose `quota_remaining` is still 0 must
+/// STILL be unselectable on every path.
+#[tokio::test]
+async fn month_flip_resurrected_zero_remaining_key_stays_unselectable() {
+    let db_path = temp_db_path("zombie-key-month-flip-resurrection");
+    let db_str = db_path.to_string_lossy().to_string();
+    let (backend_time, clock) = BackendTime::manual(utc_ts("2026-03-15T12:00:00Z"));
+    let store = KeyStore::new_with_time(&db_str, backend_time)
+        .await
+        .expect("store");
+
+    seed_provider_keys(&store, ProviderId::Tavily, &["tvly-zk-flip".to_string()]).await;
+    set_quota_remaining(&store.pool, "tvly-zk-flip", Some(0)).await;
+    assert!(
+        store
+            .mark_quota_exhausted("tvly-zk-flip")
+            .await
+            .expect("seed exhausted")
+    );
+    assert_eq!(key_status(&store.pool, "tvly-zk-flip").await, "exhausted");
+
+    // Flip the UTC month: reset_monthly resurrects the key to active while
+    // the (empty) depletion window restarts for the new month.
+    clock.set_now_utc(utc_ts("2026-04-01T00:00:01Z"));
+    store
+        .reset_monthly(ProviderId::Tavily)
+        .await
+        .expect("month-flip reset");
+    assert_eq!(
+        key_status(&store.pool, "tvly-zk-flip").await,
+        "active",
+        "reset_monthly must have resurrected the key for this regression to matter"
+    );
+    let remaining: Option<i64> =
+        sqlx::query_scalar("SELECT quota_remaining FROM api_keys WHERE api_key = ?")
+            .bind("tvly-zk-flip")
+            .fetch_one(&store.pool)
+            .await
+            .expect("quota_remaining lookup");
+    assert_eq!(
+        remaining,
+        Some(0),
+        "the resurrection must not fake a balance"
+    );
+
+    // The resurrected zombie stays unselectable on every path.
+    let err = store
+        .acquire_key_for_provider(ProviderId::Tavily)
+        .await
+        .expect_err("resurrected zero-remaining key must not lease");
+    assert!(matches!(err, ProxyError::NoAvailableKeys));
+    assert!(
+        !store
+            .has_available_active_key_excluding(ProviderId::Tavily, None)
+            .await
+            .expect("availability check"),
+        "resurrected zero-remaining key must not count as available"
+    );
+    let retry = store
+        .acquire_key_for_cross_key_retry(ProviderId::Tavily, None, HTTP_GLOBAL_BACKOFF_SCOPE, &[])
+        .await
+        .expect("strict retry acquire");
+    assert!(
+        retry.is_none(),
+        "resurrected zero-remaining key must not be a retry candidate"
+    );
+    assert!(
+        store
+            .list_mcp_session_candidate_key_ids(ProviderId::Tavily)
+            .await
+            .expect("mcp candidate listing")
+            .is_empty()
+    );
+
+    std::eprintln!("[zombie][month-flip] resurrected active zombie stays unselectable");
 }

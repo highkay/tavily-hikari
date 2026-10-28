@@ -4,6 +4,16 @@ enum SpecificKeySelection {
     CooledDown,
 }
 
+/// Shared active-tier selection predicate (plan tavily-zombie-key-exclusion):
+/// a key whose synced `quota_remaining` is 0 is a zombie (quota sync writes 0
+/// without recording a depletion or changing status) and must never be
+/// selected again until a later sync raises the value. NULL always passes:
+/// it means never synced, or an unlimited provider month (Brave convention).
+/// Every active-tier selection SQL in this file embeds this exact fragment so
+/// the sites cannot drift.
+const ACTIVE_TIER_QUOTA_PREDICATE_SQL: &str =
+    " AND (api_keys.quota_remaining IS NULL OR api_keys.quota_remaining > 0)";
+
 impl KeyStore {
     fn admin_active_user_day_bucket_start(&self) -> i64 {
         let current_local_day_start = local_day_bucket_start_utc_ts(self.backend_time.now_ts());
@@ -454,12 +464,12 @@ impl KeyStore {
         let month_start = start_of_month(self.backend_time.now_utc()).timestamp();
         let provider = provider.as_str();
 
-        if let Some((id, api_key)) = sqlx::query_as::<_, (String, String)>(
+        if let Some((id, api_key)) = sqlx::query_as::<_, (String, String)>(&format!(
             r#"
             SELECT id, api_key
             FROM api_keys
             WHERE status = ? AND deleted_at IS NULL
-              AND provider = ?
+              AND provider = ?{ACTIVE_TIER_QUOTA_PREDICATE_SQL}
               AND NOT EXISTS (
                   SELECT 1
                   FROM api_key_low_quota_depletions d
@@ -473,7 +483,7 @@ impl KeyStore {
             ORDER BY last_used_at ASC, id ASC
             LIMIT 1
             "#,
-        )
+        ))
         .bind(STATUS_ACTIVE)
         .bind(provider)
         .bind(month_start)
@@ -591,6 +601,7 @@ impl KeyStore {
         builder.push_bind(STATUS_ACTIVE);
         builder.push(" AND deleted_at IS NULL AND provider = ");
         builder.push_bind(provider.as_str());
+        builder.push(ACTIVE_TIER_QUOTA_PREDICATE_SQL);
         if let Some(excluded_key_id) = excluded_key_id {
             builder.push(" AND id != ");
             builder.push_bind(excluded_key_id);
@@ -795,6 +806,7 @@ impl KeyStore {
         builder.push_bind(STATUS_ACTIVE);
         builder.push(" AND deleted_at IS NULL AND provider = ");
         builder.push_bind(provider.as_str());
+        builder.push(ACTIVE_TIER_QUOTA_PREDICATE_SQL);
         if let Some(key_id) = key_id {
             builder.push(" AND id = ");
             builder.push_bind(key_id);
@@ -865,12 +877,12 @@ impl KeyStore {
         let month_start = start_of_month(self.backend_time.now_utc()).timestamp();
         let provider = provider.as_str();
 
-        let active = sqlx::query_scalar::<_, String>(
+        let active = sqlx::query_scalar::<_, String>(&format!(
             r#"
             SELECT id
             FROM api_keys
             WHERE status = ? AND deleted_at IS NULL
-              AND provider = ?
+              AND provider = ?{ACTIVE_TIER_QUOTA_PREDICATE_SQL}
               AND NOT EXISTS (
                   SELECT 1
                   FROM api_key_low_quota_depletions d
@@ -883,7 +895,7 @@ impl KeyStore {
               )
             ORDER BY id ASC
             "#,
-        )
+        ))
         .bind(STATUS_ACTIVE)
         .bind(provider)
         .bind(month_start)
@@ -1205,12 +1217,12 @@ let lease_with_cooldown = if let Some(scope) = transient_backoff_scope {
         let provider = provider.as_str();
 
         let count: i64 = if let Some(excluded_key_id) = excluded_key_id {
-            sqlx::query_scalar(
+            sqlx::query_scalar(&format!(
                 r#"
                 SELECT COUNT(*)
                 FROM api_keys
                 WHERE id != ? AND status = ? AND deleted_at IS NULL
-                  AND provider = ?
+                  AND provider = ?{ACTIVE_TIER_QUOTA_PREDICATE_SQL}
                   AND NOT EXISTS (
                       SELECT 1
                       FROM api_key_low_quota_depletions d
@@ -1222,7 +1234,7 @@ let lease_with_cooldown = if let Some(scope) = transient_backoff_scope {
                       WHERE q.key_id = api_keys.id AND q.cleared_at IS NULL
                   )
                 "#,
-            )
+            ))
             .bind(excluded_key_id)
             .bind(STATUS_ACTIVE)
             .bind(provider)
@@ -1230,12 +1242,12 @@ let lease_with_cooldown = if let Some(scope) = transient_backoff_scope {
             .fetch_one(&self.pool)
             .await?
         } else {
-            sqlx::query_scalar(
+            sqlx::query_scalar(&format!(
                 r#"
                 SELECT COUNT(*)
                 FROM api_keys
                 WHERE status = ? AND deleted_at IS NULL
-                  AND provider = ?
+                  AND provider = ?{ACTIVE_TIER_QUOTA_PREDICATE_SQL}
                   AND NOT EXISTS (
                       SELECT 1
                       FROM api_key_low_quota_depletions d
@@ -1247,7 +1259,7 @@ let lease_with_cooldown = if let Some(scope) = transient_backoff_scope {
                       WHERE q.key_id = api_keys.id AND q.cleared_at IS NULL
                   )
                 "#,
-            )
+            ))
             .bind(STATUS_ACTIVE)
             .bind(provider)
             .bind(month_start)
@@ -1400,12 +1412,12 @@ let lease_with_cooldown = if let Some(scope) = transient_backoff_scope {
         let provider = provider.as_str();
 
         let active_candidate = if let Some(excluded_key_id) = excluded_key_id {
-            sqlx::query_as::<_, (String, String)>(
+            sqlx::query_as::<_, (String, String)>(&format!(
                 r#"
                 SELECT id, api_key
                 FROM api_keys
                 WHERE id != ? AND status = ? AND deleted_at IS NULL
-                  AND provider = ?
+                  AND provider = ?{ACTIVE_TIER_QUOTA_PREDICATE_SQL}
                   AND NOT EXISTS (
                       SELECT 1
                       FROM api_key_low_quota_depletions d
@@ -1419,7 +1431,7 @@ let lease_with_cooldown = if let Some(scope) = transient_backoff_scope {
                 ORDER BY last_used_at ASC, id ASC
                 LIMIT 1
                 "#,
-            )
+            ))
             .bind(excluded_key_id)
             .bind(STATUS_ACTIVE)
             .bind(provider)
@@ -1427,12 +1439,12 @@ let lease_with_cooldown = if let Some(scope) = transient_backoff_scope {
             .fetch_optional(&self.pool)
             .await?
         } else {
-            sqlx::query_as::<_, (String, String)>(
+            sqlx::query_as::<_, (String, String)>(&format!(
                 r#"
                 SELECT id, api_key
                 FROM api_keys
                 WHERE status = ? AND deleted_at IS NULL
-                  AND provider = ?
+                  AND provider = ?{ACTIVE_TIER_QUOTA_PREDICATE_SQL}
                   AND NOT EXISTS (
                       SELECT 1
                       FROM api_key_low_quota_depletions d
@@ -1446,7 +1458,7 @@ let lease_with_cooldown = if let Some(scope) = transient_backoff_scope {
                 ORDER BY last_used_at ASC, id ASC
                 LIMIT 1
             "#,
-            )
+            ))
             .bind(STATUS_ACTIVE)
             .bind(provider)
             .bind(month_start)
