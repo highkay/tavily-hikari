@@ -249,8 +249,16 @@ use super::upstream_support_and_manual_jobs::*;
     }
 
     #[tokio::test]
-    async fn api_keys_batch_registration_metadata_does_not_eagerly_prewarm_forward_proxy_geo_cache()
+    async fn api_keys_batch_registration_metadata_prewarms_forward_proxy_geo_cache_only_once()
     {
+        // Contract (docs/specs/forward-proxy-geo-negative-cache-refresh/SPEC.md):
+        // batch registration never runs an extra whole-pool GEO prewarm round inside
+        // the handler. The registration-aware affinity selection may lazily complete a
+        // never-cached node exactly once: the first batch persists a `negative`
+        // placeholder and every later batch inside the short cooldown must reuse it
+        // without re-tracing the pool. (The old assertion that the runtime row stays
+        // untouched only held because the bootstrap probe took freshly-added dead
+        // nodes out of rotation; 69b602d1 keeps them selectable after one failure.)
         let db_path = temp_db_path("keys-batch-registration-geo-warm");
         let db_str = db_path.to_string_lossy().to_string();
         let geo_addr = spawn_api_key_geo_mock_server().await;
@@ -323,10 +331,38 @@ use super::upstream_support_and_manual_jobs::*;
         .fetch_one(&pool)
         .await
         .expect("registration batch runtime row");
-        assert!(runtime_row.0.is_empty());
+        assert_eq!(runtime_row.0, "negative");
         assert_eq!(runtime_row.1, "[]");
         assert_eq!(runtime_row.2, "[]");
-        assert_eq!(runtime_row.3, 0);
+        assert!(
+            runtime_row.3 > 0,
+            "the first registration-aware selection must persist a dated negative placeholder"
+        );
+
+        let resp = client
+            .post(format!("http://{}/api/keys/batch", addr))
+            .header("x-forward-user", "admin")
+            .json(&serde_json::json!({
+                "items": [
+                    { "api_key": "tvly-batch-geo-c", "registration_ip": "9.9.9.9" }
+                ]
+            }))
+            .send()
+            .await
+            .expect("second registration batch succeeds");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        let second_row: (String, String, String, i64) = sqlx::query_as(
+            "SELECT resolved_ip_source, resolved_ips_json, resolved_regions_json, geo_refreshed_at FROM forward_proxy_runtime WHERE proxy_key = ?",
+        )
+        .bind("http://127.0.0.1:1")
+        .fetch_one(&pool)
+        .await
+        .expect("second registration batch runtime row");
+        assert_eq!(
+            second_row, runtime_row,
+            "a later batch inside the cooldown must reuse the persisted placeholder instead of prewarming the pool again"
+        );
 
         let _ = std::fs::remove_file(db_path);
     }
