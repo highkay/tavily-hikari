@@ -558,9 +558,23 @@ async fn sync_serpapi_key_quota(
         .and_then(|date| date.and_hms_opt(0, 0, 0))
         .map(|renewal| renewal.and_utc().timestamp());
     let synced_at = state.proxy.backend_time().now_ts();
+    let account_status = parsed["account_status"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    // Route through the same adapter the scheduled sync uses so a manual
+    // sync can also revive an exhausted key when the fresh snapshot proves
+    // remaining quota (before this, the manual path only wrote quota fields).
+    let snapshot = tavily_hikari::SerpapiAccountSnapshot {
+        quota_limit: limit,
+        quota_remaining: remaining,
+        quota_renews_at: renews_at,
+        quota_synced_at: synced_at,
+        account_status,
+    };
     state
         .proxy
-        .update_provider_key_quota(key_id, limit, remaining, renews_at, synced_at)
+        .record_serpapi_account_sync(key_id, &snapshot, "quota_sync/manual")
         .await
         .map_err(|err| {
             ManualQuotaSyncError::new(

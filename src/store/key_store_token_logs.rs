@@ -1475,6 +1475,8 @@ impl KeyStore {
                       AND provider = ?
                       AND quota_renews_at IS NOT NULL
                       AND quota_renews_at <= ?
+                      AND status_changed_at IS NOT NULL
+                      AND status_changed_at < quota_renews_at
                     "#,
                 )
                 .bind(STATUS_ACTIVE)
@@ -1523,6 +1525,26 @@ impl KeyStore {
         .bind(STATUS_ACTIVE)
         .bind(now)
         .bind(key)
+        .bind(STATUS_EXHAUSTED)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// By-id twin of `restore_active_status` for callers that hold the
+    /// public key id (nanoid) rather than the secret.
+    pub(crate) async fn restore_active_status_by_id(&self, key_id: &str) -> Result<bool, ProxyError> {
+        let now = self.backend_time.now_ts();
+        let res = sqlx::query(
+            r#"
+            UPDATE api_keys
+            SET status = ?, status_changed_at = ?
+            WHERE id = ? AND status = ? AND deleted_at IS NULL
+            "#,
+        )
+        .bind(STATUS_ACTIVE)
+        .bind(now)
+        .bind(key_id)
         .bind(STATUS_EXHAUSTED)
         .execute(&self.pool)
         .await?;

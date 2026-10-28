@@ -569,12 +569,14 @@ async fn serpapi_account_status_suspended_records_note_without_disabling() {
     );
 }
 
-/// Acceptance (plan L235/L238): renewal-driven recovery — once
-/// quota_renews_at passes, the EXISTING T9 reset_monthly(RenewalDate)
-/// policy flips exhausted -> active during the sync, and the flip writes
-/// the T18-parity auto_restore_active audit row (handoff #3).
+/// Acceptance (plan L235/L238): evidence-driven recovery — a fresh snapshot
+/// showing remaining quota on an Active account flips exhausted -> active
+/// during the sync even when the stored renewal date predates the
+/// exhaustion mark (the calendar arm alone would keep it down, 2026-10-28
+/// churn guard), and the flip writes the T18-parity auto_restore_active
+/// audit row (handoff #3).
 #[tokio::test]
-async fn serpapi_renewal_recovery_flips_exhausted_key_with_audit_row() {
+async fn serpapi_quota_recovery_flips_exhausted_key_with_audit_row() {
     let obs = Arc::new(EgressObservation::default());
     let mocks = spawn_adapter_mock_upstreams(
         obs.clone(),
@@ -616,7 +618,7 @@ async fn serpapi_renewal_recovery_flips_exhausted_key_with_audit_row() {
         .await
         .expect("renewal sync persists");
 
-    assert!(effects.renewed_to_active, "renewal date passed => flip");
+    assert!(effects.renewed_to_active, "usable snapshot => flip");
     let (status, _, remaining, _, renews_at) = fetch_key_row(&proxy.key_store.pool, &key_id).await;
     assert_eq!(status, "active");
     assert_eq!(remaining, Some(30_000));
@@ -626,9 +628,67 @@ async fn serpapi_renewal_recovery_flips_exhausted_key_with_audit_row() {
         .iter()
         .find(|row| row.0 == "auto_restore_active")
         .expect("auto_restore_active audit row exists");
-    assert_eq!(restore.1.as_deref(), Some("serpapi_renewal_recovery"));
+    assert_eq!(restore.1.as_deref(), Some("serpapi_quota_recovered"));
     assert_eq!(restore.3.as_deref(), Some("exhausted"));
     assert_eq!(restore.4.as_deref(), Some("active"));
+}
+
+/// Calendar renewal path: a key exhausted BEFORE its renewal date flips
+/// active once the date has passed, and the audit row keeps the
+/// serpapi_renewal_recovery reason code (distinguishing it from the
+/// evidence-driven `serpapi_quota_recovered` path).
+#[tokio::test]
+async fn serpapi_renewal_date_flip_uses_renewal_reason_code() {
+    let obs = Arc::new(EgressObservation::default());
+    let mocks = spawn_adapter_mock_upstreams(
+        obs.clone(),
+        account_payload("Active", 30_000, 30_000, "2026-03-10"),
+        0,
+    )
+    .await;
+    let (proxy, clock) = build_adapter_proxy(
+        "serpapi-renewal-calendar-flip",
+        &mocks,
+        utc_ts("2026-03-05T12:00:00Z"),
+    )
+    .await;
+    let secret = "serp-renewal-calendar";
+    proxy
+        .key_store
+        .sync_keys(ProviderId::Serpapi, &[secret.to_string()])
+        .await
+        .expect("seed serpapi key");
+    let key_id = key_id_for(&proxy.key_store.pool, secret).await;
+    assert!(
+        proxy
+            .key_store
+            .mark_quota_exhausted(secret)
+            .await
+            .expect("exhaust key"),
+        "key starts exhausted"
+    );
+
+    // Advance past the renewal date; the mark (03-05) predates it (03-10).
+    clock.set_now_utc(utc_ts("2026-03-15T12:00:00Z"));
+    let snapshot = SerpapiAccountSnapshot {
+        quota_limit: 30_000,
+        quota_remaining: 0,
+        quota_renews_at: Some(utc_ts("2026-03-10T00:00:00Z").timestamp()),
+        quota_synced_at: utc_ts("2026-03-15T12:00:00Z").timestamp(),
+        account_status: "Active".to_string(),
+    };
+    let effects = proxy
+        .record_serpapi_account_sync(&key_id, &snapshot, "quota_sync/serpapi")
+        .await
+        .expect("renewal sync persists");
+
+    assert!(effects.renewed_to_active, "passed renewal date => flip");
+    let rows = maintenance_rows(&proxy.key_store.pool, &key_id).await;
+    let restore = rows
+        .iter()
+        .find(|row| row.0 == "auto_restore_active")
+        .expect("auto_restore_active audit row exists");
+    assert_eq!(restore.1.as_deref(), Some("serpapi_renewal_recovery"));
 }
 
 /// Complement of the renewal flip: strictly BEFORE quota_renews_at the

@@ -216,6 +216,53 @@ async fn exhausted_provider_pool_yields_no_available_keys_while_tavily_succeeds(
     );
 }
 
+/// A SerpApi key exhausted AFTER its stored renewal date must stay
+/// exhausted on the RenewalDate sweep (churn guard, 2026-10-28): before the
+/// `status_changed_at < quota_renews_at` clause, such a key was revived on
+/// every acquire, immediately re-marked by the next 429 run-out body.
+#[tokio::test]
+async fn reset_monthly_skips_key_exhausted_after_renewal_date() {
+    let db_path = temp_db_path("provider-pool-reset-monthly-post-renewal");
+    let db_str = db_path.to_string_lossy().to_string();
+    let (backend_time, clock) = BackendTime::manual(utc_ts("2026-04-12T00:00:00Z"));
+    let store = KeyStore::new_with_time(&db_str, backend_time)
+        .await
+        .expect("store");
+
+    seed_provider_keys(
+        &store,
+        ProviderId::Serpapi,
+        &["srp-post-renewal".to_string()],
+    )
+    .await;
+
+    // Renewal date sits strictly BEFORE the exhaustion mark.
+    let renews_at = utc_ts("2026-04-10T00:00:00Z").timestamp();
+    sqlx::query("UPDATE api_keys SET quota_renews_at = ? WHERE api_key = ?")
+        .bind(renews_at)
+        .bind("srp-post-renewal")
+        .execute(&store.pool)
+        .await
+        .expect("seed quota_renews_at");
+    assert!(
+        store
+            .mark_quota_exhausted("srp-post-renewal")
+            .await
+            .expect("seed exhausted")
+    );
+
+    store
+        .reset_monthly(ProviderId::Serpapi)
+        .await
+        .expect("serpapi reset");
+    assert_eq!(
+        key_status(&store.pool, "srp-post-renewal").await,
+        "exhausted",
+        "a key exhausted after its stored renewal date must not revive"
+    );
+    let _ = clock;
+}
+
 /// C3 (M3, MANDATORY): with the injectable BackendTime clock, a UTC month flip
 /// recovers exhausted Tavily keys byte-identically and ONLY those - Exa keys
 /// never recover on any calendar flip, SerpApi keys recover only at/after

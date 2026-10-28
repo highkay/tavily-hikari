@@ -39,6 +39,9 @@ const MAINTENANCE_OP_SERPAPI_ACCOUNT_STATUS_NOTE: &str = "serpapi_account_status
 const SERPAPI_ACCOUNT_STATUS_ACTIVE: &str = "Active";
 const SERPAPI_ACCOUNT_NOTE_REASON_CODE: &str = "account_status_not_active";
 const SERPAPI_RENEWAL_RECOVERY_REASON_CODE: &str = "serpapi_renewal_recovery";
+/// Revival driven by a fresh quota snapshot (remaining > 0 on an Active
+/// account) rather than by the calendar renewal date.
+const SERPAPI_QUOTA_RECOVERED_REASON_CODE: &str = "serpapi_quota_recovered";
 
 /// Typed SerpApi `/account` snapshot (plan todo 19 field mapping).
 ///
@@ -196,6 +199,16 @@ impl TavilyProxy {
             snapshot.quota_synced_at,
         )
         .await?;
+        // Evidence-based revival: a fresh snapshot showing remaining quota on
+        // an Active account proves the key usable again even when no renewal
+        // date was ever learned (exhausted rows used to be invisible to the
+        // sync lanes, so their quota_renews_at stayed NULL forever).
+        let evidence_recovered = before.status.as_deref() == Some(STATUS_EXHAUSTED)
+            && snapshot.quota_remaining > 0
+            && snapshot.account_status == SERPAPI_ACCOUNT_STATUS_ACTIVE;
+        if evidence_recovered {
+            self.key_store.restore_active_status_by_id(key_id).await?;
+        }
         // Renewal-driven recovery: reuse the T9 policy sweep (RenewalDate)
         // so passing quota_renews_at flips exhausted -> active NOW instead
         // of waiting for the next acquire-path sweep. Never reimplemented.
@@ -215,14 +228,27 @@ impl TavilyProxy {
                     source: MAINTENANCE_SOURCE_SYSTEM.to_string(),
                     operation_code: MAINTENANCE_OP_AUTO_RESTORE_ACTIVE.to_string(),
                     operation_summary: "自动恢复为 active".to_string(),
-                    reason_code: Some(SERPAPI_RENEWAL_RECOVERY_REASON_CODE.to_string()),
-                    reason_summary: Some("SerpApi 计划续期，额度恢复".to_string()),
+                    reason_code: Some(
+                        if evidence_recovered {
+                            SERPAPI_QUOTA_RECOVERED_REASON_CODE.to_string()
+                        } else {
+                            SERPAPI_RENEWAL_RECOVERY_REASON_CODE.to_string()
+                        },
+                    ),
+                    reason_summary: Some(
+                        if evidence_recovered {
+                            "SerpApi 配额快照恢复".to_string()
+                        } else {
+                            "SerpApi 计划续期，额度恢复".to_string()
+                        },
+                    ),
                     reason_detail: Some(format!(
-                        "source={source} quota_renews_at={}",
+                        "source={source} quota_renews_at={} quota_remaining={}",
                         snapshot
                             .quota_renews_at
                             .map(|value| value.to_string())
-                            .unwrap_or_else(|| "none".to_string())
+                            .unwrap_or_else(|| "none".to_string()),
+                        snapshot.quota_remaining,
                     )),
                     request_log_id: None,
                     auth_token_log_id: None,
