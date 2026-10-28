@@ -15,17 +15,8 @@ use super::upstream_support_and_manual_jobs::*;
             .add_or_undelete_key_in_group("tvly-existing", Some("old"))
             .await
             .expect("existing key created in old group");
-        let options = SqliteConnectOptions::new()
-            .filename(&db_str)
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .busy_timeout(Duration::from_secs(5));
-        let pool = SqlitePoolOptions::new()
-            .min_connections(1)
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .expect("open db pool");
+        let pool = connect_sqlite_test_pool(&db_str).await;
+
         let forward_auth = ForwardAuthConfig::new(
             Some(HeaderName::from_static("x-forward-user")),
             Some("admin".to_string()),
@@ -110,17 +101,7 @@ use super::upstream_support_and_manual_jobs::*;
             Some(1)
         );
 
-        let options = SqliteConnectOptions::new()
-            .filename(&db_str)
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .busy_timeout(Duration::from_secs(5));
-        let pool = SqlitePoolOptions::new()
-            .min_connections(1)
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .expect("open db pool");
+        let pool = connect_sqlite_test_pool(&db_str).await;
 
         let first_row: (Option<String>, Option<String>) = sqlx::query_as(
             "SELECT registration_ip, registration_region FROM api_keys WHERE api_key = ?",
@@ -198,17 +179,7 @@ use super::upstream_support_and_manual_jobs::*;
 
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
-        let options = SqliteConnectOptions::new()
-            .filename(&db_str)
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .busy_timeout(Duration::from_secs(5));
-        let pool = SqlitePoolOptions::new()
-            .min_connections(1)
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .expect("open db pool");
+        let pool = connect_sqlite_test_pool(&db_str).await;
 
         let row: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
             r#"
@@ -312,17 +283,7 @@ use super::upstream_support_and_manual_jobs::*;
 
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
-        let options = SqliteConnectOptions::new()
-            .filename(&db_str)
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .busy_timeout(Duration::from_secs(5));
-        let pool = SqlitePoolOptions::new()
-            .min_connections(1)
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .expect("open db pool");
+        let pool = connect_sqlite_test_pool(&db_str).await;
 
         let runtime_row: (String, String, String, i64) = sqlx::query_as(
             "SELECT resolved_ip_source, resolved_ips_json, resolved_regions_json, geo_refreshed_at FROM forward_proxy_runtime WHERE proxy_key = ?",
@@ -421,17 +382,7 @@ colo=LAX
 
         run_forward_proxy_geo_refresh_job(state.clone()).await;
 
-        let options = SqliteConnectOptions::new()
-            .filename(&db_str)
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .busy_timeout(Duration::from_secs(5));
-        let pool = SqlitePoolOptions::new()
-            .min_connections(1)
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .expect("open db pool");
+        let pool = connect_sqlite_test_pool(&db_str).await;
 
         let job_row: (String, String, Option<String>) = sqlx::query_as(
             "SELECT job_type, status, message FROM scheduled_jobs ORDER BY id DESC LIMIT 1",
@@ -526,17 +477,7 @@ colo=LAX
 
         let handle = spawn_forward_proxy_geo_refresh_scheduler(state.clone());
 
-        let options = SqliteConnectOptions::new()
-            .filename(&db_str)
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .busy_timeout(Duration::from_secs(5));
-        let pool = SqlitePoolOptions::new()
-            .min_connections(1)
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .expect("open db pool");
+        let pool = connect_sqlite_test_pool(&db_str).await;
 
         let mut saw_job = false;
         for _ in 0..30 {
@@ -586,17 +527,7 @@ colo=LAX
             .await
             .expect("proxy settings updated");
 
-        let options = SqliteConnectOptions::new()
-            .filename(&db_str)
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .busy_timeout(Duration::from_secs(5));
-        let pool = SqlitePoolOptions::new()
-            .min_connections(1)
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .expect("open db pool");
+        let pool = connect_sqlite_test_pool(&db_str).await;
 
         sqlx::query(
             "UPDATE forward_proxy_runtime SET resolved_ip_source = 'trace', resolved_ips_json = '[\"127.0.0.1\"]', resolved_regions_json = '[]', geo_refreshed_at = ? WHERE proxy_key = ?",
@@ -719,17 +650,7 @@ colo=LAX
 
         let handle = spawn_forward_proxy_geo_refresh_scheduler(state.clone());
 
-        let options = SqliteConnectOptions::new()
-            .filename(&db_str)
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .busy_timeout(Duration::from_secs(5));
-        let pool = SqlitePoolOptions::new()
-            .min_connections(1)
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .expect("open db pool");
+        let pool = connect_sqlite_test_pool(&db_str).await;
 
         tokio::time::sleep(Duration::from_millis(200)).await;
         handle.abort();
@@ -803,17 +724,7 @@ colo=LAX
 
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
-        let options = SqliteConnectOptions::new()
-            .filename(&db_str)
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .busy_timeout(Duration::from_secs(5));
-        let pool = SqlitePoolOptions::new()
-            .min_connections(1)
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .expect("open db pool");
+        let pool = connect_sqlite_test_pool(&db_str).await;
 
         let affinity_row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
             r#"
@@ -876,17 +787,7 @@ colo=LAX
 
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
-        let options = SqliteConnectOptions::new()
-            .filename(&db_str)
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .busy_timeout(Duration::from_secs(5));
-        let pool = SqlitePoolOptions::new()
-            .min_connections(1)
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .expect("open db pool");
+        let pool = connect_sqlite_test_pool(&db_str).await;
 
         let affinity_row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
             r#"
@@ -931,17 +832,7 @@ colo=LAX
             .expect("existing key created");
         let geo_addr = spawn_api_key_geo_mock_server().await;
 
-        let options = SqliteConnectOptions::new()
-            .filename(&db_str)
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .busy_timeout(Duration::from_secs(5));
-        let pool = SqlitePoolOptions::new()
-            .min_connections(1)
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .expect("open db pool");
+        let pool = connect_sqlite_test_pool(&db_str).await;
 
         let forward_auth = ForwardAuthConfig::new(
             Some(HeaderName::from_static("x-forward-user")),
@@ -1400,6 +1291,7 @@ colo=LAX
             .await
             .expect("create user session");
         let pool = connect_sqlite_test_pool(&db_str).await;
+
         let now = Utc::now().timestamp();
         for offset in 0..55 {
             let billable = offset % 2 == 0;
@@ -2298,6 +2190,7 @@ colo=LAX
             .expect("create outsider session");
 
         let pool = connect_sqlite_test_pool(&db_str).await;
+
         sqlx::query(
             r#"
             INSERT INTO auth_token_logs (
@@ -2771,17 +2664,7 @@ colo=LAX
             .find_map(|(k, v)| (k == "state").then(|| v.into_owned()))
             .expect("state query param");
 
-        let options = SqliteConnectOptions::new()
-            .filename(&db_str)
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .busy_timeout(Duration::from_secs(5));
-        let pool = SqlitePoolOptions::new()
-            .min_connections(1)
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .expect("open db pool");
+        let pool = connect_sqlite_test_pool(&db_str).await;
 
         let (bind_token_id,): (Option<String>,) =
             sqlx::query_as("SELECT bind_token_id FROM oauth_login_states WHERE state = ? LIMIT 1")
@@ -2870,17 +2753,8 @@ colo=LAX
             .await
             .expect("create mistaken token");
 
-        let options = SqliteConnectOptions::new()
-            .filename(&db_str)
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .busy_timeout(Duration::from_secs(5));
-        let pool = SqlitePoolOptions::new()
-            .min_connections(1)
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .expect("open db pool");
+        let pool = connect_sqlite_test_pool(&db_str).await;
+
         sqlx::query(
             "UPDATE user_token_bindings SET token_id = ?, updated_at = ? WHERE user_id = ?",
         )
@@ -3111,17 +2985,8 @@ colo=LAX
             "expected oauth binding cookie to be cleared"
         );
 
-        let options = SqliteConnectOptions::new()
-            .filename(&db_str)
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .busy_timeout(Duration::from_secs(5));
-        let pool = SqlitePoolOptions::new()
-            .min_connections(1)
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .expect("open db pool");
+        let pool = connect_sqlite_test_pool(&db_str).await;
+
         let oauth_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oauth_accounts")
             .fetch_one(&pool)
             .await
