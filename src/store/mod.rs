@@ -22,8 +22,6 @@ mod sqlite_runtime;
 pub(crate) use immediate_transaction::{
     ImmediateSqliteTransaction, SavepointSqliteTransaction, SqliteTransaction,
 };
-#[cfg(test)]
-pub(crate) use sqlite_runtime::install_owned_finish_pause_for_test;
 pub(crate) use sqlite_runtime::{
     AdminAlertsReadSession, SqliteAdmissionDeferReason, SqliteImmediateTransaction,
     SqliteMaintenanceBulkPermit, SqliteMaintenancePreflightLease, SqliteOperation,
@@ -959,6 +957,16 @@ async fn resolve_observability_attach_plan(
         },
     )
     .await?;
+    if let Some(target_path) = target_path.as_deref() {
+        configure_observability_journal_mode(
+            target_path,
+            core_database_path,
+            read_only,
+            SQLITE_BUSY_TIMEOUT_DEFAULT,
+        )
+        .await
+        .map_err(ProxyError::Database)?;
+    }
     Ok(ObservabilityAttachPlan {
         target_path,
         max_connections: default_max_connections,
@@ -1010,6 +1018,17 @@ pub(crate) async fn open_sqlite_pool_forced_observability_with_busy_timeout(
                 Ok(())
             })
         });
+    }
+
+    if let Some(observability_database_path) = observability_database_path {
+        configure_observability_journal_mode(
+            observability_database_path,
+            core_database_path,
+            read_only,
+            busy_timeout,
+        )
+        .await
+        .map_err(ProxyError::Database)?;
     }
 
     let forced_context = sqlite_runtime_log_context(
@@ -2727,6 +2746,7 @@ pub(crate) struct KeyStore {
     pub(crate) request_log_diagnostic_handoff: Mutex<RequestLogDiagnosticHandoff>,
     pub(crate) user_debug_info_shared_cache: RwLock<HashMap<String, UserDebugInfoSharedCacheEntry>>,
     pub(crate) request_stats_coalescer: RequestStatsCoalescer,
+    pub(crate) reconciliation_maintenance_hint: Arc<UpstreamReconciliationMaintenanceHint>,
     pub(crate) admin_heavy_read_semaphore: Semaphore,
     #[cfg(test)]
     pub(crate) forced_pending_claim_miss_log_ids: Mutex<HashSet<i64>>,
@@ -2768,6 +2788,12 @@ async fn wait_for_request_stats_test_pause_if_installed(
 }
 
 impl KeyStore {
+    pub(crate) fn reconciliation_maintenance_hint(
+        &self,
+    ) -> Arc<UpstreamReconciliationMaintenanceHint> {
+        self.reconciliation_maintenance_hint.clone()
+    }
+
     #[cfg(debug_assertions)]
     #[allow(dead_code)]
     pub(crate) async fn install_dashboard_overview_read_pause(&self) -> RequestStatsPostFlushPause {
@@ -2849,6 +2875,7 @@ include!("key_store_dashboard_rollup_integrity.rs");
 include!("key_store_dashboard_and_job_read_models.rs");
 include!("key_store_request_stats_flush_and_public_metrics.rs");
 include!("key_store_request_logs_and_dashboard.rs");
+include!("key_store_dashboard_quota_recovery.rs");
 include!("key_store_request_logs_summary_windows.rs");
 include!("key_store_user_rankings.rs");
 include!("key_store_analysis_pressure.rs");

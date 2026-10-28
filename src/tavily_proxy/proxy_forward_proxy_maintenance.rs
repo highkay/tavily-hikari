@@ -1829,6 +1829,7 @@ impl TavilyProxy {
             // its outcome is the attempt's outcome and is returned unchanged.
             let mut direct_candidate_sent = false;
             for candidate in plan {
+                let attempt_started = Instant::now();
                 let mut candidate = candidate;
                 let mut attempted_recovery = false;
                 let relay_lease = loop {
@@ -1857,6 +1858,12 @@ impl TavilyProxy {
                     }
                 };
                 let Some(relay_lease) = relay_lease else {
+                    crate::observability::global_metrics().record_upstream(
+                        "forward_proxy",
+                        request_kind,
+                        Err(()),
+                        attempt_started.elapsed(),
+                    );
                     let _ = self
                         .record_forward_proxy_attempt(
                             &candidate.key,
@@ -1880,6 +1887,12 @@ impl TavilyProxy {
                     Ok(client) => client,
                     Err(err) => {
                         drop(relay_lease);
+                        crate::observability::global_metrics().record_upstream_failure(
+                            "forward_proxy",
+                            request_kind,
+                            crate::observability::outcome_for_proxy_error(&err) == "timeout",
+                            attempt_started.elapsed(),
+                        );
                         let error_code = map_forward_proxy_validation_error_code(&err);
                         let _ = self
                             .record_forward_proxy_attempt(
@@ -1895,13 +1908,21 @@ impl TavilyProxy {
                         continue;
                     }
                 };
-                let started = Instant::now();
+                let request_started = Instant::now();
                 if candidate.key == forward_proxy::FORWARD_PROXY_DIRECT_KEY {
                     direct_candidate_sent = true;
                 }
                 match build(client).send().await {
                     Ok(response) => {
-                        let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
+                        let elapsed = attempt_started.elapsed();
+                        let request_elapsed = request_started.elapsed();
+                        crate::observability::global_metrics().record_upstream(
+                            "forward_proxy",
+                            request_kind,
+                            Ok(response.status()),
+                            elapsed,
+                        );
+                        let latency_ms = request_elapsed.as_secs_f64() * 1000.0;
                         let _ = self
                             .record_forward_proxy_attempt(
                                 &candidate.key,
@@ -1921,6 +1942,12 @@ impl TavilyProxy {
                     }
                     Err(err) => {
                         drop(relay_lease);
+                        crate::observability::global_metrics().record_upstream_failure(
+                            "forward_proxy",
+                            request_kind,
+                            err.is_timeout(),
+                            attempt_started.elapsed(),
+                        );
                         let failure_kind = forward_proxy::failure_kind_from_http_error(&err);
                         let _ = self
                             .record_forward_proxy_attempt(
@@ -1981,16 +2008,23 @@ impl TavilyProxy {
                 }));
             };
             let client = self.forward_proxy_clients.direct_client();
-            let started = Instant::now();
+            let attempt_started = Instant::now();
             match build(client).send().await {
                 Ok(response) => {
+                    let elapsed = attempt_started.elapsed();
+                    crate::observability::global_metrics().record_upstream(
+                        crate::observability::upstream_class_for_operation(request_kind),
+                        request_kind,
+                        Ok(response.status()),
+                        elapsed,
+                    );
                     let _ = self
                         .record_forward_proxy_attempt(
                             &direct.key,
                             affinity_owner_key_id,
                             request_kind,
                             true,
-                            Some(started.elapsed().as_secs_f64() * 1000.0),
+                            Some(elapsed.as_secs_f64() * 1000.0),
                             None,
                         )
                         .await;
@@ -2002,6 +2036,12 @@ impl TavilyProxy {
                     ))
                 }
                 Err(err) => {
+                    crate::observability::global_metrics().record_upstream_failure(
+                        crate::observability::upstream_class_for_operation(request_kind),
+                        request_kind,
+                        err.is_timeout(),
+                        attempt_started.elapsed(),
+                    );
                     let _ = self
                         .record_forward_proxy_attempt(
                             &direct.key,
@@ -2150,6 +2190,7 @@ impl TavilyProxy {
         &self,
         billing_subject: &str,
     ) -> Result<(), ProxyError> {
+        let _settlement_phase = crate::observability::begin_request_phase("settlement");
         let pending = self
             .key_store
             .list_pending_billing_log_ids(billing_subject)
@@ -2189,7 +2230,11 @@ impl TavilyProxy {
         billing_subject: &str,
     ) -> Result<TokenBillingGuard, ProxyError> {
         let lock = {
-            let mut locks = self.token_billing_locks.lock().await;
+            let mut locks = {
+                let _billing_lock_phase =
+                    crate::observability::begin_request_phase("billing_lock_wait");
+                self.token_billing_locks.lock().await
+            };
             if locks.len() > 1024 {
                 locks.retain(|_, lock| lock.strong_count() > 0);
             }
@@ -2202,7 +2247,11 @@ impl TavilyProxy {
                 lock
             }
         };
-        let local_guard = lock.lock_owned().await;
+        let local_guard = {
+            let _billing_lock_phase =
+                crate::observability::begin_request_phase("billing_lock_wait");
+            lock.lock_owned().await
+        };
         Ok(TokenBillingGuard {
             billing_subject: billing_subject.to_string(),
             _local: local_guard,
@@ -2226,6 +2275,18 @@ mod tests {
     };
     use tokio::sync::Barrier;
     use tokio::time::{timeout, Duration};
+
+    fn request_phase_sum(output: &str, phase: &str) -> f64 {
+        output
+            .lines()
+            .find(|line| {
+                line.starts_with("hikari_http_request_duration_seconds_sum{")
+                    && line.contains(&format!("phase=\"{phase}\""))
+            })
+            .and_then(|line| line.rsplit_once(' ').map(|(_, value)| value))
+            .and_then(|value| value.parse::<f64>().ok())
+            .unwrap_or_else(|| panic!("missing request phase histogram for {phase}: {output}"))
+    }
 
     #[derive(Clone)]
     struct SubscriptionTestState {
@@ -2344,5 +2405,144 @@ mod tests {
         assert!(peak <= urls.len(), "startup fetches should not exceed the URL count");
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn request_timing_attributes_real_billing_lock_and_pending_replay() {
+        let temp_dir = tempfile::tempdir().expect("create temporary test directory");
+        let db_path = temp_dir.path().join("request-timing-billing-attribution.db");
+        let db_str = db_path.to_string_lossy().to_string();
+        let mock_upstream = "http://127.0.0.1:9";
+        let proxy_a = TavilyProxy::with_endpoint(Vec::<String>::new(), mock_upstream, &db_str)
+            .await
+            .expect("proxy a created");
+        let proxy_b = TavilyProxy::with_endpoint(Vec::<String>::new(), mock_upstream, &db_str)
+            .await
+            .expect("proxy b created");
+        let token = proxy_a
+            .create_access_token(Some("request-timing-billing-attribution"))
+            .await
+            .expect("create token");
+
+        let held_guard = proxy_a
+            .lock_token_billing(&token.id)
+            .await
+            .expect("acquire first billing lock");
+        let waiter_proxy = proxy_b.clone();
+        let waiter_token_id = token.id.clone();
+        let waiter = tokio::spawn(async move {
+            crate::observability::with_test_request_timing_scope(
+                "/api/tavily/search",
+                "POST",
+                "search",
+                StatusCode::OK,
+                async move {
+                    let _preflight = crate::observability::begin_request_phase("preflight");
+                    waiter_proxy.lock_token_billing(&waiter_token_id).await
+                },
+            )
+            .await
+        });
+        let mut waiter = waiter;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut waiter)
+                .await
+                .is_err(),
+            "same-subject lock_token_billing must wait for the held lock"
+        );
+        drop(held_guard);
+        let (waiter_result, lock_output) = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("billing lock waiter completes after release")
+            .expect("billing lock waiter joins");
+        drop(waiter_result.expect("second billing lock succeeds"));
+        let billing_lock_wait = request_phase_sum(&lock_output, "billing_lock_wait");
+        assert!(
+            billing_lock_wait > 0.1,
+            "controlled same-subject wait must be recorded as billing_lock_wait: {lock_output}"
+        );
+
+        let log_id = proxy_a
+            .record_pending_billing_attempt(
+                &token.id,
+                &Method::POST,
+                "/api/tavily/search",
+                None,
+                Some(StatusCode::OK.as_u16() as i64),
+                Some(200),
+                true,
+                OUTCOME_SUCCESS,
+                Some("request timing attribution"),
+                1,
+                None,
+            )
+            .await
+            .expect("record pending billing attempt");
+        assert!(log_id > 0);
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let holder_proxy = proxy_a.clone();
+        let holder_release = Arc::clone(&release);
+        let holder = tokio::spawn(async move {
+            holder_proxy
+                .key_store
+                .hold_sqlite_pool_until_for_test(ready_tx, holder_release)
+                .await
+                .expect("hold SQLite pool");
+        });
+        ready_rx.await.expect("SQLite pool holder ready");
+
+        let replay_proxy = proxy_a.clone();
+        let replay_subject = format!("token:{}", token.id);
+        let replay = tokio::spawn(async move {
+            crate::observability::with_test_request_timing_scope(
+                "/api/tavily/search",
+                "POST",
+                "search",
+                StatusCode::OK,
+                async move {
+                    let guard = {
+                        let _preflight = crate::observability::begin_request_phase("preflight");
+                        replay_proxy.lock_billing_subject(&replay_subject).await?
+                    };
+                    replay_proxy
+                        .reconcile_pending_billing_for_subject(guard.billing_subject())
+                        .await?;
+                    drop(guard);
+                    Ok::<(), ProxyError>(())
+                },
+            )
+            .await
+        });
+        let mut replay = replay;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut replay)
+                .await
+                .is_err(),
+            "pending replay must wait for the held SQLite pool"
+        );
+        release.notify_one();
+        let (replay_result, replay_output) = tokio::time::timeout(Duration::from_secs(2), replay)
+            .await
+            .expect("pending replay completes after pool release")
+            .expect("pending replay joins");
+        replay_result.expect("pending replay succeeds");
+        holder.await.expect("SQLite pool holder joins");
+
+        let settlement = request_phase_sum(&replay_output, "settlement");
+        let replay_billing_lock_wait = request_phase_sum(&replay_output, "billing_lock_wait");
+        let replay_preflight = request_phase_sum(&replay_output, "preflight");
+        assert!(
+            settlement > replay_billing_lock_wait + 0.1,
+            "pending replay DB wait must be settlement, not billing_lock_wait: {replay_output}"
+        );
+        assert!(
+            settlement > replay_preflight + 0.1,
+            "pending replay DB wait must not remain in preflight: {replay_output}"
+        );
+
+        drop(proxy_b);
+        drop(proxy_a);
     }
 }

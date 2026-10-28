@@ -78,6 +78,62 @@ async fn workload_window_emits_once_then_starts_a_new_bounded_window() {
     assert_eq!(transaction_hold_p95_ms(&metrics.hold_histogram), 10);
 }
 
+#[tokio::test]
+async fn disabled_maintenance_evidence_does_not_change_admission_or_foreground_writes() {
+    let enabled_runtime = three_connection_runtime().await;
+    let disabled_runtime = three_connection_runtime().await;
+    disabled_runtime.set_maintenance_metrics_recording_enabled_for_test(false);
+
+    let enabled_holder = enabled_runtime
+        .try_admit_maintenance_bulk(SqliteOperation::HaOutboxGc)
+        .expect("enabled runtime bulk admission");
+    let disabled_holder = disabled_runtime
+        .try_admit_maintenance_bulk(SqliteOperation::HaOutboxGc)
+        .expect("disabled runtime bulk admission");
+
+    let enabled_defer = enabled_runtime
+        .try_admit_maintenance_bulk(SqliteOperation::RequestLogsGc)
+        .expect_err("enabled runtime must defer the second bulk slice");
+    let disabled_defer = disabled_runtime
+        .try_admit_maintenance_bulk(SqliteOperation::RequestLogsGc)
+        .expect_err("disabled runtime must defer the second bulk slice");
+    assert_eq!(enabled_defer, disabled_defer);
+
+    for (runtime, table) in [
+        (&enabled_runtime, "enabled_foreground_write"),
+        (&disabled_runtime, "disabled_foreground_write"),
+    ] {
+        let mut connection = runtime
+            .acquire_operation_connection(SqliteOperation::AdminMutation)
+            .await
+            .expect("foreground operation connection");
+        sqlx::query(&format!("CREATE TABLE {table} (id INTEGER)"))
+            .execute(&mut *connection)
+            .await
+            .expect("foreground write");
+        connection
+            .close()
+            .await
+            .expect("close foreground connection");
+    }
+
+    let disabled_snapshot = disabled_runtime.maintenance_metrics_snapshot_for_test();
+    for metric in SqliteMaintenanceInternalMetric::ALL {
+        assert_eq!(disabled_snapshot.internal(metric).count, 0);
+    }
+    assert_eq!(
+        disabled_snapshot
+            .permit(SqliteMaintenanceClass::HaOutboxGc)
+            .count,
+        0
+    );
+    assert_eq!(disabled_snapshot.cursor_progress, 0);
+    assert_eq!(disabled_snapshot.range_progress, 0);
+    assert_eq!(disabled_snapshot.completed, 0);
+
+    drop((enabled_holder, disabled_holder));
+}
+
 #[test]
 fn transaction_hold_histogram_reports_the_fixed_p95_bucket() {
     let mut histogram = [0; TRANSACTION_HOLD_BUCKET_UPPER_MS.len()];
@@ -216,7 +272,7 @@ async fn cancelled_immediate_transaction_rolls_back_without_discarding_connectio
 #[tokio::test]
 async fn cancelled_finish_keeps_the_owned_commit_boundary_alive() {
     let runtime = single_connection_runtime().await;
-    let pause = install_owned_finish_pause_for_test();
+    let pause = runtime.install_owned_finish_pause_for_test();
     let task_runtime = runtime.clone();
     let task = tokio::spawn(async move {
         let mut transaction = task_runtime
@@ -246,6 +302,45 @@ async fn cancelled_finish_keeps_the_owned_commit_boundary_alive() {
         runtime.discarded_connections_for_test(SqliteOperation::DashboardIntegrityWrite),
         0,
         "caller cancellation during commit must not detach the connection"
+    );
+}
+
+#[tokio::test]
+async fn owned_finish_pause_is_scoped_to_its_runtime() {
+    let paused_runtime = single_connection_runtime().await;
+    let other_runtime = single_connection_runtime().await;
+    let pause = paused_runtime.install_owned_finish_pause_for_test();
+    let task_runtime = other_runtime.clone();
+    let mut task = tokio::spawn(async move {
+        let mut transaction = task_runtime
+            .begin_immediate(SqliteOperation::DashboardIntegrityWrite)
+            .await
+            .expect("immediate transaction");
+        sqlx::query("CREATE TABLE runtime_scoped_pause_probe (id INTEGER PRIMARY KEY)")
+            .execute(&mut *transaction)
+            .await
+            .expect("write inside transaction");
+        transaction.finish(Ok(())).await
+    });
+
+    let result = tokio::time::timeout(Duration::from_secs(1), &mut task).await;
+    if result.is_err() {
+        pause.release();
+        let _ = task.await;
+    }
+    assert!(
+        result.is_ok(),
+        "an unrelated runtime must not consume the installed finish pause"
+    );
+    result
+        .expect("unrelated runtime finish should complete")
+        .expect("unrelated runtime task should join")
+        .expect("unrelated runtime transaction should finish");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), pause.wait_until_arrived())
+            .await
+            .is_err(),
+        "the pause must remain available to its owning runtime"
     );
 }
 
@@ -419,6 +514,10 @@ async fn alert_projection_read_snapshot_uses_and_restores_short_busy_timeout() {
         .begin_read_snapshot(SqliteOperation::AlertProjection)
         .await
         .expect("alert projection read snapshot");
+    assert_eq!(
+        snapshot.cooperative_run_budget_for_test(),
+        Some(Duration::from_millis(250))
+    );
     let busy_timeout_ms: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
         .fetch_one(&mut *snapshot)
         .await
@@ -437,6 +536,84 @@ async fn alert_projection_read_snapshot_uses_and_restores_short_busy_timeout() {
         .await
         .expect("read restored busy timeout");
     assert_eq!(busy_timeout_ms, DEFAULT_BUSY_TIMEOUT_MS);
+}
+
+#[tokio::test]
+async fn alert_projection_operation_connection_enforces_native_deadline() {
+    let runtime = single_connection_runtime().await;
+    let mut connection = runtime
+        .acquire_operation_connection(SqliteOperation::AlertProjection)
+        .await
+        .expect("alert projection operation connection");
+    connection.expire_cooperative_run_deadline_for_test();
+    let query_result = sqlx::query_scalar::<_, i64>(
+        "WITH RECURSIVE counter(value) AS (VALUES(1) UNION ALL SELECT value + 1 FROM counter WHERE value < 1000000) SELECT SUM(value) FROM counter",
+    )
+    .fetch_one(&mut *connection)
+    .await;
+    assert!(matches!(
+        connection.complete_query(query_result).await,
+        Err(ProxyError::Deferred { reason, .. }) if reason == "read_budget"
+    ));
+    assert_eq!(
+        runtime.discarded_connections_for_test(SqliteOperation::AlertProjection),
+        0,
+        "a native deadline must restore the projection connection"
+    );
+    runtime
+        .begin_read_snapshot(SqliteOperation::AlertProjection)
+        .await
+        .expect("next alert projection read is reusable")
+        .close()
+        .await
+        .expect("close next alert projection read");
+}
+
+#[tokio::test]
+async fn dashboard_integrity_native_read_deadline_does_not_commit_progress() {
+    let runtime = single_connection_runtime().await;
+    let mut snapshot = runtime
+        .begin_read_snapshot(SqliteOperation::DashboardIntegrityWrite)
+        .await
+        .expect("dashboard integrity read snapshot");
+    snapshot
+        .arm_cooperative_run_budget(Duration::ZERO)
+        .await
+        .expect("install an immediate dashboard read deadline");
+    let query_result = sqlx::query_scalar::<_, i64>(
+        "WITH RECURSIVE counter(value) AS (VALUES(1) UNION ALL SELECT value + 1 FROM counter WHERE value < 1000000) SELECT SUM(value) FROM counter",
+    )
+    .fetch_one(&mut *snapshot)
+    .await;
+    assert!(matches!(
+        snapshot.complete_native_read(query_result).await,
+        Ok(SqliteCooperativeQueryOutcome::DeadlineExceeded)
+    ));
+    assert_eq!(
+        runtime.discarded_connections_for_test(SqliteOperation::DashboardIntegrityWrite),
+        0,
+        "an interrupted integrity page must return a clean connection"
+    );
+}
+
+#[tokio::test]
+async fn dashboard_integrity_read_caps_long_turn_to_native_budget() {
+    let runtime = single_connection_runtime().await;
+    let snapshot = runtime
+        .begin_read_snapshot_before_deadline(
+            SqliteOperation::DashboardIntegrityWrite,
+            Instant::now() + Duration::from_secs(20),
+            Duration::from_millis(150),
+        )
+        .await
+        .expect("dashboard integrity read snapshot");
+    assert!(
+        snapshot
+            .cooperative_run_budget_for_test()
+            .expect("native read budget")
+            <= Duration::from_millis(150)
+    );
+    snapshot.close().await.expect("close read snapshot");
 }
 
 #[tokio::test]
@@ -2091,7 +2268,7 @@ async fn maintenance_control_pool_timeout_is_a_typed_defer() {
     assert_eq!(
         metrics
             .deferred_by_reason
-            .get(&SqliteAdmissionDeferReason::RecentContention),
+            .get(&SqliteAdmissionDeferReason::PoolPressure),
         Some(&1)
     );
     drop(held);

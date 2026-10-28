@@ -52,12 +52,22 @@ contention policy. Add one instance-local coordinator in front of that semaphore
 - Runtime workload-window logs expose pending age and per-class admission/completion statistics;
   each admitted slice logs its class and wait age.
 
+Maintenance evidence must distinguish physical bulk-permit ownership from coordinator fairness,
+pool acquisition, BEGIN, and native-read deadline. These are bounded internal classifications;
+they do not change admission, SQL, or foreground write behavior. Only a committed cursor or range
+advance is business progress. Lease release, rollback, stale-claim rejection, and observation-row
+updates remain operational events and must not be counted as progress.
+
 Ordinary admission-defer continuations and the coordinator's aged-class-order turn use a
-five-second cadence. Request-log GC uses a five-minute retry after any admission defer, while
-Dashboard integrity uses five minutes for foreground, pool, or recent-contention pressure and
-five seconds when another bulk class owns the permit. A normally completed request-log GC
-continuation keeps its five-minute cadence, and HA GC's post-admission channel continuation keeps
-its separate durable contention delay.
+five-second cadence. Request-log GC retries admission-only `bulk_busy`, `pool_pressure`,
+`foreground_pressure`, and `recent_contention` defers on that same five-second cadence; unknown
+admission reasons retain the conservative five-minute retry. Source or archival blocking and an
+actually executed zero-progress pass retain their existing five-minute protection. Dashboard
+integrity continues to re-probe transient admission defers on the aged-turn five-second cadence.
+This changes only retry timing: foreground-rate, pool-capacity, recent-contention, single-permit,
+and coordinator-fairness checks remain enforced on every attempt. A normally completed
+request-log GC continuation keeps its five-minute cadence, and HA GC's post-admission channel
+continuation keeps its separate durable contention delay.
 
 ## Alternatives Rejected
 

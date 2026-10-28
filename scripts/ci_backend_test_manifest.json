@@ -128,6 +128,7 @@
         "tavily_proxy::tests::"
       ],
       "include_prefixes": [
+        "observability::tests::",
         "affinity_tests::",
         "analysis::tests::",
         "ha::tests::",
@@ -300,6 +301,7 @@
       "coverage_target": "lib",
       "run_args": ["--lib"],
       "filtered_test_threads": 2,
+      "isolated_prefixes": ["tests::dashboard_rollup_integrity::"],
       "serial_prefixes": ["tests::dashboard_rollup_integrity::"],
       "include_prefixes": ["tests::dashboard_rollup_integrity::"]
     },
@@ -384,6 +386,8 @@
         "tests::proxy_affinity_and_summary::proxy_",
         "tests::request_rollup::proxy_",
         "tests::observability_and_lifecycle::observability_",
+        "tests::observability_and_lifecycle::writable_distinct_observability_sidecar_uses_wal",
+        "tests::observability_and_lifecycle::read_only_observability_sidecar_preserves_existing_journal_mode",
         "tests::request_rollup::observability_",
         "tests::maintenance_and_mcp_affinity::mcp_",
         "tests::observability_and_lifecycle::large_",
@@ -661,10 +665,13 @@
         "tests::upstream_reconciliation_projection::",
         "tests::upstream_reconciliation_source_identity::",
         "tests::upstream_reconciliation::reconciliation_controlled_retry_advances_the_claim_attempt_before_success",
+        "tavily_proxy::maintenance_runtime_tests::enqueue_failure_remains_pending_without_a_new_generation",
+        "tavily_proxy::maintenance_runtime_tests::enqueue_success_preserves_generation_published_during_await",
         "tavily_proxy::reconciliation_engine_tests::",
         "tavily_proxy::user_business_calls_memory::memory_window_regression_tests::",
         "upstream_privacy::tests::"
-      ]
+      ],
+      "isolated_prefixes": ["tests::upstream_reconciliation_fencing::"]
     },
     {
       "id": "bin-support",
@@ -836,7 +843,8 @@
         "tavily-hikari"
       ],
       "isolated_prefixes": [
-        "server::tests::tavily_http_search::tavily_"
+        "server::tests::tavily_http_search::tavily_",
+        "server::tests::tavily_http_search_timing::tavily_"
       ],
       "isolated_process_workers": 4,
       "filtered_process_workers": 4,
@@ -848,6 +856,7 @@
         "server::tests::research_result_and_mcp_subpath::tavily_",
         "server::tests::tavily_http_free_account_boundary::tavily_",
         "server::tests::tavily_http_search::tavily_",
+        "server::tests::tavily_http_search_timing::tavily_",
         "server::tests::system_settings_and_forward_proxy::extract_",
         "server::tests::provider_admin_api_keys::",
         "server::tests::provider_privacy_redaction::",
@@ -1037,6 +1046,7 @@
         "server::tests::alerts_and_ha_source_and_recovery::ha_",
         "server::tests::alerts_and_ha_source_and_recovery::maintenance_worker_retries_a_locked_claim_",
         "server::tests::alerts_and_ha_source_and_recovery::request_logs_gc_",
+        "server::scheduler_tests::",
         "server::tests::alerts_and_ha_source_and_recovery::dashboard_integrity_admission_pressure_",
         "server::dashboard_integrity_admission_tests::",
         "server::tests::alerts_and_ha_source_and_recovery::aged_",

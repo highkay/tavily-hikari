@@ -50,7 +50,7 @@ fn linuxdo_credit_recharge_lifecycle_recheck_secs() -> i64 {
 fn scheduled_request_logs_gc_options() -> RequestLogsGcOptions {
     RequestLogsGcOptions {
         batch_size: 100,
-        max_batches: 5,
+        max_batches: 10,
         max_runtime_secs: 20,
         inter_batch_sleep_ms: 0,
     }
@@ -77,8 +77,13 @@ fn request_logs_gc_continuation_delay(report: &RequestLogsGcReport) -> i64 {
     }
 }
 
-fn request_logs_gc_admission_retry_delay(_reason: &str) -> i64 {
-    REQUEST_LOGS_GC_CONTINUATION_DELAY_SECS
+fn request_logs_gc_admission_retry_delay(reason: &str) -> i64 {
+    match reason {
+        "bulk_busy" | "pool_pressure" | "foreground_pressure" | "recent_contention" => {
+            SQLITE_MAINTENANCE_ADMISSION_RETRY_DELAY_SECS
+        }
+        _ => REQUEST_LOGS_GC_CONTINUATION_DELAY_SECS,
+    }
 }
 
 fn request_logs_gc_made_progress(report: &RequestLogsGcReport) -> bool {
@@ -88,8 +93,11 @@ fn request_logs_gc_made_progress(report: &RequestLogsGcReport) -> bool {
 
 fn dashboard_integrity_admission_retry_delay(reason: &str) -> i64 {
     match reason {
+        // Keep the real pool and contention gates intact, but probe again on
+        // the aged-turn cadence instead of parking the durable recovery job
+        // for five minutes after a transient defer.
         "foreground_pressure" | "pool_pressure" | "recent_contention" => {
-            REQUEST_LOGS_GC_CONTINUATION_DELAY_SECS
+            SQLITE_MAINTENANCE_ADMISSION_RETRY_DELAY_SECS
         }
         _ => SQLITE_MAINTENANCE_ADMISSION_RETRY_DELAY_SECS,
     }
@@ -100,18 +108,18 @@ mod dashboard_integrity_admission_tests {
     use super::*;
 
     #[test]
-    fn dashboard_integrity_admission_pressure_uses_full_backoff() {
+    fn dashboard_integrity_admission_pressure_uses_aged_turn_retry() {
         assert_eq!(
             dashboard_integrity_admission_retry_delay("foreground_pressure"),
-            REQUEST_LOGS_GC_CONTINUATION_DELAY_SECS
+            SQLITE_MAINTENANCE_ADMISSION_RETRY_DELAY_SECS
         );
         assert_eq!(
             dashboard_integrity_admission_retry_delay("pool_pressure"),
-            REQUEST_LOGS_GC_CONTINUATION_DELAY_SECS
+            SQLITE_MAINTENANCE_ADMISSION_RETRY_DELAY_SECS
         );
         assert_eq!(
             dashboard_integrity_admission_retry_delay("recent_contention"),
-            REQUEST_LOGS_GC_CONTINUATION_DELAY_SECS
+            SQLITE_MAINTENANCE_ADMISSION_RETRY_DELAY_SECS
         );
         assert_eq!(
             dashboard_integrity_admission_retry_delay("bulk_busy"),
@@ -120,21 +128,21 @@ mod dashboard_integrity_admission_tests {
     }
 
     #[test]
-    fn request_logs_gc_admission_pressure_uses_full_backoff() {
+    fn request_logs_gc_admission_pressure_uses_short_retry() {
+        for reason in [
+            "bulk_busy",
+            "pool_pressure",
+            "foreground_pressure",
+            "recent_contention",
+        ] {
+            assert_eq!(
+                request_logs_gc_admission_retry_delay(reason),
+                SQLITE_MAINTENANCE_ADMISSION_RETRY_DELAY_SECS,
+                "admission-only reason {reason} should retry on the short cadence"
+            );
+        }
         assert_eq!(
-            request_logs_gc_admission_retry_delay("pool_pressure"),
-            REQUEST_LOGS_GC_CONTINUATION_DELAY_SECS
-        );
-        assert_eq!(
-            request_logs_gc_admission_retry_delay("foreground_pressure"),
-            REQUEST_LOGS_GC_CONTINUATION_DELAY_SECS
-        );
-        assert_eq!(
-            request_logs_gc_admission_retry_delay("recent_contention"),
-            REQUEST_LOGS_GC_CONTINUATION_DELAY_SECS
-        );
-        assert_eq!(
-            request_logs_gc_admission_retry_delay("bulk_busy"),
+            request_logs_gc_admission_retry_delay("source_baseline"),
             REQUEST_LOGS_GC_CONTINUATION_DELAY_SECS
         );
     }
@@ -750,30 +758,6 @@ fn spawn_scheduled_job_stale_reaper(state: Arc<AppState>) {
                     err = %err,
                 ),
             }
-            match state
-                .proxy
-                .ensure_upstream_reconciliation_representative_job()
-                .await
-            {
-                Ok(()) => maintenance_worker_wake_for_state(state.as_ref()).notify_one(),
-                Err(err) => tracing::debug!(
-                    component = "reconciliation",
-                    event = "resume_watcher_enqueue_failed",
-                    err = %err,
-                ),
-            }
-            match state
-                .proxy
-                .ensure_upstream_reconciliation_research_drain_job()
-                .await
-            {
-                Ok(()) => maintenance_worker_wake_for_state(state.as_ref()).notify_one(),
-                Err(err) => tracing::debug!(
-                    component = "reconciliation_research_drain",
-                    event = "resume_watcher_enqueue_failed",
-                    err = %err,
-                ),
-            }
         }
     });
 }
@@ -1283,36 +1267,45 @@ async fn run_ha_outbox_gc_claimed_job(
     drop(_job_execution_gate);
 
     let foreground_rps = state.proxy.foreground_activity_rps();
-    let _bulk_admission = match state.proxy.admit_ha_outbox_gc() {
-        tavily_hikari::SqliteAdmissionOutcome::Admitted(permit) => permit,
-        tavily_hikari::SqliteAdmissionOutcome::Deferred { reason } => {
-            tracing::debug!(
-                component = "ha_outbox_gc",
-                event = "deferred",
-                job_id,
-                claim_generation,
-                defer_reason = reason,
-                continuation_delay_secs = SQLITE_MAINTENANCE_ADMISSION_RETRY_DELAY_SECS,
-            );
-            return finish_ha_gc_with_continuation(
-                &state,
-                job_id,
-                claim_generation,
-                format!("deferred={reason}"),
-                SQLITE_MAINTENANCE_ADMISSION_RETRY_DELAY_SECS,
+    let result = {
+        let _bulk_admission = match state.proxy.admit_ha_outbox_gc() {
+            tavily_hikari::SqliteAdmissionOutcome::Admitted(permit) => permit,
+            tavily_hikari::SqliteAdmissionOutcome::Deferred { reason } => {
+                tracing::debug!(
+                    component = "ha_outbox_gc",
+                    event = "deferred",
+                    job_id,
+                    claim_generation,
+                    defer_reason = reason,
+                    continuation_delay_secs = SQLITE_MAINTENANCE_ADMISSION_RETRY_DELAY_SECS,
+                );
+                return finish_ha_gc_with_continuation(
+                    &state,
+                    job_id,
+                    claim_generation,
+                    format!("deferred={reason}"),
+                    SQLITE_MAINTENANCE_ADMISSION_RETRY_DELAY_SECS,
+                )
+                .await;
+            }
+        };
+        let proxy = state.proxy.clone();
+        state
+            .proxy
+            .gc_ha_outbox_online_with_foreground_activity(
+                foreground_rps,
+                state.proxy.foreground_activity_low_pressure_since_floor(),
+                move || proxy.foreground_activity_rps(),
             )
-            .await;
-        }
+            .await
     };
-    let proxy = state.proxy.clone();
-    let result = state
-        .proxy
-        .gc_ha_outbox_online_with_foreground_activity(
-            foreground_rps,
-            state.proxy.foreground_activity_low_pressure_since_floor(),
-            move || proxy.foreground_activity_rps(),
-        )
-        .await;
+    tracing::debug!(
+        component = "ha_outbox_gc",
+        event = "data_slice_released",
+        job_id,
+        claim_generation,
+        "HA outbox GC data slice and native cleanup completed before report finalization"
+    );
 
     match result {
         Ok(report) => {
@@ -2649,6 +2642,7 @@ async fn run_manual_claimed_job(
                         .backend_time()
                         .now_ts()
                         .saturating_add(RECONCILIATION_SQLITE_ADMISSION_RETRY_DELAY_SECS),
+                    false,
                 )
                 .await;
             }
@@ -2678,6 +2672,7 @@ async fn run_manual_claimed_job(
                             .backend_time()
                             .now_ts()
                             .saturating_add(RECONCILIATION_SQLITE_ADMISSION_RETRY_DELAY_SECS),
+                        false,
                     )
                     .await;
                     return deferred;
@@ -2845,19 +2840,25 @@ async fn persist_claimed_reconciliation_run(
                             .backend_time()
                             .now_ts()
                             .saturating_add(RECONCILIATION_SQLITE_ADMISSION_RETRY_DELAY_SECS),
+                        false,
                     )
                     .await
                 }
                 Err(err) => finish(state, "error", err.to_string()).await,
             }
         }
-        Ok(ClaimedReconciliationRunOutcome::Deferred { reason, retry_at }) => {
+        Ok(ClaimedReconciliationRunOutcome::Deferred {
+            reason,
+            retry_at,
+            projection_accepted_progress,
+        }) => {
             defer_reconciliation_for_sqlite_admission(
                 &state,
                 job_id,
                 claim_generation,
                 reason,
                 retry_at,
+                projection_accepted_progress,
             )
             .await
         }
@@ -2882,6 +2883,7 @@ async fn persist_claimed_reconciliation_run(
                     .backend_time()
                     .now_ts()
                     .saturating_add(RECONCILIATION_SQLITE_ADMISSION_RETRY_DELAY_SECS),
+                false,
             )
             .await
         }
@@ -2897,6 +2899,7 @@ async fn defer_reconciliation_for_sqlite_admission(
     claim_generation: i64,
     defer_reason: &'static str,
     retry_at: i64,
+    projection_accepted_progress: bool,
 ) -> bool {
     let available_at = retry_at.max(state.proxy.backend_time().now_ts());
     tracing::debug!(
@@ -2910,11 +2913,12 @@ async fn defer_reconciliation_for_sqlite_admission(
     );
     state
         .proxy
-        .finalize_deferred_upstream_reconciliation_claim(
+        .finalize_deferred_upstream_reconciliation_claim_with_progress(
             job_id,
             claim_generation,
             defer_reason,
             available_at,
+            projection_accepted_progress,
         )
         .await
         .is_ok()
@@ -3111,4 +3115,19 @@ fn spawn_forward_proxy_maintenance_scheduler(state: Arc<AppState>) {
             state.proxy.backend_time().sleep(Duration::from_secs(30)).await;
         }
     });
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::scheduled_request_logs_gc_options;
+
+    #[test]
+    fn scheduled_request_logs_gc_options_stays_bounded() {
+        let options = scheduled_request_logs_gc_options();
+
+        assert_eq!(options.batch_size, 100);
+        assert_eq!(options.max_batches, 10);
+        assert_eq!(options.max_runtime_secs, 20);
+        assert_eq!(options.inter_batch_sleep_ms, 0);
+    }
 }

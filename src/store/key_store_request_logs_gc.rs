@@ -1213,28 +1213,26 @@ impl KeyStore {
                 deadline_exhausted = true;
                 break;
             }
-            let Some(raw_delete_cutoff) = request_logs_gc_before_deadline(
-                deadline,
-                async {
-                    match target_day {
-                        Some((target_day_start, target_day_end)) => self
-                            .dashboard_rollup_integrity_request_log_gc_decision_for_day(
-                                threshold,
-                                target_day_start,
-                                target_day_end,
-                            )
-                            .await,
-                        None => self
-                            .dashboard_rollup_integrity_request_log_gc_decision(threshold)
-                            .await,
-                    }
-                },
-            )
-            .await?
-            else {
+            let raw_delete_cutoff = match target_day {
+                Some((target_day_start, target_day_end)) => self
+                    .dashboard_rollup_integrity_request_log_gc_decision_for_day_before_deadline(
+                        threshold,
+                        target_day_start,
+                        target_day_end,
+                        deadline,
+                    )
+                    .await?,
+                None => self
+                    .dashboard_rollup_integrity_request_log_gc_decision_before_deadline(
+                        threshold,
+                        deadline,
+                    )
+                    .await?,
+            };
+            if self.backend_time.instant_now() >= deadline {
                 deadline_exhausted = true;
                 break;
-            };
+            }
             let request_deleted = match raw_delete_cutoff {
                 DashboardRollupRequestLogGcDecision::Allowed {
                     cutoff,
@@ -1387,6 +1385,15 @@ impl KeyStore {
         } else {
             "incomplete_zero_progress"
         };
+        let committed_range_rows = cleaned_request_log_bodies
+            .saturating_add(deleted_request_logs)
+            .saturating_add(deleted_rollups)
+            .max(0) as u64;
+        self.sqlite_runtime.record_committed_maintenance_progress(
+            body_scan_cursor_advanced,
+            committed_range_rows,
+            !has_more,
+        );
         tracing::debug!(
             component = "request_logs_gc",
             event = "bounded_pass_completed",

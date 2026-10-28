@@ -19,6 +19,16 @@ use tracing::{debug, error, info, warn};
 mod cooperative;
 pub(crate) use cooperative::SqliteCooperativeQueryOutcome;
 
+#[path = "sqlite_runtime_maintenance_metrics.rs"]
+mod maintenance_metrics;
+#[cfg(test)]
+use maintenance_metrics::transaction_hold_p95_ms;
+use maintenance_metrics::{
+    SqliteMaintenanceInternalMetric, SqliteMaintenanceMetrics, SqliteMaintenancePermitEvidence,
+    format_admin_alerts_warm_window, format_operation_window, format_sqlite_file_state,
+    monotonic_delta,
+};
+
 #[cfg(test)]
 #[path = "sqlite_runtime_metrics_tests.rs"]
 mod metrics_tests;
@@ -47,7 +57,7 @@ const FOREGROUND_ACTIVITY_BUCKET_MS: u64 = 100;
 const TRANSACTION_HOLD_BUCKET_UPPER_MS: [u64; 6] = [10, 25, 50, 100, 250, 251];
 
 #[cfg(test)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct OwnedFinishPause {
     arrived: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
@@ -63,9 +73,6 @@ impl OwnedFinishPause {
         self.release.notify_one();
     }
 }
-
-#[cfg(test)]
-static OWNED_FINISH_PAUSE: OnceLock<Mutex<Option<OwnedFinishPause>>> = OnceLock::new();
 
 static OWNED_FINISHES: OnceLock<(Mutex<BTreeMap<SqliteOperation, usize>>, Notify)> =
     OnceLock::new();
@@ -127,47 +134,37 @@ impl Drop for OwnedFinishCompletion {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn install_owned_finish_pause_for_test() -> OwnedFinishPause {
-    let pause = OwnedFinishPause {
-        arrived: Arc::new(tokio::sync::Notify::new()),
-        release: Arc::new(tokio::sync::Notify::new()),
-    };
-    *OWNED_FINISH_PAUSE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .expect("owned finish pause mutex") = Some(pause.clone());
-    pause
-}
-
-#[cfg(test)]
-async fn wait_for_owned_finish_pause_for_test() {
-    let pause = OWNED_FINISH_PAUSE
-        .get()
-        .and_then(|slot| slot.lock().expect("owned finish pause mutex").take());
-    if let Some(pause) = pause {
-        pause.arrived.notify_one();
-        pause.release.notified().await;
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum SqliteAdmissionDeferReason {
     BulkBusy,
+    CoverageReadiness,
     ForegroundPressure,
     PoolPressure,
     RecentContention,
     QueryDeadline,
+    SourceBaseline,
+    Other,
 }
 
 impl SqliteAdmissionDeferReason {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::BulkBusy => "bulk_busy",
+            Self::CoverageReadiness => "coverage_readiness",
             Self::ForegroundPressure => "foreground_pressure",
             Self::PoolPressure => "pool_pressure",
             Self::RecentContention => "recent_contention",
             Self::QueryDeadline => "query_deadline",
+            Self::SourceBaseline => "source_baseline",
+            Self::Other => "other",
+        }
+    }
+
+    fn observability_as_str(self) -> &'static str {
+        match self {
+            Self::RecentContention => "writer_contention",
+            Self::QueryDeadline => "native_query_deadline",
+            reason => reason.as_str(),
         }
     }
 }
@@ -177,7 +174,7 @@ impl SqliteAdmissionDeferReason {
 const MAINTENANCE_BULK_PENDING_IDLE_TIMEOUT: Duration = Duration::from_secs(6 * 60);
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum SqliteMaintenanceClass {
+pub(crate) enum SqliteMaintenanceClass {
     AdminRead,
     AlertProjection,
     CapacityWarm,
@@ -264,6 +261,7 @@ struct SqliteMaintenanceAdmissionLease {
 pub(crate) struct SqliteMaintenanceBulkPermit {
     _lease: SqliteMaintenanceAdmissionLease,
     _permit: OwnedSemaphorePermit,
+    _evidence: SqliteMaintenancePermitEvidence,
 }
 
 impl SqliteMaintenanceBulkPermit {
@@ -966,6 +964,7 @@ struct SqliteRuntimeInner {
     maximum_connections: u32,
     maintenance_bulk: Arc<Semaphore>,
     maintenance_coordinator: Arc<SqliteMaintenanceCoordinator>,
+    maintenance_metrics: Arc<SqliteMaintenanceMetrics>,
     maintenance_shutdown: AtomicBool,
     maintenance_runs: Arc<Semaphore>,
     maintenance_run_shutdown: AtomicBool,
@@ -988,6 +987,8 @@ struct SqliteRuntimeInner {
     fail_next_reconciliation_research_read: AtomicBool,
     #[cfg(test)]
     fail_next_owned_finish_restore: AtomicBool,
+    #[cfg(test)]
+    owned_finish_pause: Mutex<Option<OwnedFinishPause>>,
     #[cfg(any(test, debug_assertions))]
     force_next_cooperative_query_deadline: AtomicBool,
     #[cfg(any(test, debug_assertions))]
@@ -1138,6 +1139,7 @@ impl SqliteRuntime {
                 maximum_connections: maximum_connections.max(1),
                 maintenance_bulk: Arc::new(Semaphore::new(1)),
                 maintenance_coordinator: Arc::new(SqliteMaintenanceCoordinator::default()),
+                maintenance_metrics: Arc::new(SqliteMaintenanceMetrics::default()),
                 maintenance_shutdown: AtomicBool::new(false),
                 maintenance_runs: Arc::new(Semaphore::new(MAINTENANCE_RUN_SLOTS as usize)),
                 maintenance_run_shutdown: AtomicBool::new(false),
@@ -1157,6 +1159,8 @@ impl SqliteRuntime {
                 fail_next_reconciliation_research_read: AtomicBool::new(false),
                 #[cfg(test)]
                 fail_next_owned_finish_restore: AtomicBool::new(false),
+                #[cfg(test)]
+                owned_finish_pause: Mutex::new(None),
                 #[cfg(any(test, debug_assertions))]
                 force_next_cooperative_query_deadline: AtomicBool::new(false),
                 #[cfg(any(test, debug_assertions))]
@@ -1170,6 +1174,27 @@ impl SqliteRuntime {
         self.inner
             .fail_next_reconciliation_research_read
             .store(true, AtomicOrdering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_owned_finish_pause_for_test(&self) -> OwnedFinishPause {
+        let pause = OwnedFinishPause {
+            arrived: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        let pause_slot = &self.inner.owned_finish_pause;
+        *pause_slot.lock().expect("owned finish pause mutex") = Some(pause.clone());
+        pause
+    }
+
+    #[cfg(test)]
+    async fn wait_for_owned_finish_pause_for_test(&self) {
+        let pause_slot = &self.inner.owned_finish_pause;
+        let pause = pause_slot.lock().expect("owned finish pause mutex").take();
+        if let Some(pause) = pause {
+            pause.arrived.notify_one();
+            pause.release.notified().await;
+        }
     }
 
     #[cfg(test)]
@@ -1233,6 +1258,37 @@ impl SqliteRuntime {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         paths.core = Some(PathBuf::from(core_database_path));
         paths.observability = observability_database_path.map(PathBuf::from);
+    }
+
+    fn record_internal_metric(&self, metric: SqliteMaintenanceInternalMetric, elapsed: Duration) {
+        self.inner.maintenance_metrics.record(metric, elapsed);
+    }
+
+    pub(crate) fn record_committed_maintenance_progress(
+        &self,
+        cursor_advanced: bool,
+        range_rows: u64,
+        completed: bool,
+    ) {
+        self.inner.maintenance_metrics.record_committed_progress(
+            cursor_advanced,
+            range_rows,
+            completed,
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_maintenance_metrics_recording_enabled_for_test(&self, enabled: bool) {
+        self.inner
+            .maintenance_metrics
+            .set_recording_enabled_for_test(enabled);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn maintenance_metrics_snapshot_for_test(
+        &self,
+    ) -> maintenance_metrics::SqliteMaintenanceMetricsSnapshot {
+        self.inner.maintenance_metrics.snapshot()
     }
 
     pub(crate) fn foreground_activity_rps(&self) -> i64 {
@@ -1411,21 +1467,32 @@ impl SqliteRuntime {
             return Err(reason);
         }
         let Ok(permit) = self.inner.maintenance_bulk.clone().try_acquire_owned() else {
+            self.record_internal_metric(
+                SqliteMaintenanceInternalMetric::PhysicalBulkBusy,
+                Duration::ZERO,
+            );
             self.record_deferred(operation, SqliteAdmissionDeferReason::BulkBusy);
             return Err(SqliteAdmissionDeferReason::BulkBusy);
         };
+        let evidence = self.inner.maintenance_metrics.start_permit(class);
         let Some(lease) = SqliteMaintenanceCoordinator::try_start_shared(
             &self.inner.maintenance_coordinator,
             class,
             aged_turn_bypass,
         ) else {
             drop(permit);
+            drop(evidence);
+            self.record_internal_metric(
+                SqliteMaintenanceInternalMetric::CoordinatorWait,
+                Duration::ZERO,
+            );
             self.record_deferred(operation, SqliteAdmissionDeferReason::BulkBusy);
             return Err(SqliteAdmissionDeferReason::BulkBusy);
         };
         Ok(SqliteMaintenanceBulkPermit {
             _permit: permit,
             _lease: lease,
+            _evidence: evidence,
         })
     }
 
@@ -1570,21 +1637,32 @@ impl SqliteRuntime {
             return Err(reason);
         }
         let Ok(permit) = self.inner.maintenance_bulk.clone().try_acquire_owned() else {
+            self.record_internal_metric(
+                SqliteMaintenanceInternalMetric::PhysicalBulkBusy,
+                Duration::ZERO,
+            );
             self.record_deferred(operation, SqliteAdmissionDeferReason::BulkBusy);
             return Err(SqliteAdmissionDeferReason::BulkBusy);
         };
+        let evidence = self.inner.maintenance_metrics.start_permit(class);
         let Some(lease) = SqliteMaintenanceCoordinator::try_start_shared(
             &self.inner.maintenance_coordinator,
             class,
             aged_turn_bypass,
         ) else {
             drop(permit);
+            drop(evidence);
+            self.record_internal_metric(
+                SqliteMaintenanceInternalMetric::CoordinatorWait,
+                Duration::ZERO,
+            );
             self.record_deferred(operation, SqliteAdmissionDeferReason::BulkBusy);
             return Err(SqliteAdmissionDeferReason::BulkBusy);
         };
         Ok(SqliteMaintenanceBulkPermit {
             _permit: permit,
             _lease: lease,
+            _evidence: evidence,
         })
     }
 
@@ -1906,14 +1984,26 @@ impl SqliteRuntime {
             Some(SqliteAdmissionDeferReason::RecentContention)
         } else if !self.has_maintenance_pool_capacity(allow_aged_pool_probe) {
             Some(SqliteAdmissionDeferReason::PoolPressure)
-        } else if self.inner.maintenance_bulk.available_permits() == 0
-            || (check_coordinator
-                && operation.maintenance_class().is_some_and(|class| {
-                    !self
-                        .inner
-                        .maintenance_coordinator
-                        .is_turn(class, allow_aged_coordinator_turn)
-                }))
+        } else if self.inner.maintenance_bulk.available_permits() == 0 {
+            self.record_internal_metric(
+                SqliteMaintenanceInternalMetric::PhysicalBulkBusy,
+                Duration::ZERO,
+            );
+            Some(SqliteAdmissionDeferReason::BulkBusy)
+        } else if check_coordinator
+            && operation.maintenance_class().is_some_and(|class| {
+                let turn_available = self
+                    .inner
+                    .maintenance_coordinator
+                    .is_turn(class, allow_aged_coordinator_turn);
+                if !turn_available {
+                    self.record_internal_metric(
+                        SqliteMaintenanceInternalMetric::CoordinatorWait,
+                        Duration::ZERO,
+                    );
+                }
+                !turn_available
+            })
         {
             Some(SqliteAdmissionDeferReason::BulkBusy)
         } else {
@@ -2012,11 +2102,21 @@ impl SqliteRuntime {
         match tokio::time::timeout(budget, self.inner.pool.acquire()).await {
             Ok(Ok(conn)) => {
                 drop(acquire_waiter);
-                Ok((conn, acquire_started.elapsed()))
+                let pool_wait = acquire_started.elapsed();
+                self.record_internal_metric(
+                    SqliteMaintenanceInternalMetric::PoolAcquire,
+                    pool_wait,
+                );
+                Ok((conn, pool_wait))
             }
             Ok(Err(err)) => {
+                let pool_wait = acquire_started.elapsed();
+                self.record_internal_metric(
+                    SqliteMaintenanceInternalMetric::PoolAcquire,
+                    pool_wait,
+                );
                 let err = ProxyError::Database(err);
-                self.record_error(operation, acquire_started.elapsed(), Duration::ZERO, &err);
+                self.record_error(operation, pool_wait, Duration::ZERO, &err);
                 Err(err)
             }
             Err(_) => {
@@ -2024,8 +2124,13 @@ impl SqliteRuntime {
                 // bounded-defer decision as a native sqlx pool timeout.
                 // Wrapping it in `Other` turns expected contention into an
                 // apparent scheduler failure and defeats foreground admission.
+                let pool_wait = acquire_started.elapsed();
+                self.record_internal_metric(
+                    SqliteMaintenanceInternalMetric::PoolAcquire,
+                    pool_wait,
+                );
                 let err = ProxyError::Database(sqlx::Error::PoolTimedOut);
-                self.record_error(operation, acquire_started.elapsed(), Duration::ZERO, &err);
+                self.record_error(operation, pool_wait, Duration::ZERO, &err);
                 Err(err)
             }
         }
@@ -2045,20 +2150,19 @@ impl SqliteRuntime {
                     return Err(err);
                 }
             };
-        let cooperative_run_deadline = if matches!(
-            operation,
+        let cooperative_run_deadline = match operation {
             SqliteOperation::AdminAlertsRead
-                | SqliteOperation::AdminAlertsCacheWarm
-                | SqliteOperation::DashboardQuotaRead
-        ) {
-            let deadline = Instant::now() + ADMIN_ALERTS_READ_RUN_BUDGET;
-            let mut handle = conn.lock_handle().await.map_err(ProxyError::Database)?;
-            handle.set_progress_handler(ADMIN_ALERTS_READ_PROGRESS_HANDLER_OPS, move || {
-                Instant::now() < deadline
-            });
-            Some(deadline)
-        } else {
-            None
+            | SqliteOperation::AdminAlertsCacheWarm
+            | SqliteOperation::DashboardQuotaRead
+            | SqliteOperation::AlertProjection => {
+                let deadline = Instant::now() + ADMIN_ALERTS_READ_RUN_BUDGET;
+                let mut handle = conn.lock_handle().await.map_err(ProxyError::Database)?;
+                handle.set_progress_handler(ADMIN_ALERTS_READ_PROGRESS_HANDLER_OPS, move || {
+                    Instant::now() < deadline
+                });
+                Some(deadline)
+            }
+            _ => None,
         };
         let cache_write_pages_start = connection_cache_write_pages(&mut conn).await;
         Ok(SqliteOperationConnection {
@@ -2109,8 +2213,9 @@ impl SqliteRuntime {
                 | SqliteOperation::AdminAlertsRead
                 | SqliteOperation::AdminAlertsCacheWarm
                 | SqliteOperation::DashboardQuotaRead
+                | SqliteOperation::AlertProjection
         ) {
-            // Admin privacy refreshes are detached from the HTTP budget. Its
+            // These reads are detached from the caller's future budget. Their
             // connection-local busy timeout is the bounded defer mechanism;
             // cancelling this future would leave a physical connection in an
             // unknown transaction state and turn discard into normal flow.
@@ -2123,7 +2228,12 @@ impl SqliteRuntime {
             .await
         };
         match begin_result {
-            Ok(Ok(_)) => {}
+            Ok(Ok(_)) => {
+                self.record_internal_metric(
+                    SqliteMaintenanceInternalMetric::Begin,
+                    begin_started.elapsed(),
+                );
+            }
             Ok(Err(err)) => {
                 let conn = snapshot
                     .conn
@@ -2132,12 +2242,16 @@ impl SqliteRuntime {
                 if let Err(restore_err) =
                     restore_operation_connection(conn, snapshot.restore_busy_timeout).await
                 {
+                    let begin_wait = begin_started.elapsed();
+                    self.record_internal_metric(SqliteMaintenanceInternalMetric::Begin, begin_wait);
                     let err = ProxyError::Database(restore_err);
-                    self.record_error(operation, pool_wait, begin_started.elapsed(), &err);
+                    self.record_error(operation, pool_wait, begin_wait, &err);
                     return Err(err);
                 }
+                let begin_wait = begin_started.elapsed();
+                self.record_internal_metric(SqliteMaintenanceInternalMetric::Begin, begin_wait);
                 let err = ProxyError::Database(err);
-                self.record_error(operation, pool_wait, begin_started.elapsed(), &err);
+                self.record_error(operation, pool_wait, begin_wait, &err);
                 return Err(err);
             }
             Err(_) => {
@@ -2146,8 +2260,10 @@ impl SqliteRuntime {
                     .take()
                     .expect("SQLite read snapshot connection");
                 conn.detach().close().await.ok();
+                let begin_wait = begin_started.elapsed();
+                self.record_internal_metric(SqliteMaintenanceInternalMetric::Begin, begin_wait);
                 let err = ProxyError::Database(sqlx::Error::PoolTimedOut);
-                self.record_error(operation, pool_wait, begin_started.elapsed(), &err);
+                self.record_error(operation, pool_wait, begin_wait, &err);
                 return Err(err);
             }
         }
@@ -2168,6 +2284,10 @@ impl SqliteRuntime {
                 ADMIN_ALERTS_READ_PROGRESS_HANDLER_OPS,
             )),
             SqliteOperation::DashboardQuotaRead => Some((
+                ADMIN_ALERTS_READ_RUN_BUDGET,
+                ADMIN_ALERTS_READ_PROGRESS_HANDLER_OPS,
+            )),
+            SqliteOperation::AlertProjection => Some((
                 ADMIN_ALERTS_READ_RUN_BUDGET,
                 ADMIN_ALERTS_READ_PROGRESS_HANDLER_OPS,
             )),
@@ -2244,17 +2364,28 @@ impl SqliteRuntime {
         )
         .await
         {
-            Ok(Ok(transaction)) => transaction,
+            Ok(Ok(transaction)) => {
+                self.record_internal_metric(
+                    SqliteMaintenanceInternalMetric::Begin,
+                    begin_started.elapsed(),
+                );
+                transaction
+            }
             Ok(Err(err)) => {
-                self.record_error(operation, pool_wait, begin_started.elapsed(), &err);
+                let begin_wait = begin_started.elapsed();
+                self.record_internal_metric(SqliteMaintenanceInternalMetric::Begin, begin_wait);
+                self.record_error(operation, pool_wait, begin_wait, &err);
                 return Err(err);
             }
             Err(_) => {
+                let begin_wait = begin_started.elapsed();
+                self.record_internal_metric(SqliteMaintenanceInternalMetric::Begin, begin_wait);
                 let err = ProxyError::Database(sqlx::Error::PoolTimedOut);
-                self.record_error(operation, pool_wait, begin_started.elapsed(), &err);
+                self.record_error(operation, pool_wait, begin_wait, &err);
                 return Err(err);
             }
         };
+        let begin_wait = begin_started.elapsed();
         let start_total_changes = match sqlx::query_scalar::<_, i64>("SELECT total_changes()")
             .fetch_one(&mut *transaction)
             .await
@@ -2263,7 +2394,7 @@ impl SqliteRuntime {
             Err(err) => {
                 let _ = transaction.rollback().await;
                 let err = ProxyError::Database(err);
-                self.record_error(operation, pool_wait, begin_started.elapsed(), &err);
+                self.record_error(operation, pool_wait, begin_wait, &err);
                 return Err(err);
             }
         };
@@ -2273,7 +2404,7 @@ impl SqliteRuntime {
             runtime: self.clone(),
             operation,
             pool_wait,
-            begin_wait: begin_started.elapsed(),
+            begin_wait,
             started_at: Instant::now(),
             start_total_changes,
             restore_busy_timeout,
@@ -2443,6 +2574,10 @@ impl SqliteRuntime {
             .saturating_add(u64::from(deadline_exceeded));
         drop(window);
 
+        if deadline_exceeded {
+            self.record_internal_metric(SqliteMaintenanceInternalMetric::NativeDeadline, elapsed);
+        }
+
         let mut telemetry = self
             .inner
             .operation_telemetry
@@ -2597,31 +2732,35 @@ impl SqliteRuntime {
         operation: SqliteOperation,
         reason: SqliteAdmissionDeferReason,
     ) {
-        self.record(
-            operation,
-            Duration::ZERO,
-            Duration::ZERO,
-            Duration::ZERO,
-            0,
-            false,
-            false,
-            Some(reason),
-        );
+        let zero = Duration::ZERO;
+        self.record(operation, zero, zero, zero, 0, false, false, Some(reason));
     }
 
     fn record_deferred_error(&self, operation: SqliteOperation, error: &ProxyError) {
+        use SqliteAdmissionDeferReason::*;
         let ProxyError::Deferred { reason, .. } = error else {
             self.record_error(operation, Duration::ZERO, Duration::ZERO, error);
             return;
         };
         let reason = match reason.as_str() {
-            "foreground_pressure" => SqliteAdmissionDeferReason::ForegroundPressure,
-            "pool_pressure" => SqliteAdmissionDeferReason::PoolPressure,
-            "recent_contention" => SqliteAdmissionDeferReason::RecentContention,
-            "query_deadline" | "read_budget" => SqliteAdmissionDeferReason::QueryDeadline,
-            // Generation fencing is a normal retry boundary rather than a
-            // database failure; keep it in the typed deadline/defer bucket.
-            _ => SqliteAdmissionDeferReason::QueryDeadline,
+            "foreground_pressure" => ForegroundPressure,
+            "pool_pressure" => PoolPressure,
+            "query_deadline" | "native_query_deadline" | "read_budget" => QueryDeadline,
+            "recent_contention" | "sqlite_contention" | "writer_contention" | "sqlite_busy" => {
+                RecentContention
+            }
+            _ if reason.contains("baseline") || reason.contains("source_") => SourceBaseline,
+            _ if reason.contains("coverage")
+                || reason.contains("projection")
+                || reason.contains("catalog")
+                || reason.contains("groups_")
+                || reason.contains("readiness")
+                || reason.contains("generation")
+                || reason.contains("payload") =>
+            {
+                CoverageReadiness
+            }
+            _ => Other,
         };
         self.record_deferred(operation, reason);
     }
@@ -2635,6 +2774,7 @@ impl SqliteRuntime {
     ) {
         let transient = is_transient_sqlite_write_error(err);
         let pool_timeout = matches!(err, ProxyError::Database(sqlx::Error::PoolTimedOut));
+        let acquire_timeout = pool_timeout && begin_wait.is_zero();
         let contention_entered = if transient {
             *self
                 .inner
@@ -2701,7 +2841,7 @@ impl SqliteRuntime {
                     SqliteOperation::ScheduledJobControl | SqliteOperation::HaOutboxGcWatchdog
                 ));
         let maintenance_defer_reason = maintenance_transient_defer.then_some(
-            if matches!(operation, SqliteOperation::MaintenanceCapacityWarm) {
+            if acquire_timeout || matches!(operation, SqliteOperation::MaintenanceCapacityWarm) {
                 SqliteAdmissionDeferReason::PoolPressure
             } else {
                 SqliteAdmissionDeferReason::RecentContention
@@ -2736,7 +2876,7 @@ impl SqliteRuntime {
             hold_ms = hold.as_millis() as u64,
             "discarded a physical SQLite connection with an unfinished transaction"
         );
-        self.record(operation, pool_wait, begin_wait, hold, 0, false, true, None);
+        self.record(operation, pool_wait, begin_wait, hold, 0, true, true, None);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2753,6 +2893,26 @@ impl SqliteRuntime {
     ) {
         let now = Instant::now();
         self.emit_contention_recovery_if_ready(now);
+        let outcome = if deferred.is_some() {
+            "degraded"
+        } else if error {
+            "error"
+        } else {
+            "success"
+        };
+        let reason = deferred
+            .map(SqliteAdmissionDeferReason::observability_as_str)
+            .unwrap_or(if error { "database" } else { "none" });
+        // Emit operational telemetry before taking the workload mutex. The recorder is
+        // bounded and in-memory, but it must never extend the SQLite critical section.
+        crate::observability::global_metrics().record_sqlite(
+            operation.workload_class(),
+            operation.as_str(),
+            pool_wait,
+            begin_wait,
+            outcome,
+            reason,
+        );
         let mut window = self
             .inner
             .workload
@@ -2815,6 +2975,7 @@ impl SqliteRuntime {
             format_operation_window(&window.operations, &window.reconciliation_reads);
         let admin_alerts_warm = format_admin_alerts_warm_window(window.admin_alerts_warm);
         let maintenance_admission = self.inner.maintenance_coordinator.snapshot();
+        let maintenance_evidence = self.inner.maintenance_metrics.format();
         let sqlite_file_state = self.sqlite_file_state();
         info!(
             component = "db",
@@ -2831,6 +2992,7 @@ impl SqliteRuntime {
             top_operations,
             admin_alerts_warm,
             maintenance_admission,
+            maintenance_evidence,
             "SQLite workload summary"
         );
         window.started_at = now;
@@ -2846,6 +3008,7 @@ impl SqliteRuntime {
             self.inner.acquire_waiters.load(AtomicOrdering::Acquire),
             AtomicOrdering::Release,
         );
+        self.inner.maintenance_metrics.rotate();
     }
 
     fn sqlite_file_state(&self) -> String {
@@ -3065,6 +3228,11 @@ pub(crate) struct SqliteOperationConnection {
 }
 
 impl SqliteOperationConnection {
+    #[cfg(test)]
+    pub(crate) fn expire_cooperative_run_deadline_for_test(&mut self) {
+        self.cooperative_run_deadline = Some(Instant::now());
+    }
+
     pub(crate) async fn complete_query<T>(
         mut self,
         query_result: Result<T, sqlx::Error>,
@@ -3141,12 +3309,11 @@ impl SqliteOperationConnection {
                 Err(err) => {
                     drop(conn.detach());
                     let err = ProxyError::Database(err);
-                    self.runtime.record_error(
-                        self.operation,
-                        self.pool_wait,
-                        begin_started.elapsed(),
-                        &err,
-                    );
+                    let begin_wait = begin_started.elapsed();
+                    self.runtime
+                        .record_internal_metric(SqliteMaintenanceInternalMetric::Begin, begin_wait);
+                    self.runtime
+                        .record_error(self.operation, self.pool_wait, begin_wait, &err);
                     return Err(err);
                 }
             };
@@ -3156,27 +3323,31 @@ impl SqliteOperationConnection {
         )
         .await
         {
-            Ok(Ok(transaction)) => Ok(SqliteOperationTransaction {
-                transaction: Some(transaction),
-                connection: self,
-            }),
-            Ok(Err(err)) => {
-                self.runtime.record_error(
-                    self.operation,
-                    self.pool_wait,
+            Ok(Ok(transaction)) => {
+                self.runtime.record_internal_metric(
+                    SqliteMaintenanceInternalMetric::Begin,
                     begin_started.elapsed(),
-                    &err,
                 );
+                Ok(SqliteOperationTransaction {
+                    transaction: Some(transaction),
+                    connection: self,
+                })
+            }
+            Ok(Err(err)) => {
+                let begin_wait = begin_started.elapsed();
+                self.runtime
+                    .record_internal_metric(SqliteMaintenanceInternalMetric::Begin, begin_wait);
+                self.runtime
+                    .record_error(self.operation, self.pool_wait, begin_wait, &err);
                 Err(err)
             }
             Err(_) => {
+                let begin_wait = begin_started.elapsed();
+                self.runtime
+                    .record_internal_metric(SqliteMaintenanceInternalMetric::Begin, begin_wait);
                 let err = ProxyError::Database(sqlx::Error::PoolTimedOut);
-                self.runtime.record_error(
-                    self.operation,
-                    self.pool_wait,
-                    begin_started.elapsed(),
-                    &err,
-                );
+                self.runtime
+                    .record_error(self.operation, self.pool_wait, begin_wait, &err);
                 Err(err)
             }
         }
@@ -3215,6 +3386,7 @@ impl SqliteOperationConnection {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) async fn close_and_discard(mut self) -> Result<(), ProxyError> {
         let Some(mut conn) = self.conn.take() else {
             return Ok(());
@@ -3442,6 +3614,7 @@ impl SqliteReadSnapshot {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn complete_query<T>(
         mut self,
         query_result: Result<T, sqlx::Error>,
@@ -4149,7 +4322,7 @@ async fn complete_immediate_transaction_commit(
     rows_affected: u64,
 ) -> Result<(), ProxyError> {
     #[cfg(test)]
-    wait_for_owned_finish_pause_for_test().await;
+    runtime.wait_for_owned_finish_pause_for_test().await;
     let mut conn = match transaction.commit_connection().await {
         Ok(conn) => conn,
         Err(error) => {
@@ -4340,136 +4513,6 @@ impl Drop for SqliteImmediateTransaction {
             drop(transaction);
         }
     }
-}
-
-fn monotonic_delta(current: Option<u64>, previous: Option<u64>) -> Option<u64> {
-    current
-        .zip(previous)
-        .map(|(current, previous)| current.saturating_sub(previous))
-}
-
-fn format_operation_window(
-    operations: &BTreeMap<SqliteOperation, OperationWindow>,
-    reconciliation_reads: &BTreeMap<ReconciliationReadKind, ReconciliationReadWindow>,
-) -> String {
-    operations
-        .iter()
-        .map(|(operation, metrics)| {
-            let deferred_reasons = metrics
-                .deferred_by_reason
-                .iter()
-                .map(|(reason, count)| format!("{}={count}", reason.as_str()))
-                .collect::<Vec<_>>()
-                .join("|");
-            let cache_write_pages = if metrics.connection_cache_write_sampled
-                && !metrics.connection_cache_write_sample_failed
-            {
-                metrics.connection_cache_write_pages.to_string()
-            } else {
-                "unknown".to_string()
-            };
-            format!(
-                "{}/{}:calls={},deferred={},defer_reasons={},errors={},retries={},discarded={},pool_wait_ms={},begin_wait_ms={},hold_ms={},hold_p95_ms={},rows={},connection_cache_write_pages={},cooperative_read_elapsed_ms={},cooperative_read_deadlines={}",
-                operation.workload_class(),
-                operation.as_str(),
-                metrics.calls,
-                metrics.deferred,
-                deferred_reasons,
-                metrics.errors,
-                metrics.retries,
-                metrics.discarded_connections,
-                metrics.pool_wait_ms,
-                metrics.begin_wait_ms,
-                metrics.hold_ms,
-                transaction_hold_p95_ms(&metrics.hold_histogram),
-                metrics.rows_affected,
-                cache_write_pages,
-                metrics.cooperative_read_elapsed_ms,
-                metrics.cooperative_read_deadlines,
-            )
-        })
-        .chain(reconciliation_reads.iter().map(|(kind, metrics)| {
-            let cache_write_pages = if metrics.connection_cache_write_sampled
-                && !metrics.connection_cache_write_sample_failed
-            {
-                metrics.connection_cache_write_pages.to_string()
-            } else {
-                "unknown".to_string()
-            };
-            format!(
-                "reconciliation_read/{}:calls={},elapsed_ms={},deadlines={},deferred={},discarded={},connection_cache_write_pages={},key_observation_reuses={},key_observation_identity_misses={}",
-                kind.as_str(),
-                metrics.calls,
-                metrics.elapsed_ms,
-                metrics.deadlines,
-                metrics.deferred,
-                metrics.discarded_connections,
-                cache_write_pages,
-                metrics.key_observation_reuses,
-                metrics.key_observation_identity_misses,
-            )
-        }))
-        .collect::<Vec<_>>()
-        .join(";")
-}
-
-fn format_admin_alerts_warm_window(metrics: AdminAlertsWarmWindow) -> String {
-    format!(
-        "slices={},publishes={},generation_discards={},defers={},cold_misses={},canonical_events_indexed_reads={},canonical_catalog_payload_slices={},canonical_group_build_slices={},canonical_group_reduction_slices={},canonical_group_publishes={},canonical_group_defers={}",
-        metrics.slices,
-        metrics.publishes,
-        metrics.generation_discards,
-        metrics.defers,
-        metrics.cold_misses,
-        metrics.canonical_events_indexed_reads,
-        metrics.canonical_catalog_payload_slices,
-        metrics.canonical_group_build_slices,
-        metrics.canonical_group_reduction_slices,
-        metrics.canonical_group_publishes,
-        metrics.canonical_group_defers,
-    )
-}
-
-fn format_sqlite_file_state(paths: &SqliteFileStatePaths) -> String {
-    let mut fields = Vec::with_capacity(4);
-    for (label, path) in [
-        ("core", paths.core.as_ref()),
-        ("observability", paths.observability.as_ref()),
-    ] {
-        let Some(path) = path else {
-            continue;
-        };
-        fields.push(format!("{label}_db_bytes={}", sqlite_file_size(path)));
-        let wal_path = PathBuf::from(format!("{}-wal", path.display()));
-        fields.push(format!("{label}_wal_bytes={}", sqlite_file_size(&wal_path)));
-    }
-    if fields.is_empty() {
-        "unconfigured".to_string()
-    } else {
-        fields.join(",")
-    }
-}
-
-fn sqlite_file_size(path: &std::path::Path) -> String {
-    std::fs::metadata(path)
-        .map(|metadata| metadata.len().to_string())
-        .unwrap_or_else(|_| "unknown".to_string())
-}
-
-fn transaction_hold_p95_ms(histogram: &[u64; TRANSACTION_HOLD_BUCKET_UPPER_MS.len()]) -> u64 {
-    let samples = histogram.iter().sum::<u64>();
-    if samples == 0 {
-        return 0;
-    }
-    let target = samples.saturating_mul(95).saturating_add(99) / 100;
-    let mut cumulative = 0_u64;
-    for (index, count) in histogram.iter().enumerate() {
-        cumulative = cumulative.saturating_add(*count);
-        if cumulative >= target {
-            return TRANSACTION_HOLD_BUCKET_UPPER_MS[index];
-        }
-    }
-    TRANSACTION_HOLD_BUCKET_UPPER_MS[TRANSACTION_HOLD_BUCKET_UPPER_MS.len() - 1]
 }
 
 fn read_process_write_bytes() -> Option<u64> {

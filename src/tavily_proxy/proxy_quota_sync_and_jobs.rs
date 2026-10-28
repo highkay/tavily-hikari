@@ -145,23 +145,33 @@ impl TavilyProxy {
         billing_subject: &str,
         research_request_id: Option<&str>,
     ) -> Result<Option<BusinessPeriod>, ProxyError> {
-        self.key_store
+        let result = self
+            .key_store
             .record_upstream_reconciliation_usage(
                 token_id,
                 key_id,
                 billing_subject,
                 research_request_id,
             )
-            .await
+            .await?;
+        if result.is_some() {
+            self.mark_upstream_reconciliation_maintenance_dirty();
+        }
+        Ok(result)
     }
 
     pub async fn mark_upstream_reconciliation_research_terminal(
         &self,
         request_id: &str,
     ) -> Result<bool, ProxyError> {
-        self.key_store
+        let changed = self
+            .key_store
             .mark_upstream_reconciliation_research_terminal(request_id)
-            .await
+            .await?;
+        if changed {
+            self.mark_upstream_reconciliation_maintenance_dirty();
+        }
+        Ok(changed)
     }
 
     pub async fn shadow_daily_reconciled_usage_for_accounts(
@@ -185,7 +195,6 @@ impl TavilyProxy {
             .shadow_daily_projection_for_accounts(user_ids, window.start, window.end)
             .await
     }
-
 
     pub async fn mark_upstream_reconciliation_enqueue_error_at(
         &self,
@@ -707,6 +716,7 @@ impl TavilyProxy {
         )
         .await
     }
+
     async fn run_upstream_reconciliation_once_inner(
         &self,
         usage_base: &str,
@@ -878,7 +888,8 @@ impl TavilyProxy {
                 Self::RECONCILIATION_TOTAL_BUDGET_SECS
                     .saturating_sub(Self::RECONCILIATION_OUTER_TIMEOUT_MARGIN_SECS),
             );
-        let mut preparation_budget_exhausted = false;
+        let (mut preparation_budget_exhausted, mut projection_accepted_progress) = (false, false);
+        macro_rules! deferred { ($reason:expr) => { return Ok(ReconciliationEngine::deferred_with_projection_progress(self, $reason, projection_accepted_progress)); }; ($reason:expr, $retry_at:expr) => { return Ok(ReconciliationEngine::deferred_at_with_projection_progress(self, $reason, $retry_at, projection_accepted_progress)); }; (value $reason:expr) => { ReconciliationEngine::deferred_with_projection_progress(self, $reason, projection_accepted_progress) }; }
         let mut candidate_batch;
         if preparation_deadline <= std::time::Instant::now() {
             return Ok(ReconciliationEngine::deferred(self, "local_pressure"));
@@ -931,7 +942,8 @@ impl TavilyProxy {
                     }
                 };
                 match projection {
-                    Ok(ReconciliationProjectionSliceOutcome::Advanced { scanned_rows, .. }) => {
+                    Ok(ReconciliationProjectionSliceOutcome::Advanced { scanned_rows, completed }) => {
+                        projection_accepted_progress |= completed || scanned_rows > 0;
                         if candidate_batch.candidates.is_empty()
                             && scanned_rows > 0
                             && std::time::Instant::now() < preparation_deadline
@@ -947,31 +959,22 @@ impl TavilyProxy {
                                         &err,
                                     ) =>
                                 {
-                                    return Ok(ReconciliationEngine::deferred(
-                                        self,
-                                        "projection_read_budget",
-                                    ));
+                                    deferred!("projection_read_budget");
                                 }
                                 Err(err) if is_transient_sqlite_write_error(&err) => {
-                                    return Ok(ReconciliationEngine::deferred(
-                                        self,
-                                        "local_pressure",
-                                    ));
+                                    deferred!("local_pressure");
                                 }
                                 Err(err) => return Err(err),
                             };
                             if std::time::Instant::now() >= preparation_deadline {
-                                return Ok(ReconciliationEngine::deferred(self, "local_pressure"));
+                                deferred!("local_pressure");
                             }
                         }
                     }
                     Ok(ReconciliationProjectionSliceOutcome::Deferred {
                         reason: "projection_read_budget",
                     }) => {
-                        return Ok(ReconciliationEngine::deferred(
-                            self,
-                            "projection_read_budget",
-                        ));
+                        deferred!("projection_read_budget");
                     }
                     Ok(ReconciliationProjectionSliceOutcome::Deferred { .. }) => {
                         preparation_budget_exhausted |=
@@ -991,7 +994,7 @@ impl TavilyProxy {
                     Err(err) => return Err(err),
                 }
                 if std::time::Instant::now() >= preparation_deadline {
-                    return Ok(ReconciliationEngine::deferred(self, "local_pressure"));
+                    deferred!("local_pressure");
                 }
             }
         }
@@ -1014,7 +1017,7 @@ impl TavilyProxy {
             let remaining = candidate_hydration_deadline
                 .saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
-                return Ok(ReconciliationEngine::deferred(self, "local_pressure"));
+            deferred!("local_pressure");
             } else {
                 match self
                     .key_store
@@ -1023,20 +1026,17 @@ impl TavilyProxy {
                 {
                     Ok(result) => result,
                     Err(err) if ReconciliationEngine::projection_read_budget_is_deferred(&err) => {
-                        return Ok(ReconciliationEngine::deferred(
-                            self,
-                            "projection_read_budget",
-                        ));
+                        deferred!("projection_read_budget");
                     }
                     Err(err) if is_transient_sqlite_write_error(&err) => {
-                        return Ok(ReconciliationEngine::deferred(self, "local_pressure"));
+                        deferred!("local_pressure");
                     }
                     Err(err) => return Err(err),
                 }
             }
         };
         if std::time::Instant::now() >= candidate_hydration_deadline {
-            return Ok(ReconciliationEngine::deferred(self, "local_pressure"));
+            deferred!("local_pressure");
         }
         let all_key_ids = key_ids_by_candidate
             .values()
@@ -1048,7 +1048,7 @@ impl TavilyProxy {
             let remaining = candidate_hydration_deadline
                 .saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
-                return Ok(ReconciliationEngine::deferred(self, "local_pressure"));
+                deferred!("local_pressure");
             } else {
                 match self
                     .key_store
@@ -1061,14 +1061,14 @@ impl TavilyProxy {
                 {
                     Ok(result) => result,
                     Err(err) if is_transient_sqlite_write_error(&err) => {
-                        return Ok(ReconciliationEngine::deferred(self, "local_pressure"));
+                        deferred!("local_pressure");
                     }
                     Err(err) => return Err(err),
                 }
             }
         };
         if std::time::Instant::now() >= candidate_hydration_deadline {
-            return Ok(ReconciliationEngine::deferred(self, "local_pressure"));
+            deferred!("local_pressure");
         }
         let mut earliest_key_cooldown_until = active_key_cooldowns
             .values()
@@ -1078,7 +1078,7 @@ impl TavilyProxy {
             let remaining = candidate_hydration_deadline
                 .saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
-                return Ok(ReconciliationEngine::deferred(self, "local_pressure"));
+                deferred!("local_pressure");
             }
             match self
                 .key_store
@@ -1087,22 +1087,19 @@ impl TavilyProxy {
             {
                 Ok(_) => {}
                 Err(err) if ReconciliationEngine::projection_read_budget_is_deferred(&err) => {
-                    return Ok(ReconciliationEngine::deferred(
-                        self,
-                        "projection_read_budget",
-                    ));
+                        deferred!("projection_read_budget");
                 }
                 Err(err) if is_transient_sqlite_write_error(&err) => {
-                    return Ok(ReconciliationEngine::deferred(self, "local_pressure"));
+                    deferred!("local_pressure");
                 }
                 Err(err) => return Err(err),
             }
             if std::time::Instant::now() >= candidate_hydration_deadline {
-                return Ok(ReconciliationEngine::deferred(self, "local_pressure"));
+                deferred!("local_pressure");
             }
         }
         if std::time::Instant::now() >= candidate_hydration_deadline {
-            return Ok(ReconciliationEngine::deferred(self, "local_pressure"));
+            deferred!("local_pressure");
         }
         // This indexed eligibility probe is deliberately smaller than the
         // prioritized Research sweep. A deadline here must not turn due
@@ -1136,14 +1133,12 @@ impl TavilyProxy {
             Err(err) => return Err(err),
         };
         if std::time::Instant::now() >= candidate_hydration_deadline {
-            return Ok(ReconciliationEngine::deferred(
-                self,
-                if research_reservation_read_budget_deferred {
-                    "projection_read_budget"
-                } else {
-                    "local_pressure"
-                },
-            ));
+            let defer_reason = if research_reservation_read_budget_deferred {
+                "projection_read_budget"
+            } else {
+                "local_pressure"
+            };
+            deferred!(defer_reason);
         }
         let ReconciliationRemoteBudget {
             main_remote_deadline,
@@ -1702,7 +1697,6 @@ impl TavilyProxy {
                 }
                 observed_candidates.push((candidate, upstream_usage, in_recent_lane, work_generation));
             }
-
             // Billing can become charged while the remote request is in flight. The
             // source-phase batch above proves that BillingHydrate fits its native
             // deadline before any HTTP starts. Re-read each observed candidate here
@@ -1771,10 +1765,7 @@ impl TavilyProxy {
                 event = "generation_changed_during_observation",
                 "reconciliation claim remains current but its work generation changed; deferring for a fenced continuation"
             );
-            return Ok(ReconciliationEngine::deferred(
-                self,
-                RECONCILIATION_RETRY_REASON_GENERATION_CHANGED,
-            ));
+            deferred!(RECONCILIATION_RETRY_REASON_GENERATION_CHANGED);
         }
         if let Some((job_id, claim_generation)) = claimed_job
             && !self
@@ -1795,7 +1786,7 @@ impl TavilyProxy {
             .map(|value| value.budget_exhausted)
             .unwrap_or(true);
         if !self.persist_main_reconciliation_marker().await? {
-            return Ok(ReconciliationEngine::deferred(self, "local_pressure"));
+            deferred!("local_pressure");
         }
         let research_started_at = std::time::Instant::now();
         let mut research_defer_reason: Option<&'static str> = None;
@@ -1818,10 +1809,10 @@ impl TavilyProxy {
             research_defer_reason = Some(RECONCILIATION_RETRY_REASON_REMOTE_ATTEMPT_BUDGET);
         }
         let research_page = if result.is_ok()
-            && !remote_attempt_budget_deferred
-            && !main_remote_budget_deferred
+            && projection_accepted_progress
             && research_reservation_required
             && !self.sqlite_maintenance_runs_shutting_down()
+            && !(remote_attempt_budget_deferred || main_remote_budget_deferred)
         {
             match self
                 .key_store
@@ -2170,8 +2161,8 @@ impl TavilyProxy {
                                 .await?
                             }
                         }
-                    } else if reconciliation_outcome
-                        .is_some_and(ReconciliationEngine::clears_local_pressure)
+                    } else if projection_accepted_progress
+                        || reconciliation_outcome.is_some_and(ReconciliationEngine::clears_local_pressure)
                     {
                         let now = self.backend_time.now_ts();
                         match claimed_job {
@@ -2349,7 +2340,7 @@ impl TavilyProxy {
                                 .now_ts()
                                 .saturating_add(ReconciliationEngine::DEFER_RETRY_DELAY_SECS)
                         });
-                    return Ok(ReconciliationEngine::deferred_at(self, reason, retry_at));
+                    deferred!(reason, retry_at);
                 }
                 Ok(ClaimedReconciliationRunOutcome::Completed {
                     settled,
@@ -2364,10 +2355,7 @@ impl TavilyProxy {
                     reason = "projection_read_budget",
                     "reconciliation source read reached its SQLite budget before a durable boundary"
                 );
-                Ok(ReconciliationEngine::deferred(
-                    self,
-                    "projection_read_budget",
-                ))
+                Ok(deferred!(value "projection_read_budget"))
             }
             Err(err) if is_transient_sqlite_write_error(&err) => {
                 tracing::debug!(
@@ -2376,7 +2364,7 @@ impl TavilyProxy {
                     reason = "local_pressure",
                     err = %err,
                 );
-                Ok(ReconciliationEngine::deferred(self, "local_pressure"))
+                Ok(deferred!(value "local_pressure"))
             }
             Err(err) => {
                 tracing::warn!(
@@ -2678,7 +2666,27 @@ impl TavilyProxy {
                 if let Some(timeout) = timeout {
                     req = req.timeout(timeout);
                 }
-                (req.send().await.map_err(ProxyError::Http)?, None)
+                let attempt_started = std::time::Instant::now();
+                match req.send().await {
+                    Ok(response) => {
+                        crate::observability::global_metrics().record_upstream(
+                            crate::observability::upstream_class_for_operation(request_kind),
+                            request_kind,
+                            Ok(response.status()),
+                            attempt_started.elapsed(),
+                        );
+                        (response, None)
+                    }
+                    Err(err) => {
+                        crate::observability::global_metrics().record_upstream_failure(
+                            crate::observability::upstream_class_for_operation(request_kind),
+                            request_kind,
+                            err.is_timeout(),
+                            attempt_started.elapsed(),
+                        );
+                        return Err(ProxyError::Http(err));
+                    }
+                }
             }
         };
         let status = resp.status();
@@ -3034,12 +3042,32 @@ impl TavilyProxy {
         reason: &'static str,
         retry_at: i64,
     ) -> Result<ScheduledJobEnqueueResult, ProxyError> {
+        self.finalize_deferred_upstream_reconciliation_claim_with_progress(
+            job_id,
+            claim_generation,
+            reason,
+            retry_at,
+            false,
+        )
+        .await
+    }
+
+    #[doc(hidden)]
+    pub async fn finalize_deferred_upstream_reconciliation_claim_with_progress(
+        &self,
+        job_id: i64,
+        claim_generation: i64,
+        reason: &'static str,
+        retry_at: i64,
+        projection_accepted_progress: bool,
+    ) -> Result<ScheduledJobEnqueueResult, ProxyError> {
         self.key_store
-            .finalize_deferred_upstream_reconciliation_claim(
+            .finalize_deferred_upstream_reconciliation_claim_with_progress(
                 job_id,
                 claim_generation,
                 reason,
                 retry_at,
+                projection_accepted_progress,
             )
             .await
     }
