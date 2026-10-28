@@ -376,18 +376,20 @@ async fn exhausted_signal_marks_exhausted_with_maintenance_row_per_provider() {
     ] {
         let secret = format!("mtx-ex-{}", provider.as_str());
         let key_id = seed_provider_key(&proxy, provider, &secret).await;
-        // M8 adversarial seed: remaining AT ZERO (under any threshold) so a
-        // wrongly-generalized depletion gate WOULD write a row.
-        sqlx::query("UPDATE api_keys SET quota_remaining = 0, quota_limit = 100 WHERE id = ?")
-            .bind(&key_id)
-            .execute(&proxy.key_store.pool)
-            .await
-            .expect("seed zero remaining");
         let lease = proxy
             .key_store
             .acquire_key_for_provider(provider)
             .await
             .expect("lease");
+        // M8 adversarial seed: remaining AT ZERO (under any threshold) so a
+        // wrongly-generalized depletion gate WOULD write a row. Seeded after
+        // the lease because the active-tier selector now excludes
+        // zero-remaining keys (plan tavily-zombie-key-exclusion).
+        sqlx::query("UPDATE api_keys SET quota_remaining = 0, quota_limit = 100 WHERE id = ?")
+            .bind(&key_id)
+            .execute(&proxy.key_store.pool)
+            .await
+            .expect("seed zero remaining");
         let effect = proxy
             .reconcile_key_health(
                 &lease,
@@ -425,16 +427,18 @@ async fn exhausted_signal_marks_exhausted_with_maintenance_row_per_provider() {
 async fn tavily_432_positive_control_still_records_depletion() {
     let (proxy, _clock) = spawn_matrix_proxy("health-matrix-tavily-432").await;
     let key_id = seed_provider_key(&proxy, ProviderId::Tavily, "mtx-tvly-432").await;
-    sqlx::query("UPDATE api_keys SET quota_remaining = 0 WHERE id = ?")
-        .bind(&key_id)
-        .execute(&proxy.key_store.pool)
-        .await
-        .expect("seed zero remaining");
     let lease = proxy
         .key_store
         .acquire_key_for_provider(ProviderId::Tavily)
         .await
         .expect("tavily lease");
+    // Seeded after the lease because the active-tier selector now excludes
+    // zero-remaining keys (plan tavily-zombie-key-exclusion).
+    sqlx::query("UPDATE api_keys SET quota_remaining = 0 WHERE id = ?")
+        .bind(&key_id)
+        .execute(&proxy.key_store.pool)
+        .await
+        .expect("seed zero remaining");
     let effect = proxy
         .reconcile_key_health(&lease, "/matrix/tavily-432", &exhausted_analysis(432), None)
         .await
