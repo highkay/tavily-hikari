@@ -1393,6 +1393,9 @@ async fn api_rebalance_without_routing_key_ignores_token_primary_and_uses_full_p
     let _ = std::fs::remove_file(db_path);
 }
 
+/// `(id, status_code, api_key_id, fallback_reason)` row of a retry chain.
+type RetryChainRow = (i64, Option<i64>, Option<String>, Option<String>);
+
 #[tokio::test]
 async fn unknown_403_temporarily_cools_key_without_quarantine_and_success_clears_it() {
     let db_path = temp_db_path("unknown-403-transient-backoff");
@@ -1536,22 +1539,22 @@ async fn unknown_403_temporarily_cools_key_without_quarantine_and_success_clears
     // connection already saw both rows. Every other retry-chain battery in
     // this repo observes through `connect_sqlite_test_pool` for this reason.
     let observe = super::support::connect_sqlite_test_pool(&db_str).await;
-    let first_chain: Vec<(Option<i64>, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT status_code, api_key_id, fallback_reason FROM observability.request_logs ORDER BY id ASC",
+    let first_chain: Vec<RetryChainRow> = sqlx::query_as(
+        "SELECT id, status_code, api_key_id, fallback_reason FROM observability.request_logs ORDER BY id ASC",
     )
     .fetch_all(&observe)
     .await
     .expect("load first request attempt rows");
     assert_eq!(first_chain.len(), 2, "one visible row per upstream attempt");
-    assert_eq!(first_chain[0].0, Some(403));
-    assert_eq!(first_chain[0].1.as_deref(), Some(hotter_key_id.as_str()));
+    assert_eq!(first_chain[0].1, Some(403));
+    assert_eq!(first_chain[0].2.as_deref(), Some(hotter_key_id.as_str()));
     assert_eq!(
-        first_chain[0].2.as_deref(),
+        first_chain[0].3.as_deref(),
         Some("upstream_key_retry:attempted")
     );
-    assert_eq!(first_chain[1].0, Some(200));
+    assert_eq!(first_chain[1].1, Some(200));
     assert_eq!(
-        first_chain[1].2.as_deref(),
+        first_chain[1].3.as_deref(),
         Some("upstream_key_retry:succeeded")
     );
 
@@ -1607,6 +1610,21 @@ async fn unknown_403_temporarily_cools_key_without_quarantine_and_success_clears
     .expect("count maintenance records");
     assert_eq!(maintenance_count, 1);
 
+    // Scope the second observation to this logical request: the window starts
+    // after the newest id the first chain just proved visible, so neither an
+    // interleaved writer nor the previous request can shift which rows are read.
+    let second_request_floor = first_chain[1].0;
+    // A WAL reader can still land on the state from just before the retry row
+    // committed - observed under CI-grade contention as one row where two were
+    // committed microseconds later. Wait for the scoped window to become fully
+    // visible with a bounded budget, then assert its exact contents.
+    let mut second_observe = super::support::connect_sqlite_test_connection(
+        &db_str,
+        false,
+        false,
+        std::time::Duration::from_secs(5),
+    )
+    .await;
     let (second_resp, _second_analysis) = proxy
         .proxy_http_json_endpoint(
             &usage_base,
@@ -1629,31 +1647,53 @@ async fn unknown_403_temporarily_cools_key_without_quarantine_and_success_clears
     // the retry's success (amendment contract), and that 403 re-arms the
     // cooldown the next sync below clears.
     assert_eq!(second_resp.status, StatusCode::OK);
-    let second_chain: Vec<(Option<i64>, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT status_code, api_key_id, fallback_reason FROM observability.request_logs ORDER BY id DESC LIMIT 2",
-    )
-    .fetch_all(&observe)
+    let second_chain = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            // This token's own retry-chain rows only: a rebalance audit or a
+            // local rejection from any other writer must never enter the window.
+            let rows: Vec<(Option<i64>, Option<String>, Option<String>)> = sqlx::query_as(
+                "SELECT status_code, api_key_id, fallback_reason FROM observability.request_logs \
+                 WHERE id > ? AND auth_token_id = ? \
+                   AND fallback_reason LIKE 'upstream_key_retry:%' ORDER BY id ASC",
+            )
+            .bind(second_request_floor)
+            .bind(&token.id)
+            .fetch_all(&mut second_observe)
+            .await
+            .expect("load second request attempt rows");
+            // The retry row is the last thing the request commits, so its
+            // `succeeded` marker is the exact signal that the whole window is
+            // visible - not merely that enough rows arrived.
+            if rows.len() >= 2
+                && rows.last().and_then(|row| row.2.as_deref())
+                    == Some("upstream_key_retry:succeeded")
+            {
+                return rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
     .await
-    .expect("load second request attempt rows");
+    .expect("both second-request attempt rows become visible");
     assert_eq!(
         second_chain.len(),
         2,
         "one visible row per upstream attempt"
     );
-    // Newest first: [0] is the retry, [1] the blocked attempt on the cleared key.
-    assert_eq!(second_chain[1].0, Some(403));
+    // Oldest first: [0] is the blocked attempt on the cleared key, [1] the retry.
+    assert_eq!(second_chain[0].0, Some(403));
     assert_eq!(
-        second_chain[1].1.as_deref(),
+        second_chain[0].1.as_deref(),
         Some(hotter_key_id.as_str()),
         "the cleared key is selectable again and hits the 403"
     );
     assert_eq!(
-        second_chain[1].2.as_deref(),
+        second_chain[0].2.as_deref(),
         Some("upstream_key_retry:attempted")
     );
-    assert_eq!(second_chain[0].0, Some(200));
+    assert_eq!(second_chain[1].0, Some(200));
     assert_eq!(
-        second_chain[0].2.as_deref(),
+        second_chain[1].2.as_deref(),
         Some("upstream_key_retry:succeeded")
     );
 
