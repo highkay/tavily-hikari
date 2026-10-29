@@ -91,7 +91,6 @@ impl KeyStore {
             SELECT id
             FROM api_keys
             WHERE deleted_at IS NULL
-              AND status <> ?
               AND provider = ?
               AND NOT EXISTS (
                   SELECT 1
@@ -104,7 +103,6 @@ impl KeyStore {
             ORDER BY CASE WHEN quota_synced_at IS NULL OR quota_synced_at = 0 THEN 0 ELSE 1 END, quota_synced_at ASC
             "#,
         )
-        .bind(STATUS_EXHAUSTED)
         .bind(provider.as_str())
         .bind(threshold)
         .fetch_all(&self.pool)
@@ -128,7 +126,6 @@ impl KeyStore {
             SELECT id
             FROM api_keys
             WHERE deleted_at IS NULL
-              AND status <> ?
               AND provider = ?
               AND last_used_at >= ?
               AND NOT EXISTS (
@@ -142,7 +139,6 @@ impl KeyStore {
             ORDER BY last_used_at DESC, quota_synced_at ASC, id ASC
             "#,
         )
-        .bind(STATUS_EXHAUSTED)
         .bind(provider.as_str())
         .bind(active_since)
         .bind(stale_before)

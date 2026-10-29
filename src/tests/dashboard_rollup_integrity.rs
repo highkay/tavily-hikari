@@ -322,73 +322,16 @@ async fn recovery_fails_closed_when_legacy_gc_deleted_source_baseline_is_missing
     insert_visible_dashboard_log(&proxy, day + 60).await;
     insert_visible_dashboard_log(&proxy, day + 120).await;
 
-    let mut gc_reason_counts = std::collections::BTreeMap::<&'static str, usize>::new();
-    let mut slice_counts = std::collections::BTreeMap::<(&'static str, i64), usize>::new();
-    let mut slice_summary = Vec::with_capacity(300);
-    for _ in 0..300 {
-        let decision = proxy
-            .key_store
-            .dashboard_rollup_integrity_request_log_gc_decision(threshold)
-            .await
-            .expect("check source seal");
-        let cutoff = match decision {
-            crate::store::DashboardRollupRequestLogGcDecision::Allowed { cutoff, .. } => {
-                *gc_reason_counts.entry("allowed").or_default() += 1;
-                Some(cutoff)
-            }
-            crate::store::DashboardRollupRequestLogGcDecision::Blocked { reason, .. } => {
-                *gc_reason_counts.entry(reason).or_default() += 1;
-                None
-            }
-        };
-        if cutoff.is_some() {
-            break;
-        }
-        let run = proxy
-            .run_dashboard_rollup_integrity_slice()
-            .await
-            .expect("build source seal");
-        let state = match run.state.as_str() {
-            "verified" => "verified",
-            "deferred" => "deferred",
-            "repaired" => "repaired",
-            _ => "other",
-        };
-        *slice_counts
-            .entry((state, run.next_delay_secs))
-            .or_default() += 1;
-        slice_summary.push((run.state, run.next_delay_secs));
-    }
-    let final_cutoff = {
-        let decision = proxy
-            .key_store
-            .dashboard_rollup_integrity_request_log_gc_decision(threshold)
-            .await
-            .expect("read source seal");
-        match decision {
-            crate::store::DashboardRollupRequestLogGcDecision::Allowed { cutoff, .. } => {
-                *gc_reason_counts.entry("allowed").or_default() += 1;
-                Some(cutoff)
-            }
-            crate::store::DashboardRollupRequestLogGcDecision::Blocked { reason, .. } => {
-                *gc_reason_counts.entry(reason).or_default() += 1;
-                None
-            }
-        }
-    };
-    if final_cutoff != Some(day_end) {
-        emit_dashboard_rollup_integrity_failure_snapshot(
-            &proxy.key_store.pool,
-            day,
-            day_end,
-            final_cutoff,
-            &gc_reason_counts,
-            &slice_counts,
-            &slice_summary,
-        )
+    converge_dashboard_integrity_seal(&proxy, threshold, day, day_end, "building the source seal")
         .await;
-    }
-    assert_eq!(final_cutoff, Some(day_end));
+    assert_eq!(
+        proxy
+            .key_store
+            .dashboard_rollup_integrity_request_log_gc_cutoff(threshold)
+            .await
+            .expect("read source seal"),
+        Some(day_end)
+    );
 
     sqlx::query("UPDATE dashboard_rollup_gc_delete_state SET active = 1 WHERE id = 1")
         .execute(&proxy.key_store.pool)
@@ -566,16 +509,16 @@ async fn joint_recovery_reports_budget_exhaustion_and_resumes_from_checkpoint() 
     assert!(first.accepted_checkpoints > 0 || first.checkpoint > target_day_start);
     assert!(first.target_expired_rows_remaining > 0);
 
-    let second = run_request_statistics_recovery_once(
+    let second = run_request_statistics_recovery_to_completion(
         &db_str,
         RequestStatisticsRecoveryOptions {
             target_day_start,
             max_runtime_secs: 10,
             ..RequestStatisticsRecoveryOptions::default()
         },
+        "resuming from the durable checkpoint",
     )
-    .await
-    .expect("recovery should resume from its durable checkpoint");
+    .await;
     assert_eq!(second.outcome, "complete", "report={second:?}");
     assert_eq!(second.target_expired_rows_remaining, 0);
     assert!(second.accepted_checkpoints >= first.accepted_checkpoints);
@@ -631,7 +574,7 @@ async fn joint_recovery_seals_and_deletes_an_expired_fixed_target() {
     .await
     .expect("request statistics recovery must wait for the service owner to release");
 
-    let report = run_request_statistics_recovery_once(
+    let report = run_request_statistics_recovery_to_completion(
         &db_str,
         RequestStatisticsRecoveryOptions {
             target_day_start,
@@ -640,9 +583,9 @@ async fn joint_recovery_seals_and_deletes_an_expired_fixed_target() {
             gc_max_batches: 4,
             ..RequestStatisticsRecoveryOptions::default()
         },
+        "sealing and deleting the expired fixed target",
     )
-    .await
-    .expect("recover expired fixed target");
+    .await;
     assert_eq!(report.outcome, "complete", "report={report:?}");
     assert!(report.target_complete);
     assert!(report.sealed_day);
@@ -1446,6 +1389,160 @@ async fn emit_dashboard_rollup_integrity_failure_snapshot(
     }
 }
 
+/// Slices a cold integrity pass may need before one closed day is sealed.
+///
+/// The pass must page the whole one-day hot window (288 five-minute pages) and
+/// then reaudit the closed day in two-hour GC-blocking chunks (12) before it can
+/// finalize the day seal. A bound that only covers that exact work fails as soon
+/// as a single slice defers for its read budget, admission, or a source page, so
+/// the fixture allows twice the requirement.
+const DASHBOARD_INTEGRITY_CONVERGENCE_SLICES: usize = {
+    let hot_pages = (SECS_PER_DAY / SECS_PER_FIVE_MINUTES) as usize;
+    let gc_blocking_reaudit_chunks = (SECS_PER_DAY / (2 * SECS_PER_HOUR)) as usize;
+    2 * (hot_pages + gc_blocking_reaudit_chunks + 1)
+};
+
+/// Drive the integrity scheduler until the request-log GC cutoff reports a day
+/// seal, and fail with the last slice state plus a database snapshot instead
+/// of a bare assertion.
+async fn converge_dashboard_integrity_seal(
+    proxy: &TavilyProxy,
+    threshold: i64,
+    day_start: i64,
+    day_end: i64,
+    what: &str,
+) {
+    let mut last_state = String::from("unstarted");
+    let mut last_delay_secs = 0_i64;
+    let mut slice_counts = std::collections::BTreeMap::<(&'static str, i64), usize>::new();
+    let mut slice_summary = Vec::new();
+    for _ in 0..DASHBOARD_INTEGRITY_CONVERGENCE_SLICES {
+        if proxy
+            .key_store
+            .dashboard_rollup_integrity_request_log_gc_cutoff(threshold)
+            .await
+            .expect("read the dashboard rollup integrity cutoff while converging")
+            .is_some()
+        {
+            return;
+        }
+        let run = proxy
+            .run_dashboard_rollup_integrity_slice()
+            .await
+            .expect("advance a dashboard rollup integrity slice while converging");
+        let state: &'static str = match run.state.as_str() {
+            "verified" => "verified",
+            "deferred" => "deferred",
+            "repaired" => "repaired",
+            _ => "other",
+        };
+        *slice_counts
+            .entry((state, run.next_delay_secs))
+            .or_default() += 1;
+        slice_summary.push((run.state.clone(), run.next_delay_secs));
+        last_state = run.state;
+        last_delay_secs = run.next_delay_secs;
+    }
+    let gc_reason = match proxy
+        .key_store
+        .dashboard_rollup_integrity_request_log_gc_decision(threshold)
+        .await
+        .expect("read the dashboard rollup integrity GC decision while converging")
+    {
+        crate::store::DashboardRollupRequestLogGcDecision::Allowed { .. } => "allowed",
+        crate::store::DashboardRollupRequestLogGcDecision::Blocked { reason, .. } => reason,
+    };
+    emit_dashboard_rollup_integrity_failure_snapshot(
+        &proxy.key_store.pool,
+        day_start,
+        day_end,
+        None,
+        &std::collections::BTreeMap::from([(gc_reason, 1)]),
+        &slice_counts,
+        &slice_summary,
+    )
+    .await;
+    panic!(
+        "dashboard rollup integrity did not seal within {} slices while {what}: last_state={last_state} next_delay_secs={last_delay_secs}",
+        DASHBOARD_INTEGRITY_CONVERGENCE_SLICES
+    );
+}
+
+/// Wait out typed local read defers before asserting a day's request-log GC seal.
+///
+/// `read_budget` / `recovery_budget` are bounded local refusals to answer, not
+/// state changes: the scheduler re-runs the same decision once the read window
+/// clears. Any other block is a real precondition and fails at once with its
+/// reason instead of a bare `None`.
+async fn dashboard_gc_cutoff_after_read_defers(
+    proxy: &TavilyProxy,
+    threshold: i64,
+    what: &str,
+) -> Option<i64> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let decision = proxy
+            .key_store
+            .dashboard_rollup_integrity_request_log_gc_decision(threshold)
+            .await
+            .expect("read the dashboard rollup request-log GC decision");
+        match decision {
+            crate::store::DashboardRollupRequestLogGcDecision::Allowed { cutoff, .. } => {
+                return Some(cutoff);
+            }
+            crate::store::DashboardRollupRequestLogGcDecision::Blocked { reason, .. }
+                if !matches!(reason, "read_budget" | "recovery_budget") =>
+            {
+                panic!("request-log GC stayed blocked while {what}: reason={reason}");
+            }
+            crate::store::DashboardRollupRequestLogGcDecision::Blocked { reason, .. } => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "request-log GC kept deferring while {what}: last_reason={reason}"
+                );
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Run a bounded recovery pass until it reports completion.
+///
+/// A pass reports `budget-exhausted` or `deferred` when a bounded local read or
+/// admission window refuses to answer; that refusal is not state, and the
+/// durable checkpoint survives it. Re-run the same pass in that case instead of
+/// turning a transient local budget into a false completion assertion. Stopping
+/// for any other reason fails at once with the full report.
+async fn run_request_statistics_recovery_to_completion(
+    db_str: &str,
+    options: RequestStatisticsRecoveryOptions,
+    what: &str,
+) -> RequestStatisticsRecoveryReport {
+    let runtime_budget_ms = u128::from(options.max_runtime_secs.max(1)) * 1_000;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    loop {
+        let report = run_request_statistics_recovery_once(db_str, options)
+            .await
+            .expect("run a bounded request statistics recovery pass");
+        if report.outcome == "complete" {
+            return report;
+        }
+        let transient = report.error.is_none()
+            && (report.outcome == "deferred"
+                || (report.outcome == "budget-exhausted"
+                    && report.elapsed_ms + 250 < runtime_budget_ms));
+        assert!(
+            transient,
+            "request statistics recovery stopped while {what}: report={report:?}"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "request statistics recovery kept exhausting its local budget while {what}: report={report:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 async fn insert_visible_dashboard_log(proxy: &TavilyProxy, created_at: i64) {
     sqlx::query(
         r#"
@@ -2026,21 +2123,14 @@ async fn request_log_gc_preserves_deleted_source_contribution_after_a_late_updat
     insert_visible_dashboard_log(&proxy, day + 60).await;
     insert_visible_dashboard_log(&proxy, day + 120).await;
 
-    for _ in 0..300 {
-        if proxy
-            .key_store
-            .dashboard_rollup_integrity_request_log_gc_cutoff(threshold)
-            .await
-            .expect("check initial source seal")
-            .is_some()
-        {
-            break;
-        }
-        proxy
-            .run_dashboard_rollup_integrity_slice()
-            .await
-            .expect("build initial source seal");
-    }
+    converge_dashboard_integrity_seal(
+        &proxy,
+        threshold,
+        day,
+        next_local_day_start_utc_ts(day),
+        "building the initial source seal",
+    )
+    .await;
     assert_eq!(
         proxy
             .key_store
@@ -2082,21 +2172,14 @@ async fn request_log_gc_preserves_deleted_source_contribution_after_a_late_updat
         .await
         .expect("update retained source row");
 
-    for _ in 0..300 {
-        if proxy
-            .key_store
-            .dashboard_rollup_integrity_request_log_gc_cutoff(threshold)
-            .await
-            .expect("check late-update source seal")
-            .is_some()
-        {
-            break;
-        }
-        proxy
-            .run_dashboard_rollup_integrity_slice()
-            .await
-            .expect("rebuild source-backed seal after late update");
-    }
+    converge_dashboard_integrity_seal(
+        &proxy,
+        threshold,
+        day,
+        next_local_day_start_utc_ts(day),
+        "rebuilding the source-backed seal after a late update",
+    )
+    .await;
     assert_eq!(
         proxy
             .key_store
@@ -2560,21 +2643,14 @@ async fn integrity_gc_recovers_missing_and_divergent_seals_without_touching_bill
             .expect("missing seal blocks"),
         None
     );
-    for _ in 0..300 {
-        if proxy
-            .key_store
-            .dashboard_rollup_integrity_request_log_gc_cutoff(threshold)
-            .await
-            .expect("check recovery")
-            .is_some()
-        {
-            break;
-        }
-        proxy
-            .run_dashboard_rollup_integrity_slice()
-            .await
-            .expect("advance missing-day recovery");
-    }
+    converge_dashboard_integrity_seal(
+        &proxy,
+        threshold,
+        day,
+        next_local_day_start_utc_ts(day),
+        "advancing the missing-day recovery",
+    )
+    .await;
     assert_eq!(
         proxy
             .key_store
@@ -2641,21 +2717,14 @@ async fn integrity_gc_recovers_missing_and_divergent_seals_without_touching_bill
     .await
     .expect("read preserved checkpoint");
     assert_eq!(before, after);
-    for _ in 0..300 {
-        if proxy
-            .key_store
-            .dashboard_rollup_integrity_request_log_gc_cutoff(threshold)
-            .await
-            .expect("check seal fence")
-            .is_some()
-        {
-            break;
-        }
-        proxy
-            .run_dashboard_rollup_integrity_slice()
-            .await
-            .expect("finish source-backed re-audit");
-    }
+    converge_dashboard_integrity_seal(
+        &proxy,
+        threshold,
+        day,
+        next_local_day_start_utc_ts(day),
+        "finishing the source-backed re-audit",
+    )
+    .await;
     let recovered: String = sqlx::query_scalar(
         "SELECT counts_json FROM dashboard_rollup_daily_seals WHERE bucket_start = ?",
     )
@@ -2825,11 +2894,8 @@ async fn request_log_gc_preserves_consistent_sealed_source_until_pending_recover
         .await
         .expect("finish rebalance recovery");
     assert_eq!(
-        proxy
-            .key_store
-            .dashboard_rollup_integrity_request_log_gc_cutoff(threshold)
-            .await
-            .expect("release recovered source"),
+        dashboard_gc_cutoff_after_read_defers(&proxy, threshold, "releasing the recovered source")
+            .await,
         Some(next_local_day_start_utc_ts(day))
     );
     for table in [
@@ -2842,11 +2908,12 @@ async fn request_log_gc_preserves_consistent_sealed_source_until_pending_recover
             .expect("model legacy schema without scheduler tables");
     }
     assert_eq!(
-        proxy
-            .key_store
-            .dashboard_rollup_integrity_request_log_gc_cutoff(threshold)
-            .await
-            .expect("legacy absence does not create phantom pending work"),
+        dashboard_gc_cutoff_after_read_defers(
+            &proxy,
+            threshold,
+            "proving legacy table absence releases the day",
+        )
+        .await,
         Some(next_local_day_start_utc_ts(day))
     );
 }

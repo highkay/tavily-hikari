@@ -46,6 +46,17 @@ const ADMIN_ALERTS_READ_PROGRESS_HANDLER_OPS: i32 = 1_000;
 const RECONCILIATION_READ_RUN_BUDGET: Duration = Duration::from_millis(250);
 const RECONCILIATION_READ_PROGRESS_HANDLER_OPS: i32 = 1_000;
 
+/// Bound for a pool acquire taken while the pool still has room to grow.
+///
+/// The pool opens lazily (`min_connections(1)`), so the first concurrent
+/// operation on a fresh database has to connect and ATTACH the observability
+/// sidecar before it can run. Measured growth costs 60-70ms on an idle machine,
+/// and a loaded CI runner pushes it past the 100ms contention budget, turning
+/// ordinary pool growth into a spurious `PoolTimedOut` defer. A wait taken
+/// while unused capacity exists is therefore bounded as connection setup;
+/// a saturated pool keeps the operation's short contention budget.
+const SQLITE_POOL_GROWTH_ACQUIRE_BUDGET: Duration = Duration::from_millis(500);
+
 const MAINTENANCE_BULK_MAX_FOREGROUND_RPS: i64 = 5;
 const MAINTENANCE_BULK_CONTENTION_COOLDOWN: Duration = Duration::from_secs(5);
 const MAINTENANCE_BULK_RESERVED_FOREGROUND_CONNECTIONS: u32 = 2;
@@ -2088,8 +2099,28 @@ impl SqliteRuntime {
         &self,
         operation: SqliteOperation,
     ) -> Result<(sqlx::pool::PoolConnection<Sqlite>, Duration), ProxyError> {
-        self.acquire_pool_connection_with_budget(operation, operation.acquire_budget())
+        self.acquire_pool_connection_with_budget(operation, self.pool_acquire_budget(operation))
             .await
+    }
+
+    fn pool_acquire_budget(&self, operation: SqliteOperation) -> Duration {
+        let budget = operation.acquire_budget();
+        if self.pool_waits_while_spare_capacity_exists() {
+            budget.max(SQLITE_POOL_GROWTH_ACQUIRE_BUDGET)
+        } else {
+            budget
+        }
+    }
+
+    /// True when an acquire can still be served by growable pool capacity:
+    /// nothing is idle and the pool has not reached `max_connections`. Such a
+    /// wait covers connection setup (connect plus the observability `ATTACH`)
+    /// or the imminent return of a checked-out connection, neither of which is
+    /// writer contention. A saturated pool (no idle connection and no room to
+    /// grow) keeps the operation's short budget, which preserves the ADR 0005
+    /// foreground safety boundary.
+    fn pool_waits_while_spare_capacity_exists(&self) -> bool {
+        self.inner.pool.num_idle() == 0 && self.inner.pool.size() < self.inner.maximum_connections
     }
 
     async fn acquire_pool_connection_with_budget(

@@ -143,8 +143,13 @@ async fn run_serpapi_quota_sync_claimed_job(
 /// loops (`cold` = 24h threshold sweep; hot = 2h-active/15m-stale sweep).
 /// Same pacing discipline as the Tavily lanes: bounded list under the
 /// maintenance read gate, randomized jitter before each enqueue, dedupe
-/// via the durable (job_type, key_id) active identity.
-async fn run_serpapi_pending_quota_sync_lane(state: &AppState, cold: bool) {
+/// via the durable (job_type, key_id) active identity, and the SAME
+/// `PER_SWEEP_ENQUEUE_CAP` bound so a backlog drains across sweeps.
+async fn run_serpapi_pending_quota_sync_lane(
+    state: &AppState,
+    cold: bool,
+    jitter_max_inclusive: u64,
+) {
     let scope = if cold { "serpapi_cold" } else { "serpapi_hot" };
     let keys = {
         let _maintenance = acquire_db_maintenance_read_gate().await;
@@ -179,8 +184,10 @@ async fn run_serpapi_pending_quota_sync_lane(state: &AppState, cold: bool) {
         }
     };
 
-    for key_id in keys {
-        let delay = random_delay_secs(if cold { 300 } else { 60 });
+    // Plan todo 19 follow-up: bounded like the Tavily lanes — a restart
+    // backlog drains across the following sweeps instead of one burst.
+    for key_id in keys.into_iter().take(PER_SWEEP_ENQUEUE_CAP) {
+        let delay = random_delay_secs(jitter_max_inclusive);
         state
             .proxy
             .backend_time()

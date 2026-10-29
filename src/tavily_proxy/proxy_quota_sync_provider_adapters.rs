@@ -39,6 +39,9 @@ const MAINTENANCE_OP_SERPAPI_ACCOUNT_STATUS_NOTE: &str = "serpapi_account_status
 const SERPAPI_ACCOUNT_STATUS_ACTIVE: &str = "Active";
 const SERPAPI_ACCOUNT_NOTE_REASON_CODE: &str = "account_status_not_active";
 const SERPAPI_RENEWAL_RECOVERY_REASON_CODE: &str = "serpapi_renewal_recovery";
+/// Revival driven by a fresh quota snapshot (remaining > 0 on an Active
+/// account) rather than by the calendar renewal date.
+const SERPAPI_QUOTA_RECOVERED_REASON_CODE: &str = "serpapi_quota_recovered";
 
 /// Typed SerpApi `/account` snapshot (plan todo 19 field mapping).
 ///
@@ -106,6 +109,59 @@ pub fn parse_serpapi_account_snapshot(
     })
 }
 
+/// Typed failure of the SerpApi `/account` fetch, shared by the scheduler and
+/// the admin manual lane.
+///
+/// Transport failures stay a KIND (never a reqwest `Display`, whose URL carries
+/// the key), so the admin handler can keep its legacy 502 `sync_failed`
+/// mapping while the scheduler keeps its literal timeout/transport messages.
+#[doc(hidden)]
+#[derive(Debug)]
+pub enum SerpapiManualSyncError {
+    Transport { timed_out: bool },
+    UsageHttp {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+    QuotaDataMissing {
+        reason: String,
+    },
+    Other(String),
+}
+
+impl SerpapiManualSyncError {
+    fn from_proxy(err: ProxyError) -> Self {
+        match err {
+            ProxyError::UsageHttp { status, body } => Self::UsageHttp { status, body },
+            ProxyError::QuotaDataMissing { reason } => Self::QuotaDataMissing { reason },
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+
+impl From<ProxyError> for SerpapiManualSyncError {
+    fn from(err: ProxyError) -> Self {
+        Self::from_proxy(err)
+    }
+}
+
+/// Scheduler-facing mapping: byte-identical to the pre-refactor adapter
+/// (literal transport messages, typed usage-http and missing-quota errors).
+fn serpapi_scheduler_error(err: SerpapiManualSyncError) -> ProxyError {
+    match err {
+        SerpapiManualSyncError::Transport { timed_out } => ProxyError::Other(if timed_out {
+            "serpapi account request timed out".to_string()
+        } else {
+            "serpapi account request transport failed".to_string()
+        }),
+        SerpapiManualSyncError::UsageHttp { status, body } => ProxyError::UsageHttp { status, body },
+        SerpapiManualSyncError::QuotaDataMissing { reason } => {
+            ProxyError::QuotaDataMissing { reason }
+        }
+        SerpapiManualSyncError::Other(message) => ProxyError::Other(message),
+    }
+}
+
 impl TavilyProxy {
     /// Scheduler-facing SerpApi /account fetch with the shared single
     /// outbound remote-attempt lease (M4 C4a: Tavily /usage and SerpApi
@@ -120,6 +176,61 @@ impl TavilyProxy {
         admission: std::sync::Arc<crate::RemoteAttemptAdmissionController>,
         manual_remote_attempt: bool,
     ) -> Result<SerpapiAccountSnapshot, ProxyError> {
+        let payload = self
+            .fetch_serpapi_account_payload(
+                secret,
+                key_id,
+                admission,
+                manual_remote_attempt,
+                Duration::from_secs(QUOTA_SYNC_FETCH_TIMEOUT_SECS),
+            )
+            .await
+            .map_err(serpapi_scheduler_error)?;
+        let synced_at = self.backend_time.now_ts();
+        let json: Value = serde_json::from_slice(&payload)
+            .map_err(|e| ProxyError::Other(format!("invalid serpapi account json: {}", e)))?;
+        parse_serpapi_account_snapshot(&json, synced_at)
+    }
+
+    /// Admin manual sync-usage lane (plan v2-cutover-followups todo 2 / GAP-2):
+    /// the SAME forward-proxy plan + single outbound lease as
+    /// [`Self::fetch_serpapi_account_for_sync`], but the caller owns the
+    /// timeout envelope, so the admin handler keeps its 20s budget instead of
+    /// inheriting the scheduler's 8s fetch timeout.
+    ///
+    /// Parsing deliberately degrades an unparsable body to `Value::Null` so a
+    /// malformed `/account` payload keeps surfacing as `QuotaDataMissing`
+    /// (400 `quota_data_missing`), exactly as the pre-forward-proxy admin path
+    /// did; the scheduler lane keeps its own invalid-JSON error.
+    pub async fn fetch_serpapi_account_for_manual_sync(
+        &self,
+        secret: &str,
+        key_id: &str,
+        admission: std::sync::Arc<crate::RemoteAttemptAdmissionController>,
+        request_timeout: Duration,
+    ) -> Result<SerpapiAccountSnapshot, SerpapiManualSyncError> {
+        let payload = self
+            .fetch_serpapi_account_payload(secret, key_id, admission, true, request_timeout)
+            .await?;
+        let synced_at = self.backend_time.now_ts();
+        let json: Value = serde_json::from_slice(&payload).unwrap_or(Value::Null);
+        parse_serpapi_account_snapshot(&json, synced_at).map_err(SerpapiManualSyncError::from_proxy)
+    }
+
+    /// Shared egress half of both SerpApi `/account` lanes: local plan
+    /// preparation OUTSIDE the lease, lease held through the outbound send and
+    /// the response body read, `mark_request_started` at request build. Only
+    /// the per-request timeout differs between the scheduler and the admin
+    /// caller, and the failure kind keeps transport separate so the admin
+    /// surface can preserve its legacy 502 mapping.
+    async fn fetch_serpapi_account_payload(
+        &self,
+        secret: &str,
+        key_id: &str,
+        admission: std::sync::Arc<crate::RemoteAttemptAdmissionController>,
+        manual_remote_attempt: bool,
+        request_timeout: Duration,
+    ) -> Result<bytes::Bytes, SerpapiManualSyncError> {
         let base = self.provider_rest_base(providers::ProviderId::Serpapi)?;
         let url = build_path_prefixed_url(&base, "/account");
         let plan = self.prepare_forward_proxy_plan(key_id).await;
@@ -128,7 +239,7 @@ impl TavilyProxy {
         } else {
             admission.acquire_attempt().await
         }
-        .map_err(|reason| ProxyError::Other(reason.to_string()))?;
+        .map_err(|reason| SerpapiManualSyncError::Other(reason.to_string()))?;
 
         let secret_param = secret.to_string();
         let request_url = url.clone();
@@ -143,37 +254,31 @@ impl TavilyProxy {
                     client
                         .get(request_url.clone())
                         .query(&[("api_key", secret_param.as_str())])
-                        .timeout(Duration::from_secs(QUOTA_SYNC_FETCH_TIMEOUT_SECS))
+                        .timeout(request_timeout)
                 },
             )
             .await;
-        let synced_at = self.backend_time.now_ts();
         let (resp, _relay_lease) = match send_result {
             Ok(pair) => pair,
             // Secret-safety: reqwest Display embeds the query string, which
-            // carries the SerpApi key. Only a literal, timeout-classified
-            // message may surface (T10 admin-path discipline).
+            // carries the SerpApi key, so only a timeout-classified failure
+            // kind may surface (T10 admin-path discipline).
             Err(ProxyError::Http(error)) => {
-                return Err(ProxyError::Other(if error.is_timeout() {
-                    "serpapi account request timed out".to_string()
-                } else {
-                    "serpapi account request transport failed".to_string()
-                }));
+                return Err(SerpapiManualSyncError::Transport {
+                    timed_out: error.is_timeout(),
+                });
             }
-            Err(err) => return Err(err),
+            Err(err) => return Err(SerpapiManualSyncError::from_proxy(err)),
         };
         let status = resp.status();
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|_| ProxyError::Other("serpapi account response body read failed".into()))?;
+        let bytes = resp.bytes().await.map_err(|_| {
+            SerpapiManualSyncError::Other("serpapi account response body read failed".into())
+        })?;
         if !status.is_success() {
             let body = String::from_utf8_lossy(&bytes).into_owned();
-            return Err(ProxyError::UsageHttp { status, body });
+            return Err(SerpapiManualSyncError::UsageHttp { status, body });
         }
-        let json: Value = serde_json::from_slice(&bytes)
-            .map_err(|e| ProxyError::Other(format!("invalid serpapi account json: {}", e)))?;
-        parse_serpapi_account_snapshot(&json, synced_at)
+        Ok(bytes)
     }
 
     /// Persist one SerpApi /account snapshot (quota fields ONLY — M8), then
@@ -196,6 +301,16 @@ impl TavilyProxy {
             snapshot.quota_synced_at,
         )
         .await?;
+        // Evidence-based revival: a fresh snapshot showing remaining quota on
+        // an Active account proves the key usable again even when no renewal
+        // date was ever learned (exhausted rows used to be invisible to the
+        // sync lanes, so their quota_renews_at stayed NULL forever).
+        let evidence_recovered = before.status.as_deref() == Some(STATUS_EXHAUSTED)
+            && snapshot.quota_remaining > 0
+            && snapshot.account_status == SERPAPI_ACCOUNT_STATUS_ACTIVE;
+        if evidence_recovered {
+            self.key_store.restore_active_status_by_id(key_id).await?;
+        }
         // Renewal-driven recovery: reuse the T9 policy sweep (RenewalDate)
         // so passing quota_renews_at flips exhausted -> active NOW instead
         // of waiting for the next acquire-path sweep. Never reimplemented.
@@ -215,14 +330,27 @@ impl TavilyProxy {
                     source: MAINTENANCE_SOURCE_SYSTEM.to_string(),
                     operation_code: MAINTENANCE_OP_AUTO_RESTORE_ACTIVE.to_string(),
                     operation_summary: "自动恢复为 active".to_string(),
-                    reason_code: Some(SERPAPI_RENEWAL_RECOVERY_REASON_CODE.to_string()),
-                    reason_summary: Some("SerpApi 计划续期，额度恢复".to_string()),
+                    reason_code: Some(
+                        if evidence_recovered {
+                            SERPAPI_QUOTA_RECOVERED_REASON_CODE.to_string()
+                        } else {
+                            SERPAPI_RENEWAL_RECOVERY_REASON_CODE.to_string()
+                        },
+                    ),
+                    reason_summary: Some(
+                        if evidence_recovered {
+                            "SerpApi 配额快照恢复".to_string()
+                        } else {
+                            "SerpApi 计划续期，额度恢复".to_string()
+                        },
+                    ),
                     reason_detail: Some(format!(
-                        "source={source} quota_renews_at={}",
+                        "source={source} quota_renews_at={} quota_remaining={}",
                         snapshot
                             .quota_renews_at
                             .map(|value| value.to_string())
-                            .unwrap_or_else(|| "none".to_string())
+                            .unwrap_or_else(|| "none".to_string()),
+                        snapshot.quota_remaining,
                     )),
                     request_log_id: None,
                     auth_token_log_id: None,

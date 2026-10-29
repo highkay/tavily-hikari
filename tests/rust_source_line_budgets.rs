@@ -21,8 +21,18 @@ const EXCEPTIONS: &[(&str, usize, &str)] = &[
     ),
     (
         "src/lib.rs",
-        3300,
-        "Recovery admission, timeout ownership, and online dashboard/request-log maintenance now share the root lifecycle wiring while extracting recovery orchestration remains a separate behavior-preserving change.",
+        3320,
+        "Recovery admission, timeout ownership, and online dashboard/request-log maintenance now share the root lifecycle wiring, and the v2 cutover grew that same root wiring further (provider facades, native-auth routing, maintenance contention budgets); extracting recovery orchestration remains a separate behavior-preserving change.",
+    ),
+    (
+        "src/server/state.rs",
+        3060,
+        "The server state carries the dashboard rollup integrity signature beside the existing provider, maintenance, and recovery wiring while a state-facade extraction remains a separate behavior-preserving change.",
+    ),
+    (
+        "src/store/key_store_upstream_reconciliation.rs",
+        3075,
+        "The upstream reconciliation store carries claim, admission, per-key cooldown, projection, and the mergeable maintenance wake hint together while a broader store split remains a separate behavior-preserving change.",
     ),
     (
         "src/store/key_store_dashboard_rollup_integrity.rs",
@@ -66,18 +76,23 @@ const EXCEPTIONS: &[(&str, usize, &str)] = &[
     ),
     (
         "src/tavily_proxy/proxy_quota_sync_and_jobs.rs",
-        3250,
-        "Reconciliation execution and quota synchronization remain together while per-key cooldown, request-scoped admission, and typed Research poll outcomes converge; extracting the remaining run phases is a separate behavior-preserving change.",
+        3275,
+        "Reconciliation execution and quota synchronization remain together while per-key cooldown, request-scoped admission, and typed Research poll outcomes converge; the maintenance wake hint and projection-progress defers extend the shared run phases, and extracting the remainder is a separate behavior-preserving change.",
     ),
     (
         "src/tests/upstream_reconciliation.rs",
-        3500,
-        "The consolidated upstream reconciliation integration suite carries the multi-key observation, per-key cooldown, and continuation-fencing coverage while a broader test extraction remains a separate behavior-preserving change.",
+        3540,
+        "The consolidated upstream reconciliation integration suite carries the multi-key observation, per-key cooldown, and continuation-fencing coverage, and the upstream merge unions defer-tolerant admission waits with mixed-key admission retry coverage while a broader test extraction remains a separate behavior-preserving change.",
+    ),
+    (
+        "src/tests/dashboard_rollup_integrity.rs",
+        3130,
+        "The consolidated dashboard rollup integrity suite carries the one closed-day seal fixtures through the shared convergence helper, the upstream failure-snapshot diagnostics, and the defer-tolerant request-log GC seal and bounded recovery-pass waits that keep load-sensitive local read budgets from turning into false completion assertions; extracting the legacy-GC fixtures remains a separate behavior-preserving change.",
     ),
     (
         "src/store/sqlite_runtime.rs",
-        4550,
-        "The runtime owns the shared pool, operation budgeting, transaction guards, fair maintenance admission coordinator, operation-scoped owned-finish tracking, workload aggregation, and the bounded reconciliation read session; cooperative query cleanup remains isolated in its dedicated child module.",
+        4580,
+        "The runtime owns the shared pool, operation budgeting, transaction guards, fair maintenance admission coordinator, operation-scoped owned-finish tracking, workload aggregation, and the bounded reconciliation read session; the hardened connection-setup acquire budget extends the same surface, while cooperative query cleanup remains isolated in its dedicated child module.",
     ),
 ];
 

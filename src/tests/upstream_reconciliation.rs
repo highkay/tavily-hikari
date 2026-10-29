@@ -1376,19 +1376,65 @@ async fn reconciliation_rejects_reclaimed_claim_after_remote_fetch() {
         .prewarm_upstream_reconciliation_projection_capacity()
         .await
         .expect("prewarm reconciliation projection capacity");
-    let running_proxy = proxy.clone();
-    let running = tokio::spawn(async move {
-        running_proxy
-            .run_upstream_reconciliation_once_claimed_outcome(
-                &format!("http://{addr}"),
-                claimed.id,
-                claimed.claim_generation,
-            )
-            .await
-    });
-    tokio::time::timeout(std::time::Duration::from_secs(20), fetch_started.notified())
-        .await
-        .expect("upstream usage fetch starts");
+    let usage_base = format!("http://{addr}");
+    let mut running = {
+        let running_proxy = proxy.clone();
+        let usage_base = usage_base.clone();
+        tokio::spawn(async move {
+            running_proxy
+                .run_upstream_reconciliation_once_claimed_outcome(
+                    &usage_base,
+                    claimed.id,
+                    claimed.claim_generation,
+                )
+                .await
+        })
+    };
+    // A claimed run may legitimately defer before it makes any remote attempt:
+    // local admission (pool, contention, projection read budget) refuses the
+    // work and the scheduler re-runs the same claim later with a typed
+    // `Deferred`. Such a deferral writes nothing and keeps the claim current, so
+    // re-run the same claim until the remote fetch is actually in flight - the
+    // fence this test pins only exists once that fetch has started. The whole
+    // wait stays bounded by one admission deadline so a wedged run fails loudly
+    // instead of hanging.
+    let admission_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
+    loop {
+        let fetch_wait = fetch_started.notified();
+        tokio::pin!(fetch_wait);
+        let deferred = tokio::select! {
+            _ = &mut fetch_wait => None,
+            joined = &mut running => Some(
+                joined
+                    .expect("join claimed worker")
+                    .expect("claimed worker exits cleanly"),
+            ),
+            _ = tokio::time::sleep_until(admission_deadline) => {
+                panic!("reconciliation admission never let the claimed run start its remote fetch")
+            }
+        };
+        let Some(outcome) = deferred else {
+            break;
+        };
+        assert!(
+            matches!(outcome, ClaimedReconciliationRunOutcome::Deferred { .. }),
+            "claimed worker left the claim before its remote fetch started: {outcome:?}"
+        );
+        // A deferral is a bounded admission refusal, not a state change: wait one
+        // admission tick and re-run the SAME claim, exactly as the scheduler does.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let retry_proxy = proxy.clone();
+        let retry_usage_base = usage_base.clone();
+        running = tokio::spawn(async move {
+            retry_proxy
+                .run_upstream_reconciliation_once_claimed_outcome(
+                    &retry_usage_base,
+                    claimed.id,
+                    claimed.claim_generation,
+                )
+                .await
+        });
+    }
     clock.set_now_ts(now + 61);
     assert_eq!(
         proxy

@@ -3,7 +3,7 @@
 //! per-provider sync-usage semantics, additive-DTO compat pins, and the M22
 //! typed cross-provider duplicate rejection at the admin API.
 
-use super::core_support_and_parsing::temp_db_path;
+use super::core_support_and_parsing::{connect_sqlite_test_pool, temp_db_path};
 use super::*;
 use std::sync::atomic::AtomicUsize;
 use tavily_hikari::providers::ProviderId;
@@ -197,6 +197,77 @@ async fn spawn_brave_mock(counters: Arc<ProviderCounters>) -> SocketAddr {
     .await
 }
 
+// ---------- mock forwarding proxy for the manual sync lane ----------
+//
+// A real HTTP forward proxy: reqwest sends absolute-form request targets when
+// a proxy is configured, so this handler sees `/account?api_key=...` and
+// relays it to the SerpApi mock. Probe/trace traffic (anything that is not
+// `/account`) is answered locally so no test ever leaves the machine.
+
+#[derive(Clone)]
+struct SerpapiProxyRelay {
+    serpapi_base: String,
+    hits: Arc<AtomicUsize>,
+    client: Client,
+}
+
+async fn serpapi_proxy_relay_handler(
+    State(state): State<SerpapiProxyRelay>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    let path_and_query = uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or("/");
+    if !path_and_query.starts_with("/account") {
+        // Probe/trace traffic is answered locally so the suite never leaves
+        // this machine.
+        return (StatusCode::OK, "ip=1.1.1.1\nloc=US\ncolo=LAX\n").into_response();
+    }
+    state.hits.fetch_add(1, Ordering::SeqCst);
+    let mut req = state
+        .client
+        .request(method, format!("{}{path_and_query}", state.serpapi_base));
+    for (name, value) in &headers {
+        if name.as_str().eq_ignore_ascii_case("host") {
+            continue;
+        }
+        req = req.header(name, value);
+    }
+    match req.send().await {
+        Ok(response) => {
+            let status = response.status();
+            let body = response.bytes().await.unwrap_or_default();
+            (status, body).into_response()
+        }
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            format!("serpapi proxy relay error: {err}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn spawn_serpapi_proxy_relay(serpapi_base: String, hits: Arc<AtomicUsize>) -> SocketAddr {
+    bind_ephemeral(
+        Router::new()
+            .fallback(any(serpapi_proxy_relay_handler))
+            .with_state(SerpapiProxyRelay {
+                serpapi_base,
+                hits,
+                // The relay must dial the local mock directly, never through
+                // an environment proxy.
+                client: Client::builder()
+                    .no_proxy()
+                    .build()
+                    .expect("relay client"),
+            }),
+    )
+    .await
+}
+
 // ---------- admin harness ----------
 
 struct ProviderAdminHarness {
@@ -205,6 +276,7 @@ struct ProviderAdminHarness {
     serpapi_counters: Arc<ProviderCounters>,
     exa_counters: Arc<ProviderCounters>,
     brave_counters: Arc<ProviderCounters>,
+    admission: Arc<RemoteAttemptAdmissionController>,
     db_path: PathBuf,
 }
 
@@ -250,6 +322,22 @@ impl ProviderAdminHarness {
 }
 
 async fn spawn_provider_admin_harness(prefix: &str) -> ProviderAdminHarness {
+    spawn_provider_admin_harness_with(prefix, ProviderAdminNetwork::default()).await
+}
+
+/// Egress overrides for the manual-sync lane tests: a serpapi upstream that
+/// is not the local mock, and a forward-proxy pool the admin surface must
+/// actually dial through.
+#[derive(Default)]
+struct ProviderAdminNetwork {
+    serpapi_upstream: Option<String>,
+    forward_proxy_urls: Vec<String>,
+}
+
+async fn spawn_provider_admin_harness_with(
+    prefix: &str,
+    network: ProviderAdminNetwork,
+) -> ProviderAdminHarness {
     let db_path = temp_db_path(prefix);
     let db_str = db_path.to_string_lossy().to_string();
     let serpapi_counters = ProviderCounters::new_arc();
@@ -258,9 +346,11 @@ async fn spawn_provider_admin_harness(prefix: &str) -> ProviderAdminHarness {
     let serpapi_addr = spawn_serpapi_mock(serpapi_counters.clone()).await;
     let exa_addr = spawn_exa_mock(exa_counters.clone()).await;
     let brave_addr = spawn_brave_mock(brave_counters.clone()).await;
+    let serpapi_upstream =
+        network.serpapi_upstream.unwrap_or_else(|| format!("http://{serpapi_addr}"));
     let providers = tavily_hikari::ProviderBootstrap {
-        serpapi_upstream: format!("http://{serpapi_addr}"),
-        serpapi_mcp_upstream: format!("http://{serpapi_addr}/mcp"),
+        serpapi_upstream: serpapi_upstream.clone(),
+        serpapi_mcp_upstream: format!("{serpapi_upstream}/mcp"),
         exa_upstream: format!("http://{exa_addr}"),
         brave_upstream: format!("http://{brave_addr}"),
         serpapi_keys: Vec::new(),
@@ -277,6 +367,26 @@ async fn spawn_provider_admin_harness(prefix: &str) -> ProviderAdminHarness {
     )
     .await
     .expect("proxy created");
+    if !network.forward_proxy_urls.is_empty() {
+        // `insert_direct: false` so the plan only ever carries the configured
+        // proxy node; the serpapi provider is direct-allowed, so a plan with a
+        // direct candidate would not distinguish the two lanes.
+        proxy
+            .update_forward_proxy_settings(
+                ForwardProxySettings {
+                    proxy_urls: network.forward_proxy_urls.clone(),
+                    subscription_urls: Vec::new(),
+                    subscription_update_interval_secs: 3600,
+                    insert_direct: false,
+                    egress_socks5_enabled: false,
+                    egress_socks5_url: String::new(),
+                },
+                true,
+            )
+            .await
+            .expect("configure test forward proxy");
+    }
+    let admission = new_remote_attempt_admission();
     let state = Arc::new(AppState {
         proxy,
         static_dir: None,
@@ -291,9 +401,10 @@ async fn spawn_provider_admin_harness(prefix: &str) -> ProviderAdminHarness {
         // Any accidental Tavily validate/sync traffic lands on an unrouted
         // mock path (404) instead of a real endpoint.
         usage_base: format!("http://{brave_addr}/__unused_tavily_usage"),
-        api_key_ip_geo_origin: "https://api.country.is".to_string(),
+        // Local 404 keeps geo lookups off the public internet.
+        api_key_ip_geo_origin: format!("http://{serpapi_addr}/__unused_geo"),
         dashboard_overview_cache: new_dashboard_overview_cache(),
-        remote_attempt_admission: new_remote_attempt_admission(),
+        remote_attempt_admission: admission.clone(),
     });
     let app = Router::new()
         .route("/api/keys", get(list_keys).post(create_api_key))
@@ -308,6 +419,7 @@ async fn spawn_provider_admin_harness(prefix: &str) -> ProviderAdminHarness {
         serpapi_counters,
         exa_counters,
         brave_counters,
+        admission,
         db_path,
     }
 }
@@ -664,6 +776,185 @@ async fn sync_usage_is_live_for_serpapi_passive_for_brave_and_409_for_exa() {
     assert_eq!(body["error"], json!("sync_unsupported"));
     assert_eq!(body["provider"], json!("exa"));
     assert_eq!(harness.exa_counters.probe_hits(), 0, "no exa call");
+}
+
+#[tokio::test]
+async fn serpapi_manual_sync_reaches_the_upstream_through_the_forward_proxy() {
+    // Given a serpapi mock upstream and a real HTTP forward proxy in front of
+    // it (the admin surface must dial the proxy, never the upstream directly)
+    let counters = ProviderCounters::new_arc();
+    let serpapi_addr = spawn_serpapi_mock(counters.clone()).await;
+    let relay_hits = Arc::new(AtomicUsize::new(0));
+    let relay_addr = spawn_serpapi_proxy_relay(
+        format!("http://{serpapi_addr}"),
+        relay_hits.clone(),
+    )
+    .await;
+    let relay_url = format!("http://{relay_addr}");
+    let harness = spawn_provider_admin_harness_with(
+        "provider-admin-sync-forward-proxy",
+        ProviderAdminNetwork {
+            serpapi_upstream: Some(format!("http://{serpapi_addr}")),
+            forward_proxy_urls: vec![relay_url.clone()],
+        },
+    )
+    .await;
+    let (status, body) = harness
+        .create_key(json!({ "api_key": SERP_VALID_KEY, "provider": "serpapi" }))
+        .await;
+    assert_eq!(status, 201, "create serpapi key: {body}");
+    let key_id = body["id"].as_str().expect("id").to_string();
+
+    // When the operator triggers a manual sync-usage
+    let (status, body) = harness
+        .post_json(&format!("/api/keys/{key_id}/sync-usage"), json!({}))
+        .await;
+    // Then the live snapshot still arrives ...
+    assert_eq!(status, 200, "serpapi sync via proxy: {body}");
+    assert_eq!(body["source"], json!("live"));
+    assert_eq!(body["quota_limit"], json!(5000));
+    assert_eq!(body["quota_remaining"], json!(4321));
+    // ... because the request actually went THROUGH the configured proxy:
+    // a bare direct client would have hit the upstream while leaving the
+    // relay at zero hits (the exact pre-fix behavior).
+    assert_eq!(
+        relay_hits.load(Ordering::SeqCst),
+        1,
+        "exactly one /account request must ride the forward proxy"
+    );
+    assert_eq!(counters.probe_hits(), 1, "upstream saw the proxied request");
+    let pool = connect_sqlite_test_pool(&harness.db_path.to_string_lossy()).await;
+    let proxied_attempts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM forward_proxy_attempts WHERE proxy_key = ? AND is_success = 1",
+    )
+    .bind(&relay_url)
+    .fetch_one(&pool)
+    .await
+    .expect("count proxied attempts");
+    assert!(
+        proxied_attempts >= 1,
+        "the forward-proxy attempt ledger must record the sync"
+    );
+    let direct_attempts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM forward_proxy_attempts WHERE proxy_key = '__direct__'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count direct attempts");
+    assert_eq!(direct_attempts, 0, "no direct egress may be recorded");
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn serpapi_manual_sync_waits_for_the_single_remote_attempt_lease() {
+    // Given a working proxy lane and the single outbound lease already held
+    let counters = ProviderCounters::new_arc();
+    let serpapi_addr = spawn_serpapi_mock(counters.clone()).await;
+    let relay_hits = Arc::new(AtomicUsize::new(0));
+    let relay_addr =
+        spawn_serpapi_proxy_relay(format!("http://{serpapi_addr}"), relay_hits.clone()).await;
+    let harness = spawn_provider_admin_harness_with(
+        "provider-admin-sync-lease",
+        ProviderAdminNetwork {
+            serpapi_upstream: Some(format!("http://{serpapi_addr}")),
+            forward_proxy_urls: vec![format!("http://{relay_addr}")],
+        },
+    )
+    .await;
+    let (status, body) = harness
+        .create_key(json!({ "api_key": SERP_VALID_KEY, "provider": "serpapi" }))
+        .await;
+    assert_eq!(status, 201, "create serpapi key: {body}");
+    let key_id = body["id"].as_str().expect("id").to_string();
+
+    let lease = harness
+        .admission
+        .acquire_manual_attempt()
+        .await
+        .expect("hold the outbound lease");
+    let request = {
+        let client = harness.client.clone();
+        let addr = harness.addr;
+        let path = format!("/api/keys/{key_id}/sync-usage");
+        tokio::spawn(async move {
+            client
+                .post(format!("http://{addr}{path}"))
+                .json(&json!({}))
+                .send()
+                .await
+                .expect("sync request completes")
+        })
+    };
+
+    // Then it cannot reach the upstream while the lease is held (M4 C4a: at
+    // most one outbound in flight, manual and scheduled work alike)
+    let mut request = request;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut request)
+            .await
+            .is_err(),
+        "manual sync must wait for the shared remote-attempt lease"
+    );
+    assert_eq!(
+        relay_hits.load(Ordering::SeqCst),
+        0,
+        "no outbound may start while another attempt holds the lease"
+    );
+
+    // When the lease is released, the held request proceeds through the proxy
+    drop(lease);
+    let response = tokio::time::timeout(Duration::from_secs(10), request)
+        .await
+        .expect("held sync completes after the lease is released")
+        .expect("sync task joins");
+    assert_eq!(response.status(), 200, "sync after lease release");
+    assert_eq!(
+        relay_hits.load(Ordering::SeqCst),
+        1,
+        "exactly one proxied /account request after the lease is released"
+    );
+}
+
+#[tokio::test]
+async fn serpapi_manual_sync_keeps_the_502_mapping_when_the_proxy_is_unreachable() {
+    // Given a real serpapi upstream and a configured but unreachable forward
+    // proxy (a closed loopback port)
+    let counters = ProviderCounters::new_arc();
+    let serpapi_addr = spawn_serpapi_mock(counters.clone()).await;
+    let harness = spawn_provider_admin_harness_with(
+        "provider-admin-sync-forward-proxy-dead",
+        ProviderAdminNetwork {
+            serpapi_upstream: Some(format!("http://{serpapi_addr}")),
+            forward_proxy_urls: vec!["http://127.0.0.1:9".to_string()],
+        },
+    )
+    .await;
+    let (status, body) = harness
+        .create_key(json!({ "api_key": SERP_VALID_KEY, "provider": "serpapi" }))
+        .await;
+    assert_eq!(status, 201, "create serpapi key: {body}");
+    let key_id = body["id"].as_str().expect("id").to_string();
+
+    // When the operator triggers a manual sync-usage
+    let (status, body) = harness
+        .post_json(&format!("/api/keys/{key_id}/sync-usage"), json!({}))
+        .await;
+    // Then the transport failure keeps its legacy gateway mapping ...
+    assert_eq!(status, 502, "dead proxy sync: {body}");
+    assert_eq!(body["error"], json!("sync_failed"));
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("could not reach the upstream"),
+        "legacy 502 detail wording must survive: {body}"
+    );
+    // ... and the secret-bearing upstream was never contacted directly.
+    assert_eq!(
+        counters.probe_hits(),
+        0,
+        "a dead proxy must not silently fall back to a direct fetch"
+    );
 }
 
 #[test]
