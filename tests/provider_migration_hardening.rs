@@ -6,13 +6,15 @@
 //!
 //!  * a genuinely seeded **v44 fixture** (44 ledger rows = 30 versioned +
 //!    14 convergence, provider-less legacy table shapes, dangling-key row)
-//!    is upgraded by the REAL server binary to v45; the v45 ledger row +
-//!    checksum land, `migration_count` reaches 45, the sidecar
-//!    `request_logs.provider` ALTER is applied exactly once, every legacy
-//!    row stays readable, and legacy `api_keys` rows resolve to
-//!    `provider='tavily'` (M23);
+//!    is upgraded by the REAL server binary to the post-merge ledger v47;
+//!    the fork's v45 provider-aware row plus the renumbered upstream v46
+//!    (alert projection source indexes) and v47 (dashboard rollup integrity
+//!    blocked ranges) rows land with their checksums, `migration_count`
+//!    reaches 47, the sidecar `request_logs.provider` ALTER is applied
+//!    exactly once, every legacy row stays readable, and legacy `api_keys`
+//!    rows resolve to `provider='tavily'` (M23);
 //!  * a **fresh bootstrap** records every column from `initialize_schema`
-//!    DDL AND the full 1..=45 ledger (house rule);
+//!    DDL AND the full 1..=47 ledger (house rule);
 //!  * the **provider facades stay functional post-upgrade** (one REST + one
 //!    MCP call per new provider against stub mocks seeded by post-upgrade
 //!    keys) with the M8 negative: zero `api_key_low_quota_depletions` rows
@@ -68,6 +70,17 @@ const LEGACY_BILLING_LOG_ID: i64 = 900_001;
 /// `key_store_schema_migrations_provider.rs`).
 const PROVIDER_AWARE_V45_CHECKSUM: &str =
     "sha256:77201d3952329ffb3e54be6c2a1bdb08d595e3ecbc3e5279a6fb6f4895f4bd0f";
+
+/// v46 recorded checksum: upstream's alert projection source indexes,
+/// renumbered 45 -> 46 on the 2026-10-28 merge behind the fork's v45
+/// provider-aware slot (see `key_store_schema_migrations_convergence.rs`).
+const ALERT_PROJECTION_SOURCE_INDEXES_V46_CHECKSUM: &str =
+    "sha256:5ac91a3fd7243f45b1cbc7af95c6defd7378ad5c06e693156b516594412ae56c";
+
+/// v47 recorded checksum: upstream's dashboard rollup integrity blocked
+/// ranges, renumbered 46 -> 47 on the 2026-10-28 merge.
+const DASHBOARD_ROLLUP_INTEGRITY_BLOCKED_RANGES_V47_CHECKSUM: &str =
+    "sha256:2a2f2d4e5a9a77b3f7f9cc0d7c8c6b11";
 
 // ---------------------------------------------------------------------------
 // Shared harness utilities (pattern: tests/provider_matrix_e2e.rs).
@@ -350,8 +363,9 @@ async fn build_v44_fixture(prefix: &str) -> (PathBuf, String) {
     let db_path = temp_db_path(prefix);
     let db_str = db_path.to_string_lossy().to_string();
 
-    // Phase 1: a fresh (v45) bootstrap run through the real binary, then stop
-    // it. We then strip the v45 objects to reconstruct a genuine v44 database.
+    // Phase 1: a fresh (v47) bootstrap run through the real binary, then stop
+    // it. We then strip the v45..=v47 objects to reconstruct a genuine v44
+    // database.
     let port = reserve_local_port();
     let dead_port = reserve_local_port();
     let child = base_server_command(
@@ -380,11 +394,34 @@ async fn build_v44_fixture(prefix: &str) -> (PathBuf, String) {
 async fn downgrade_and_seed_v44(db_str: &str) {
     let pool = connect_sqlite_test_pool(db_str).await;
 
-    // Ledger: drop the sole v45 row, leaving 30 versioned + 14 convergence.
-    sqlx::query("DELETE FROM schema_migrations WHERE version = 45")
+    // Ledger: drop the v45..=v47 rows, leaving 30 versioned + 14 convergence
+    // (v31..=v44). The 2026-10-28 upstream merge renumbered its migrations to
+    // v46/v47 behind the fork's v45 provider-aware slot, so a genuine v44
+    // fixture must strip those two rows and their objects as well.
+    sqlx::query("DELETE FROM schema_migrations WHERE version BETWEEN 45 AND 47")
         .execute(&pool)
         .await
-        .expect("drop v45 ledger row");
+        .expect("drop v45..=v47 ledger rows");
+    // v47 objects: the blocked-range table and its probe index.
+    sqlx::query("DROP INDEX IF EXISTS observability.idx_dashboard_rollup_integrity_blocked_probe")
+        .execute(&pool)
+        .await
+        .expect("drop v47 blocked-range probe index");
+    sqlx::query("DROP TABLE IF EXISTS observability.dashboard_rollup_integrity_blocked_ranges")
+        .execute(&pool)
+        .await
+        .expect("drop v47 blocked-range table");
+    // v46 objects: the alert projection source indexes.
+    for index in [
+        "idx_auth_token_logs_alert_time",
+        "idx_api_key_maintenance_records_alert_time",
+        "idx_scheduled_jobs_alert_time",
+    ] {
+        sqlx::query(&format!("DROP INDEX IF EXISTS {index}"))
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|err| panic!("restore v44 shape (drop {index}): {err}"));
+    }
     // v45 objects: index before the column it references.
     sqlx::query("DROP INDEX IF EXISTS idx_api_keys_provider_status")
         .execute(&pool)
@@ -444,20 +481,49 @@ async fn downgrade_and_seed_v44(db_str: &str) {
     .expect("seed dangling-key request_logs row");
 
     // Assert the fixture is genuinely v44 before the upgrade run.
-    let ledger_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations")
-        .fetch_one(&pool)
-        .await
-        .expect("count v44 ledger rows");
+    let versions: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM schema_migrations ORDER BY version")
+            .fetch_all(&pool)
+            .await
+            .expect("read v44 ledger rows");
     assert_eq!(
-        ledger_rows, 44,
-        "fixture must present exactly 44 ledger rows"
+        versions,
+        (1..=44_i64).collect::<Vec<_>>(),
+        "fixture must present exactly 44 ledger rows (v1..=v44)"
     );
-    let v45_rows: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 45")
+    let post_v44_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version >= 45")
             .fetch_one(&pool)
             .await
-            .expect("count v45 rows");
-    assert_eq!(v45_rows, 0, "fixture must not carry the v45 ledger row");
+            .expect("count post-v44 rows");
+    assert_eq!(
+        post_v44_rows, 0,
+        "fixture must not carry the v45/v46/v47 ledger rows"
+    );
+    // The renumbered upstream migrations must be genuinely pending: if their
+    // objects survived the downgrade, the upgrade run would never exercise
+    // their DDL and this fixture would silently stop covering v46/v47.
+    let alert_indexes: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name IN (\
+         'idx_auth_token_logs_alert_time', \
+         'idx_api_key_maintenance_records_alert_time', \
+         'idx_scheduled_jobs_alert_time')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("probe v46 indexes");
+    assert_eq!(alert_indexes, 0, "fixture must not carry the v46 indexes");
+    let blocked_ranges: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM observability.sqlite_master WHERE type = 'table' \
+         AND name = 'dashboard_rollup_integrity_blocked_ranges'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("probe v47 blocked-range table");
+    assert_eq!(
+        blocked_ranges, 0,
+        "fixture must not carry the v47 blocked-range table"
+    );
     let api_keys_provider: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('api_keys') WHERE name = 'provider'",
     )
@@ -610,14 +676,17 @@ async fn try_spawn_harness(db_path: &Path, db_str: &str) -> Option<MigrationHarn
 // Shared migration assertions.
 // ---------------------------------------------------------------------------
 
-async fn assert_v45_schema_applied(pool: &sqlx::SqlitePool, context: &str) {
-    let ledger_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations")
-        .fetch_one(pool)
-        .await
-        .expect("count ledger rows");
+async fn assert_post_merge_ledger_applied(pool: &sqlx::SqlitePool, context: &str) {
+    let versions: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM schema_migrations ORDER BY version")
+            .fetch_all(pool)
+            .await
+            .expect("read migration ledger");
     assert_eq!(
-        ledger_rows, 45,
-        "{context}: migration_count must reach 45 (30 versioned + 14 convergence + v45)"
+        versions,
+        (1..=47_i64).collect::<Vec<_>>(),
+        "{context}: migration_count must reach 47 (30 versioned + 14 fork \
+         convergence + v45 + v46 + v47)"
     );
     let versioned: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version <= 30")
@@ -633,19 +702,38 @@ async fn assert_v45_schema_applied(pool: &sqlx::SqlitePool, context: &str) {
     assert_eq!(
         (versioned, convergence),
         (30, 14),
-        "{context}: 30 versioned + 14 convergence rows expected"
+        "{context}: 30 versioned + 14 fork convergence rows expected"
     );
 
-    let (name, checksum): (String, String) =
-        sqlx::query_as("SELECT name, checksum FROM schema_migrations WHERE version = 45")
-            .fetch_one(pool)
-            .await
-            .expect("read v45 ledger row");
-    assert_eq!(name, "provider-aware-schema-v1", "{context}: v45 name");
-    assert_eq!(
-        checksum, PROVIDER_AWARE_V45_CHECKSUM,
-        "{context}: v45 checksum"
-    );
+    for (version, expected_name, expected_checksum) in [
+        (
+            45_i64,
+            "provider-aware-schema-v1",
+            PROVIDER_AWARE_V45_CHECKSUM,
+        ),
+        (
+            46,
+            "alert-projection-source-indexes-v1",
+            ALERT_PROJECTION_SOURCE_INDEXES_V46_CHECKSUM,
+        ),
+        (
+            47,
+            "dashboard-rollup-integrity-blocked-ranges-v1",
+            DASHBOARD_ROLLUP_INTEGRITY_BLOCKED_RANGES_V47_CHECKSUM,
+        ),
+    ] {
+        let (name, checksum): (String, String) =
+            sqlx::query_as("SELECT name, checksum FROM schema_migrations WHERE version = ?")
+                .bind(version)
+                .fetch_one(pool)
+                .await
+                .unwrap_or_else(|err| panic!("{context}: read v{version} ledger row: {err}"));
+        assert_eq!(name, expected_name, "{context}: v{version} name");
+        assert_eq!(
+            checksum, expected_checksum,
+            "{context}: v{version} checksum"
+        );
+    }
 
     let api_keys_cols: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('api_keys') \
@@ -691,10 +779,45 @@ async fn assert_v45_schema_applied(pool: &sqlx::SqlitePool, context: &str) {
     .await
     .expect("probe provider index");
     assert_eq!(provider_index, 1, "{context}: provider index");
+
+    // v46 objects: the three alert projection source indexes.
+    let alert_indexes: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name IN (\
+         'idx_auth_token_logs_alert_time', \
+         'idx_api_key_maintenance_records_alert_time', \
+         'idx_scheduled_jobs_alert_time')",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("probe v46 indexes");
+    assert_eq!(alert_indexes, 3, "{context}: v46 alert source indexes");
+    // v47 objects: the blocked-range table and its probe index.
+    let blocked_ranges_table: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM observability.sqlite_master WHERE type = 'table' \
+         AND name = 'dashboard_rollup_integrity_blocked_ranges'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("probe v47 blocked-range table");
+    assert_eq!(
+        blocked_ranges_table, 1,
+        "{context}: v47 blocked-range table"
+    );
+    let blocked_ranges_index: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM observability.sqlite_master WHERE type = 'index' \
+         AND name = 'idx_dashboard_rollup_integrity_blocked_probe'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("probe v47 blocked-range probe index");
+    assert_eq!(
+        blocked_ranges_index, 1,
+        "{context}: v47 blocked-range probe index"
+    );
 }
 
 // ---------------------------------------------------------------------------
-// Test 1 — warm v44 → v45 upgrade E2E (M23 core).
+// Test 1 — warm v44 → v47 upgrade E2E (M23 core).
 // ---------------------------------------------------------------------------
 
 /// Legacy-row counts for the QA happy-path before/after identity check.
@@ -725,11 +848,12 @@ async fn legacy_row_counts(pool: &sqlx::SqlitePool) -> (i64, i64, i64, i64) {
     (auth, session, billing, dangling)
 }
 
-/// Given a genuinely seeded v44 fixture (30 versioned + 14 convergence rows,
-/// provider-less legacy shapes, a dangling-key row).
+/// Given a genuinely seeded v44 fixture (30 versioned + 14 fork convergence
+/// rows, provider-less legacy shapes, a dangling-key row).
 /// When the real server binary starts against it.
-/// Then v45 is applied exactly once (ledger + checksum + migration_count=45,
-/// sidecar ALTER), every legacy row stays readable, and legacy
+/// Then v45..=v47 are applied exactly once (ledger reaches 47 with all three
+/// rows + checksums, sidecar ALTER, v46 indexes, v47 blocked-range table),
+/// every legacy row stays readable, and legacy
 /// api_keys/auth_token_logs/mcp_sessions rows resolve to `tavily` — never a
 /// non-tavily provider.
 #[tokio::test]
@@ -749,7 +873,7 @@ async fn warm_v44_upgrade_applies_v45_and_keeps_legacy_rows_tavily() {
     let harness = spawn_harness("mh-warm-upgrade", db_path, db_str).await;
     let pool = harness.pool().await;
 
-    assert_v45_schema_applied(&pool, "warm upgrade").await;
+    assert_post_merge_ledger_applied(&pool, "warm upgrade").await;
 
     // QA happy: the warm upgrade loses no legacy row — counts identical.
     let post_counts = legacy_row_counts(&pool).await;
@@ -869,7 +993,7 @@ async fn warm_v44_upgrade_applies_v45_and_keeps_legacy_rows_tavily() {
 /// Given a brand-new database.
 /// When the real server binary bootstraps it.
 /// Then columns come from the `initialize_schema` DDL AND the ledger holds
-/// every recorded version 1..=45 (the src/tests/schema_migrations.rs golden
+/// every recorded version 1..=47 (the src/tests/schema_migrations.rs golden
 /// vector is cited, not duplicated).
 #[tokio::test]
 async fn fresh_bootstrap_records_provider_columns_and_full_ledger() {
@@ -885,18 +1009,18 @@ async fn fresh_bootstrap_records_provider_columns_and_full_ledger() {
             .expect("read fresh ledger");
     assert_eq!(
         versions,
-        (1..=45_i64).collect::<Vec<_>>(),
-        "fresh bootstrap must record the golden vector 1..=45"
+        (1..=47_i64).collect::<Vec<_>>(),
+        "fresh bootstrap must record the golden vector 1..=47"
     );
 
-    assert_v45_schema_applied(&pool, "fresh bootstrap").await;
+    assert_post_merge_ledger_applied(&pool, "fresh bootstrap").await;
 }
 
 // ---------------------------------------------------------------------------
 // Test 3 — provider facades functional post-upgrade + M8 negative.
 // ---------------------------------------------------------------------------
 
-/// Given an upgraded v45 database with post-upgrade provider keys.
+/// Given an upgraded (v47 ledger) database with post-upgrade provider keys.
 /// When one REST + one MCP call per new provider hits the stubs.
 /// Then every facade answers 200, each stamps a provider-tagged request log,
 /// and M8 holds: zero depletion rows for the new providers.
@@ -1042,7 +1166,7 @@ async fn upgraded_database_serves_all_provider_facades_with_zero_new_depletions(
 // Test 4 — HA control baseline export carries the provider column.
 // ---------------------------------------------------------------------------
 
-/// Given an upgraded v45 database.
+/// Given an upgraded (v47 ledger) database.
 /// When the admin HA control baseline is exported.
 /// Then the api_keys resource rows carry `provider='tavily'` (the import-side
 /// legacy-NDJSON defaulting is covered by the committed lib test
@@ -1118,14 +1242,15 @@ async fn ha_baseline_export_from_upgraded_database_carries_provider() {
 // Test 5 — QA failure scenario: checksum tamper rejected at startup.
 // ---------------------------------------------------------------------------
 
-/// Given an upgraded v45 database whose v45 checksum is tampered.
+/// Given an upgraded (v47 ledger) database whose v45 checksum is tampered.
 /// When the real server binary starts against it.
 /// Then startup is rejected with the typed checksum-mismatch error.
 #[tokio::test]
 async fn checksum_tamper_on_upgraded_database_is_rejected_at_startup() {
     let (db_path, db_str) = build_v44_fixture("mh-tamper").await;
 
-    // Upgrade the fixture to v45 (minimal single-provider server; no mocks).
+    // Upgrade the fixture to the post-merge ledger v45..=v47 (minimal
+    // single-provider server; no mocks).
     let upgrade_port = reserve_local_port();
     let dead_port = reserve_local_port();
     let upgrade_child = base_server_command(
