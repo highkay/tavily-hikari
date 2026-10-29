@@ -1529,6 +1529,67 @@ async fn reconciliation_read_sessions_interrupt_and_clean_each_read_kind() {
 }
 
 #[tokio::test]
+async fn lazy_pool_growth_uses_a_connection_setup_budget_not_a_contention_budget() {
+    let runtime = SqliteRuntime::with_max_connections(
+        SqlitePoolOptions::new()
+            .min_connections(1)
+            .max_connections(3)
+            .connect_with(
+                SqliteConnectOptions::from_str("sqlite::memory:")
+                    .expect("SQLite options")
+                    .create_if_missing(true),
+            )
+            .await
+            .expect("lazy three connection pool"),
+        3,
+    );
+    assert_eq!(runtime.inner.pool.size(), 1);
+    assert_eq!(runtime.inner.pool.num_idle(), 1);
+
+    // The only open connection is checked out, but the pool may still grow:
+    // the next acquire covers connect plus ATTACH and is not writer
+    // contention, so it must not be charged the short contention budget.
+    let held = runtime
+        .inner
+        .pool
+        .acquire()
+        .await
+        .expect("hold the open slot");
+    assert_eq!(runtime.inner.pool.num_idle(), 0);
+    assert_eq!(runtime.inner.pool.size(), 1);
+    let dashboard_integrity = SqliteOperation::DashboardIntegrityWrite.acquire_budget();
+    assert_eq!(
+        runtime.pool_acquire_budget(SqliteOperation::DashboardIntegrityWrite),
+        dashboard_integrity.max(SQLITE_POOL_GROWTH_ACQUIRE_BUDGET)
+    );
+
+    // Once the pool reaches max_connections every wait really is contention,
+    // so the operation's short budget is restored unchanged.
+    let second = runtime.inner.pool.acquire().await.expect("grow to two");
+    let third = runtime.inner.pool.acquire().await.expect("grow to three");
+    assert_eq!(runtime.inner.pool.size(), 3);
+    assert_eq!(runtime.inner.pool.num_idle(), 0);
+    assert_eq!(
+        runtime.pool_acquire_budget(SqliteOperation::DashboardIntegrityWrite),
+        dashboard_integrity
+    );
+    drop((third, second, held));
+
+    // An idle connection also means the acquire cannot need setup work.
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while runtime.inner.pool.num_idle() < 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("returned connections become idle");
+    assert_eq!(
+        runtime.pool_acquire_budget(SqliteOperation::DashboardIntegrityWrite),
+        dashboard_integrity
+    );
+}
+
+#[tokio::test]
 async fn sqlite_runtime_admits_bulk_from_a_lazy_three_connection_pool() {
     let runtime = SqliteRuntime::with_max_connections(
         SqlitePoolOptions::new()

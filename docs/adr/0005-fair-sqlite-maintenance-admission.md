@@ -35,6 +35,12 @@ contention policy. Add one instance-local coordinator in front of that semaphore
   dashboard-integrity and request-log-GC recovery turns. The 100ms acquire
   budget is the safety boundary, so a full pool cannot starve an aged ticket behind a pre-admission
   `pool_pressure` check. Pools at or below the two-slot foreground reserve remain foreground-only.
+- The pool opens lazily and grows on demand, so the short acquire budget bounds writer contention
+  only. While the pool still has room to grow and nothing is idle, the acquire may also be covering
+  connection setup (connect plus the observability `ATTACH`) or the return of a checked-out
+  connection; that wait is bounded separately as pool growth. A saturated pool, where no idle
+  connection exists and the pool cannot grow, keeps the short budget, so the safety boundary above
+  is unchanged.
 - Admission is non-blocking. A caller either receives the physical permit plus a coordinator lease
   or receives the existing typed defer reason and retries through its existing bounded loop.
 - A class keeps its one pending ticket while a caller is still retrying any typed admission defer;

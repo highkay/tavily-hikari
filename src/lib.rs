@@ -690,6 +690,15 @@ pub async fn run_request_statistics_recovery_once(
 
 const REQUEST_STATISTICS_RECOVERY_OBSERVATION_BUDGET: Duration = Duration::from_millis(150);
 
+/// Bound for opening the exclusive recovery store before any recovery work runs.
+///
+/// `max_runtime_secs` bounds the resumable recovery pass itself. Opening the
+/// store acquires the exclusive service lock and converges schema state, which
+/// costs the same regardless of how much recovery work the caller asked for;
+/// charging it to the work budget turned a small budget into an error before
+/// the pass could report its resumable outcome.
+const REQUEST_STATISTICS_RECOVERY_BOOTSTRAP_BUDGET: Duration = Duration::from_secs(30);
+
 async fn request_statistics_recovery_observation<T, F>(
     deadline: Instant,
     future: F,
@@ -785,11 +794,10 @@ pub(crate) async fn run_request_statistics_recovery_once_with_time(
         )));
     }
     let started = backend_time.instant_now();
-    let deadline =
-        backend_time.deadline_after(Duration::from_secs(options.max_runtime_secs.max(1)));
     let target_day_end = next_local_day_start_utc_ts(options.target_day_start);
+    let bootstrap_deadline = Instant::now() + REQUEST_STATISTICS_RECOVERY_BOOTSTRAP_BUDGET;
     let key_store = tokio::time::timeout(
-        deadline.saturating_duration_since(Instant::now()),
+        bootstrap_deadline.saturating_duration_since(Instant::now()),
         crate::store::KeyStore::open_for_request_statistics_recovery_with_time(
             database_path,
             backend_time.clone(),
@@ -799,6 +807,10 @@ pub(crate) async fn run_request_statistics_recovery_once_with_time(
     .map_err(|_| {
         ProxyError::Other("request statistics recovery bootstrap exceeded its budget".to_string())
     })??;
+    // The requested runtime bounds recovery work, so it starts once the store
+    // is open instead of absorbing lock acquisition and schema convergence.
+    let deadline =
+        backend_time.deadline_after(Duration::from_secs(options.max_runtime_secs.max(1)));
     let Some(settings) =
         request_statistics_recovery_observation(deadline, key_store.get_system_settings()).await?
     else {

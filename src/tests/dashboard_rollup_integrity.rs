@@ -322,21 +322,7 @@ async fn recovery_fails_closed_when_legacy_gc_deleted_source_baseline_is_missing
     insert_visible_dashboard_log(&proxy, day + 60).await;
     insert_visible_dashboard_log(&proxy, day + 120).await;
 
-    for _ in 0..300 {
-        if proxy
-            .key_store
-            .dashboard_rollup_integrity_request_log_gc_cutoff(threshold)
-            .await
-            .expect("check source seal")
-            .is_some()
-        {
-            break;
-        }
-        proxy
-            .run_dashboard_rollup_integrity_slice()
-            .await
-            .expect("build source seal");
-    }
+    converge_dashboard_integrity_seal(&proxy, threshold, "building the source seal").await;
     assert_eq!(
         proxy
             .key_store
@@ -1272,6 +1258,47 @@ async fn dashboard_window_marks_unscanned_history_as_unverified() {
     );
 }
 
+/// Slices a cold integrity pass may need before one closed day is sealed.
+///
+/// The pass must page the whole one-day hot window (288 five-minute pages) and
+/// then reaudit the closed day in two-hour GC-blocking chunks (12) before it can
+/// finalize the day seal. A bound that only covers that exact work fails as soon
+/// as a single slice defers for its read budget, admission, or a source page, so
+/// the fixture allows twice the requirement.
+const DASHBOARD_INTEGRITY_CONVERGENCE_SLICES: usize = {
+    let hot_pages = (SECS_PER_DAY / SECS_PER_FIVE_MINUTES) as usize;
+    let gc_blocking_reaudit_chunks = (SECS_PER_DAY / (2 * SECS_PER_HOUR)) as usize;
+    2 * (hot_pages + gc_blocking_reaudit_chunks + 1)
+};
+
+/// Drive the integrity scheduler until the request-log GC cutoff reports a day
+/// seal, and fail with the last slice state instead of a bare assertion.
+async fn converge_dashboard_integrity_seal(proxy: &TavilyProxy, threshold: i64, what: &str) {
+    let mut last_state = String::from("unstarted");
+    let mut last_delay_secs = 0_i64;
+    for _ in 0..DASHBOARD_INTEGRITY_CONVERGENCE_SLICES {
+        if proxy
+            .key_store
+            .dashboard_rollup_integrity_request_log_gc_cutoff(threshold)
+            .await
+            .expect("read the dashboard rollup integrity cutoff while converging")
+            .is_some()
+        {
+            return;
+        }
+        let run = proxy
+            .run_dashboard_rollup_integrity_slice()
+            .await
+            .expect("advance a dashboard rollup integrity slice while converging");
+        last_state = run.state;
+        last_delay_secs = run.next_delay_secs;
+    }
+    panic!(
+        "dashboard rollup integrity did not seal within {} slices while {what}: last_state={last_state} next_delay_secs={last_delay_secs}",
+        DASHBOARD_INTEGRITY_CONVERGENCE_SLICES
+    );
+}
+
 async fn insert_visible_dashboard_log(proxy: &TavilyProxy, created_at: i64) {
     sqlx::query(
         r#"
@@ -1846,21 +1873,7 @@ async fn request_log_gc_preserves_deleted_source_contribution_after_a_late_updat
     insert_visible_dashboard_log(&proxy, day + 60).await;
     insert_visible_dashboard_log(&proxy, day + 120).await;
 
-    for _ in 0..300 {
-        if proxy
-            .key_store
-            .dashboard_rollup_integrity_request_log_gc_cutoff(threshold)
-            .await
-            .expect("check initial source seal")
-            .is_some()
-        {
-            break;
-        }
-        proxy
-            .run_dashboard_rollup_integrity_slice()
-            .await
-            .expect("build initial source seal");
-    }
+    converge_dashboard_integrity_seal(&proxy, threshold, "building the initial source seal").await;
     assert_eq!(
         proxy
             .key_store
@@ -1902,21 +1915,12 @@ async fn request_log_gc_preserves_deleted_source_contribution_after_a_late_updat
         .await
         .expect("update retained source row");
 
-    for _ in 0..300 {
-        if proxy
-            .key_store
-            .dashboard_rollup_integrity_request_log_gc_cutoff(threshold)
-            .await
-            .expect("check late-update source seal")
-            .is_some()
-        {
-            break;
-        }
-        proxy
-            .run_dashboard_rollup_integrity_slice()
-            .await
-            .expect("rebuild source-backed seal after late update");
-    }
+    converge_dashboard_integrity_seal(
+        &proxy,
+        threshold,
+        "rebuilding the source-backed seal after a late update",
+    )
+    .await;
     assert_eq!(
         proxy
             .key_store
@@ -2380,21 +2384,8 @@ async fn integrity_gc_recovers_missing_and_divergent_seals_without_touching_bill
             .expect("missing seal blocks"),
         None
     );
-    for _ in 0..300 {
-        if proxy
-            .key_store
-            .dashboard_rollup_integrity_request_log_gc_cutoff(threshold)
-            .await
-            .expect("check recovery")
-            .is_some()
-        {
-            break;
-        }
-        proxy
-            .run_dashboard_rollup_integrity_slice()
-            .await
-            .expect("advance missing-day recovery");
-    }
+    converge_dashboard_integrity_seal(&proxy, threshold, "advancing the missing-day recovery")
+        .await;
     assert_eq!(
         proxy
             .key_store
@@ -2461,21 +2452,8 @@ async fn integrity_gc_recovers_missing_and_divergent_seals_without_touching_bill
     .await
     .expect("read preserved checkpoint");
     assert_eq!(before, after);
-    for _ in 0..300 {
-        if proxy
-            .key_store
-            .dashboard_rollup_integrity_request_log_gc_cutoff(threshold)
-            .await
-            .expect("check seal fence")
-            .is_some()
-        {
-            break;
-        }
-        proxy
-            .run_dashboard_rollup_integrity_slice()
-            .await
-            .expect("finish source-backed re-audit");
-    }
+    converge_dashboard_integrity_seal(&proxy, threshold, "finishing the source-backed re-audit")
+        .await;
     let recovered: String = sqlx::query_scalar(
         "SELECT counts_json FROM dashboard_rollup_daily_seals WHERE bucket_start = ?",
     )
