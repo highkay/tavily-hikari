@@ -2102,13 +2102,15 @@ async fn request_logs_gc_scans_past_unexpired_body_to_clear_later_expired_body()
     manual_clock.set_now_ts(1_700_000_000);
 
     let now = manual_clock.now_ts();
-    let unexpired_id: i64 = sqlx::query_scalar(
+    // Seed with `execute()` + `last_insert_rowid()`: an `INSERT ... RETURNING`
+    // against the observability sidecar can leave the pooled connection holding
+    // a stale snapshot, hiding these rows from the later GC read.
+    let insert = sqlx::query(
         r#"
         INSERT INTO observability.request_logs (
             method, path, result_status, request_kind_key, request_user_id,
             request_body, response_body, visibility, created_at
         ) VALUES ('POST', '/api/tavily/search', 'success', 'api:search', ?, ?, ?, ?, ?)
-        RETURNING id
         "#,
     )
     .bind(&user.user_id)
@@ -2116,25 +2118,26 @@ async fn request_logs_gc_scans_past_unexpired_body_to_clear_later_expired_body()
     .bind(br#"{"ok":true}"#.as_slice())
     .bind(REQUEST_LOG_VISIBILITY_VISIBLE)
     .bind(now - SECS_PER_DAY)
-    .fetch_one(&proxy.key_store.pool)
+    .execute(&proxy.key_store.pool)
     .await
     .expect("seed unexpired debug body");
-    let expired_id: i64 = sqlx::query_scalar(
+    let unexpired_id = insert.last_insert_rowid();
+    let insert = sqlx::query(
         r#"
         INSERT INTO observability.request_logs (
             method, path, result_status, request_kind_key,
             request_body, response_body, visibility, created_at
         ) VALUES ('POST', '/mcp', 'success', 'mcp:tools/list', ?, ?, ?, ?)
-        RETURNING id
         "#,
     )
     .bind(br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#.as_slice())
     .bind(br#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#.as_slice())
     .bind(REQUEST_LOG_VISIBILITY_VISIBLE)
     .bind(now)
-    .fetch_one(&proxy.key_store.pool)
+    .execute(&proxy.key_store.pool)
     .await
     .expect("seed later expired non-business body");
+    let expired_id = insert.last_insert_rowid();
 
     let report = proxy
         .gc_request_logs_with_options(RequestLogsGcOptions {
@@ -2167,22 +2170,22 @@ async fn request_logs_gc_scans_past_unexpired_body_to_clear_later_expired_body()
         Some(REQUEST_LOG_BODY_CLEANED_REASON_POLICY_ZERO)
     );
 
-    let second_expired_id: i64 = sqlx::query_scalar(
+    let insert = sqlx::query(
         r#"
         INSERT INTO observability.request_logs (
             method, path, result_status, request_kind_key,
             request_body, response_body, visibility, created_at
         ) VALUES ('POST', '/mcp', 'success', 'mcp:tools/list', ?, ?, ?, ?)
-        RETURNING id
         "#,
     )
     .bind(br#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#.as_slice())
     .bind(br#"{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}"#.as_slice())
     .bind(REQUEST_LOG_VISIBILITY_VISIBLE)
     .bind(now + SECS_PER_MINUTE)
-    .fetch_one(&proxy.key_store.pool)
+    .execute(&proxy.key_store.pool)
     .await
     .expect("seed another expired non-business body");
+    let second_expired_id = insert.last_insert_rowid();
     manual_clock.advance_wall(Duration::from_secs(SECS_PER_MINUTE as u64 + 1));
     let second_report = proxy
         .gc_request_logs_with_options(RequestLogsGcOptions {
