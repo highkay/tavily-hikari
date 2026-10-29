@@ -1569,6 +1569,9 @@ async fn projection_defer_skips_research_candidates_in_the_same_turn() {
     .await
     .expect("inject projection defer");
     proxy.fail_next_reconciliation_research_read_for_test();
+    // The projection defer this test injects is unrelated to admission; a
+    // typed admission defer must not be mistaken for the no-progress gate.
+    let admission_deadline = tokio::time::Instant::now() + Duration::from_secs(45);
     let queued = proxy
         .scheduled_job_enqueue("upstream_reconciliation", "auto", None, 1)
         .await
@@ -1578,14 +1581,30 @@ async fn projection_defer_skips_research_candidates_in_the_same_turn() {
         .await
         .expect("claim representative")
         .expect("representative is claimed");
-    let outcome = proxy
-        .run_upstream_reconciliation_once_claimed_outcome(
-            "http://127.0.0.1:9",
-            claim.id,
-            claim.claim_generation,
-        )
-        .await
-        .expect("projection defer does not fail the main turn");
+    let outcome = loop {
+        let outcome = proxy
+            .run_upstream_reconciliation_once_claimed_outcome(
+                "http://127.0.0.1:9",
+                claim.id,
+                claim.claim_generation,
+            )
+            .await
+            .expect("projection defer does not fail the main turn");
+        if !matches!(outcome, ClaimedReconciliationRunOutcome::Deferred { .. }) {
+            break outcome;
+        }
+        // A claimed run may defer before it reaches the projection slice: local
+        // SQLite admission (pool pressure, contention) refuses the work and the
+        // scheduler re-runs the same claim later. Such a deferral writes nothing,
+        // keeps the claim current, and cannot reach the Research sweep, so re-run
+        // the SAME claim until the turn actually completes - the no-progress gate
+        // this test pins is only exercised by a completed turn.
+        assert!(
+            tokio::time::Instant::now() < admission_deadline,
+            "reconciliation admission never let the claimed projection turn complete: {outcome:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     assert!(
         matches!(outcome, ClaimedReconciliationRunOutcome::Completed { .. }),
         "projection no-progress must skip the same-turn Research sweep: {outcome:?}"
