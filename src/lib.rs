@@ -690,13 +690,7 @@ pub async fn run_request_statistics_recovery_once(
 
 const REQUEST_STATISTICS_RECOVERY_OBSERVATION_BUDGET: Duration = Duration::from_millis(150);
 
-/// Bound for opening the exclusive recovery store before any recovery work runs.
-///
-/// `max_runtime_secs` bounds the resumable recovery pass itself. Opening the
-/// store acquires the exclusive service lock and converges schema state, which
-/// costs the same regardless of how much recovery work the caller asked for;
-/// charging it to the work budget turned a small budget into an error before
-/// the pass could report its resumable outcome.
+/// Store opening (service lock plus schema convergence) is budgeted apart from the runtime.
 const REQUEST_STATISTICS_RECOVERY_BOOTSTRAP_BUDGET: Duration = Duration::from_secs(30);
 
 async fn request_statistics_recovery_observation<T, F>(
@@ -795,6 +789,8 @@ pub(crate) async fn run_request_statistics_recovery_once_with_time(
     }
     let started = backend_time.instant_now();
     let target_day_end = next_local_day_start_utc_ts(options.target_day_start);
+    // Opening the store takes the service lock and converges schema state, so it is not
+    // charged to the requested recovery runtime, which only starts once the store is open.
     let bootstrap_deadline = Instant::now() + REQUEST_STATISTICS_RECOVERY_BOOTSTRAP_BUDGET;
     let key_store = tokio::time::timeout(
         bootstrap_deadline.saturating_duration_since(Instant::now()),
@@ -807,8 +803,6 @@ pub(crate) async fn run_request_statistics_recovery_once_with_time(
     .map_err(|_| {
         ProxyError::Other("request statistics recovery bootstrap exceeded its budget".to_string())
     })??;
-    // The requested runtime bounds recovery work, so it starts once the store
-    // is open instead of absorbing lock acquisition and schema convergence.
     let deadline =
         backend_time.deadline_after(Duration::from_secs(options.max_runtime_secs.max(1)));
     let Some(settings) =
@@ -1627,17 +1621,12 @@ pub(crate) fn build_mcp_upstream_url(base: &Url, request_path: &str) -> Url {
 
 /// Provider-aware MCP upstream URL builder (plan todo 11, amendment M1).
 ///
-/// [`build_mcp_upstream_url`] strips the Tavily-literal `/mcp` ingress from
-/// the client-facing request path before appending the remainder under the
-/// configured upstream base. Provider MCP ingress paths (`/serpapi/mcp`,
-/// `/exa/mcp`, `/brave/mcp`) must strip THEIR OWN prefix so a path-prefixed
-/// upstream (`SERPAPI_MCP_UPSTREAM=http://host/gw/mcp` + request
-/// `/serpapi/mcp`) resolves to the exact configured `/gw/mcp` target.
-///
-/// Root-path bases resolve to `/` plus the ingress-stripped suffix: unlike
-/// the Tavily contract above, the client-facing ingress prefix is NEVER
-/// appended verbatim to a provider upstream. The legacy Tavily function is
-/// kept untouched (byte-stability rule) instead of delegating here.
+/// Unlike [`build_mcp_upstream_url`], which strips the Tavily-literal `/mcp` ingress, provider
+/// ingresses (`/serpapi/mcp`, `/exa/mcp`, `/brave/mcp`) strip their OWN prefix so a path-prefixed
+/// upstream (`SERPAPI_MCP_UPSTREAM=http://host/gw/mcp` + `/serpapi/mcp`) resolves to `/gw/mcp`.
+/// Root-path bases resolve to `/` plus the ingress-stripped suffix: the client-facing ingress
+/// prefix is never appended verbatim, and the legacy Tavily function stays untouched for
+/// byte stability instead of delegating here.
 pub(crate) fn build_mcp_upstream_url_with_ingress(
     base: &Url,
     request_path: &str,
