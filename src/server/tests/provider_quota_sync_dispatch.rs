@@ -538,3 +538,209 @@ fn serpapi_job_type_registered_as_remote_io_with_db_gate() {
         "exa/brave have NO scheduler lane or job type"
     );
 }
+
+// -------------------------------------------------------------------------
+// Plan todo 19 follow-up: per-sweep enqueue cap + serpapi-first lane order.
+//
+// The sweep body is driven directly (no tokio sleep beyond the random jitter,
+// which the tests pin to 0 seconds => `random_delay_secs(0) == 0`), so every
+// assertion is deterministic and no wall-clock wait exists. BackendTime's
+// manual clock is lib-only (`#[cfg(test)]`), so bin tests reach the same
+// guarantee through the zero-jitter seam the sweep now exposes.
+// -------------------------------------------------------------------------
+
+struct SweepHarness {
+    state: Arc<AppState>,
+    pool: sqlx::SqlitePool,
+    db_path: std::path::PathBuf,
+}
+
+impl Drop for SweepHarness {
+    fn drop(&mut self) {
+        if let Some(dir) = self.db_path.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// Seed `tavily_keys` + `serpapi_keys` at construction; a sweep only enqueues
+/// durable jobs, so no upstream is ever contacted.
+async fn spawn_sweep_harness(
+    prefix: &str,
+    tavily_keys: &[String],
+    serpapi_keys: &[String],
+) -> SweepHarness {
+    let db_path = temp_db_path(prefix);
+    let db_str = db_path.to_string_lossy().to_string();
+    let providers = tavily_hikari::ProviderBootstrap {
+        // Never contacted: this harness only enqueues durable jobs. Pinning the
+        // bases to a dead local port keeps any accidental egress off real
+        // upstreams.
+        serpapi_upstream: "http://127.0.0.1:9".to_string(),
+        serpapi_mcp_upstream: "http://127.0.0.1:9/mcp".to_string(),
+        serpapi_keys: serpapi_keys.to_vec(),
+        ..tavily_hikari::ProviderBootstrap::default()
+    };
+    let proxy = TavilyProxy::with_providers_in_ha_mode(
+        tavily_keys.to_vec(),
+        DEFAULT_UPSTREAM,
+        &db_str,
+        tavily_hikari::TavilyProxyOptions::from_database_path(&db_str),
+        providers,
+        tavily_hikari::HaMode::Single,
+    )
+    .await
+    .expect("proxy created");
+    let state = Arc::new(AppState {
+        proxy,
+        static_dir: None,
+        forward_auth: ForwardAuthConfig::new(None, None, None, None),
+        forward_auth_enabled: false,
+        builtin_admin: BuiltinAdminAuth::new(false, None, None),
+        admin_passkey: AdminPasskeyOptions::disabled(),
+        linuxdo_oauth: LinuxDoOAuthOptions::disabled(),
+        linuxdo_credit: LinuxDoCreditOptions::disabled(),
+        ha: tavily_hikari::HaRuntime::new(tavily_hikari::HaConfig::default()),
+        dev_open_admin: true,
+        usage_base: "http://127.0.0.1:9".to_string(),
+        api_key_ip_geo_origin: "https://api.country.is".to_string(),
+        dashboard_overview_cache: new_dashboard_overview_cache(),
+        remote_attempt_admission: new_remote_attempt_admission(),
+    });
+    let pool = connect_sqlite_test_pool(&db_str).await;
+    SweepHarness {
+        state,
+        pool,
+        db_path,
+    }
+}
+
+impl SweepHarness {
+    /// Every queued job in durable insertion order (id ASC).
+    async fn enqueued_jobs(&self) -> Vec<(String, Option<String>)> {
+        sqlx::query_as("SELECT job_type, key_id FROM scheduled_jobs ORDER BY id ASC")
+            .fetch_all(&self.pool)
+            .await
+            .expect("read scheduled_jobs")
+    }
+
+    async fn count_enqueued(&self, job_type: &str) -> usize {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM scheduled_jobs WHERE job_type = ?")
+            .bind(job_type)
+            .fetch_one(&self.pool)
+            .await
+            .expect("count scheduled_jobs") as usize
+    }
+}
+
+fn numbered_secrets(prefix: &str, count: usize) -> Vec<String> {
+    (0..count).map(|index| format!("{prefix}-{index:03}")).collect()
+}
+
+/// (a) A cold sweep with 100 pending serpapi keys enqueues ONLY the cap.
+#[tokio::test]
+async fn serpapi_sweep_enqueues_at_most_per_sweep_cap() {
+    let harness = spawn_sweep_harness(
+        "serpapi-sweep-cap",
+        &[],
+        &numbered_secrets("serp-sweep-cap", 100),
+    )
+    .await;
+
+    run_quota_sync_sweep(harness.state.as_ref(), true, 0).await;
+
+    assert_eq!(PER_SWEEP_ENQUEUE_CAP, 60);
+    let serpapi = harness.count_enqueued(QUOTA_SYNC_SERPAPI_JOB_TYPE).await;
+    assert_eq!(
+        serpapi, PER_SWEEP_ENQUEUE_CAP,
+        "100 pending serpapi keys must enqueue exactly {PER_SWEEP_ENQUEUE_CAP} per sweep, got {serpapi}"
+    );
+    assert_eq!(
+        harness.count_enqueued("quota_sync").await,
+        0,
+        "no tavily key exists, so the tavily lane enqueues nothing"
+    );
+    // The 40 deferred keys stay pending: nothing was dropped or quarantined.
+    let still_pending = harness
+        .state
+        .proxy
+        .list_keys_pending_provider_quota_sync(
+            tavily_hikari::providers::ProviderId::Serpapi,
+            twenty_four_hours_secs(),
+        )
+        .await
+        .expect("serpapi pending list");
+    assert_eq!(
+        still_pending.len(),
+        100,
+        "the cap bounds enqueueing only; pending selection is unchanged"
+    );
+}
+
+/// (b) Within ONE sweep the serpapi jobs are enqueued before every tavily job.
+#[tokio::test]
+async fn serpapi_jobs_enqueue_before_tavily_jobs_in_one_sweep() {
+    let harness = spawn_sweep_harness(
+        "sweep-lane-order",
+        &numbered_secrets("tvly-sweep-order", 3),
+        &numbered_secrets("serp-sweep-order", 3),
+    )
+    .await;
+
+    run_quota_sync_sweep(harness.state.as_ref(), true, 0).await;
+
+    let jobs = harness.enqueued_jobs().await;
+    let serpapi_count = jobs
+        .iter()
+        .filter(|(job_type, _)| job_type == QUOTA_SYNC_SERPAPI_JOB_TYPE)
+        .count();
+    let tavily_count = jobs
+        .iter()
+        .filter(|(job_type, _)| job_type == "quota_sync")
+        .count();
+    assert_eq!(serpapi_count, 3, "all three serpapi keys enqueued: {jobs:?}");
+    assert_eq!(tavily_count, 3, "all three tavily keys enqueued: {jobs:?}");
+    assert_eq!(jobs.len(), 6);
+    let first_tavily = jobs
+        .iter()
+        .position(|(job_type, _)| job_type == "quota_sync")
+        .expect("tavily jobs enqueued");
+    assert_eq!(
+        jobs[0].0, QUOTA_SYNC_SERPAPI_JOB_TYPE,
+        "the sweep starts with a serpapi job, not a tavily one: {jobs:?}"
+    );
+    assert!(
+        jobs[..first_tavily]
+            .iter()
+            .all(|(job_type, _)| job_type == QUOTA_SYNC_SERPAPI_JOB_TYPE),
+        "every job before the first tavily job is a serpapi job: {jobs:?}"
+    );
+    assert_eq!(
+        jobs[first_tavily - 1].0, QUOTA_SYNC_SERPAPI_JOB_TYPE,
+        "the last serpapi job is enqueued immediately before the first tavily job: {jobs:?}"
+    );
+}
+
+/// (c) The tavily lane is bounded by the same cap: 100 pending -> exactly 60.
+#[tokio::test]
+async fn tavily_sweep_enqueues_at_most_per_sweep_cap() {
+    let harness = spawn_sweep_harness(
+        "tavily-sweep-cap",
+        &numbered_secrets("tvly-sweep-cap", 100),
+        &[],
+    )
+    .await;
+
+    run_quota_sync_sweep(harness.state.as_ref(), true, 0).await;
+
+    let tavily = harness.count_enqueued("quota_sync").await;
+    assert_eq!(
+        tavily, PER_SWEEP_ENQUEUE_CAP,
+        "100 pending tavily keys must enqueue exactly {PER_SWEEP_ENQUEUE_CAP} per sweep, got {tavily}"
+    );
+    assert_eq!(
+        harness.count_enqueued(QUOTA_SYNC_SERPAPI_JOB_TYPE).await,
+        0,
+        "no serpapi key exists, so that lane enqueues nothing"
+    );
+}
