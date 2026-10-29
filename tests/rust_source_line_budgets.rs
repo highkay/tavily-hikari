@@ -21,8 +21,8 @@ const EXCEPTIONS: &[(&str, usize, &str)] = &[
     ),
     (
         "src/lib.rs",
-        3300,
-        "Recovery admission, timeout ownership, and online dashboard/request-log maintenance now share the root lifecycle wiring while extracting recovery orchestration remains a separate behavior-preserving change.",
+        3320,
+        "Recovery admission, timeout ownership, and online dashboard/request-log maintenance now share the root lifecycle wiring, and the v2 cutover grew that same root wiring further (provider facades, native-auth routing, maintenance contention budgets); extracting recovery orchestration remains a separate behavior-preserving change.",
     ),
     (
         "src/store/key_store_dashboard_rollup_integrity.rs",

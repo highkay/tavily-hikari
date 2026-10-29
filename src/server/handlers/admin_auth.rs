@@ -472,11 +472,19 @@ async fn run_manual_key_quota_sync_with_outcome(
 /// (UTC midnight), quota_synced_at=now. /account is free/uncounted (M13).
 /// The error detail never embeds the transport error's URL (it would carry
 /// the secret in its query string).
+///
+/// Egress (plan v2-cutover-followups todo 2 / GAP-2): the fetch rides the SAME
+/// forward-proxy lane as the scheduled lane — local plan preparation, then the
+/// shared single remote-attempt lease (`acquire_manual_attempt`, M4 C4a: at
+/// most one outbound in flight), then `send_with_forward_proxy_plan`. A
+/// direct-only client could never reach SerpApi from the deployment networks,
+/// which made manual verification useless there. The 20s manual budget stays
+/// here (the scheduled lane keeps its 8s fetch timeout).
 async fn sync_serpapi_key_quota(
     state: &AppState,
     key_id: &str,
 ) -> Result<ProviderQuotaSyncSnapshot, ManualQuotaSyncError> {
-    use tavily_hikari::providers::ProviderId;
+    use tavily_hikari::SerpapiManualSyncError;
     let api_key = state
         .proxy
         .get_api_key_secret(key_id)
@@ -495,83 +503,59 @@ async fn sync_serpapi_key_quota(
                 format!("api key secret not found for {key_id}"),
             )
         })?;
-    let rest_base = state
+    let admission = remote_attempt_admission_for_state(state);
+    let snapshot = state
         .proxy
-        .provider_rest_base_url(ProviderId::Serpapi)
-        .map_err(|err| {
-            ManualQuotaSyncError::new(
-                StatusCode::BAD_GATEWAY,
-                "sync_failed",
-                err.to_string(),
-            )
-        })?;
-    let rest_base = rest_base.trim_end_matches('/');
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(PROVIDER_QUOTA_SYNC_TIMEOUT_SECS))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-    let response = client
-        .get(format!("{rest_base}/account"))
-        .query(&[("api_key", api_key.as_str())])
-        .send()
+        .fetch_serpapi_account_for_manual_sync(
+            &api_key,
+            key_id,
+            admission,
+            Duration::from_secs(PROVIDER_QUOTA_SYNC_TIMEOUT_SECS),
+        )
         .await
-        .map_err(|err| {
-            eprintln!("serpapi account sync transport error for key {key_id}: timeout={}", err.is_timeout());
-            ManualQuotaSyncError::new(
+        .map_err(|err| match err {
+            SerpapiManualSyncError::Transport { timed_out } => {
+                eprintln!(
+                    "serpapi account sync transport error for key {key_id}: timeout={timed_out}"
+                );
+                ManualQuotaSyncError::new(
+                    StatusCode::BAD_GATEWAY,
+                    "sync_failed",
+                    "SerpApi account request could not reach the upstream".to_string(),
+                )
+            }
+            SerpapiManualSyncError::UsageHttp { status, body } => {
+                let http_status = if status == reqwest::StatusCode::UNAUTHORIZED {
+                    StatusCode::UNAUTHORIZED
+                } else if status == reqwest::StatusCode::FORBIDDEN {
+                    StatusCode::FORBIDDEN
+                } else if status.is_client_error() {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::BAD_GATEWAY
+                };
+                ManualQuotaSyncError::new(
+                    http_status,
+                    "usage_http",
+                    format!("SerpApi account request failed with {status}: {body}"),
+                )
+            }
+            SerpapiManualSyncError::QuotaDataMissing { reason } => ManualQuotaSyncError::new(
+                StatusCode::BAD_REQUEST,
+                "quota_data_missing",
+                reason,
+            ),
+            // Lease admission, unresolved upstream base, and body-read failures
+            // keep the legacy gateway mapping; none of these carry the secret.
+            SerpapiManualSyncError::Other(detail) => ManualQuotaSyncError::new(
                 StatusCode::BAD_GATEWAY,
                 "sync_failed",
-                "SerpApi account request could not reach the upstream".to_string(),
-            )
+                detail,
+            ),
         })?;
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    if status != reqwest::StatusCode::OK {
-        let http_status = if status == reqwest::StatusCode::UNAUTHORIZED {
-            StatusCode::UNAUTHORIZED
-        } else if status == reqwest::StatusCode::FORBIDDEN {
-            StatusCode::FORBIDDEN
-        } else if status.is_client_error() {
-            StatusCode::BAD_REQUEST
-        } else {
-            StatusCode::BAD_GATEWAY
-        };
-        return Err(ManualQuotaSyncError::new(
-            http_status,
-            "usage_http",
-            format!("SerpApi account request failed with {status}: {body}"),
-        ));
-    }
-    let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-    let (Some(limit), Some(remaining)) = (
-        parsed["searches_per_month"].as_i64(),
-        parsed["total_searches_left"].as_i64(),
-    ) else {
-        return Err(ManualQuotaSyncError::new(
-            StatusCode::BAD_REQUEST,
-            "quota_data_missing",
-            "SerpApi account response lacks searches_per_month/total_searches_left".to_string(),
-        ));
-    };
-    let renews_at = parsed["plan_renewal_date"]
-        .as_str()
-        .and_then(|text| NaiveDate::parse_from_str(text, "%Y-%m-%d").ok())
-        .and_then(|date| date.and_hms_opt(0, 0, 0))
-        .map(|renewal| renewal.and_utc().timestamp());
-    let synced_at = state.proxy.backend_time().now_ts();
-    let account_status = parsed["account_status"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
     // Route through the same adapter the scheduled sync uses so a manual
     // sync can also revive an exhausted key when the fresh snapshot proves
     // remaining quota (before this, the manual path only wrote quota fields).
-    let snapshot = tavily_hikari::SerpapiAccountSnapshot {
-        quota_limit: limit,
-        quota_remaining: remaining,
-        quota_renews_at: renews_at,
-        quota_synced_at: synced_at,
-        account_status,
-    };
     state
         .proxy
         .record_serpapi_account_sync(key_id, &snapshot, "quota_sync/manual")
@@ -585,11 +569,11 @@ async fn sync_serpapi_key_quota(
         })?;
     Ok(ProviderQuotaSyncSnapshot {
         source: "live",
-        provider: ProviderId::Serpapi,
-        quota_limit: Some(limit),
-        quota_remaining: Some(remaining),
-        quota_renews_at: renews_at,
-        quota_synced_at: Some(synced_at),
+        provider: tavily_hikari::providers::ProviderId::Serpapi,
+        quota_limit: Some(snapshot.quota_limit),
+        quota_remaining: Some(snapshot.quota_remaining),
+        quota_renews_at: snapshot.quota_renews_at,
+        quota_synced_at: Some(snapshot.quota_synced_at),
     })
 }
 

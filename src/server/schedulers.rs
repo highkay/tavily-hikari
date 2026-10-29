@@ -62,6 +62,10 @@ const LINUXDO_CREDIT_RECHARGE_LIFECYCLE_JOB_TYPE: &str = "linuxdo_credit_recharg
 const TRIGGER_SOURCE_SCHEDULER: &str = "scheduler";
 const TRIGGER_SOURCE_MANUAL: &str = "manual";
 const TRIGGER_SOURCE_AUTO: &str = "auto";
+/// Plan todo 19 follow-up: one quota-sync sweep enqueues at most this many
+/// pending keys per lane. A backlog that survives a restart is spread across
+/// the following sweeps instead of flooding the durable queue in one pass.
+const PER_SWEEP_ENQUEUE_CAP: usize = 60;
 const REQUEST_LOGS_GC_CONTINUATION_DELAY_SECS: i64 = 5 * 60;
 const SQLITE_MAINTENANCE_ADMISSION_RETRY_DELAY_SECS: i64 = 5;
 const RECONCILIATION_SQLITE_ADMISSION_RETRY_DELAY_SECS: i64 = 5;
@@ -782,49 +786,7 @@ fn spawn_quota_sync_scheduler(state: Arc<AppState>) {
     let cold_state = state.clone();
     tokio::spawn(async move {
         loop {
-            let keys = {
-                let _maintenance = acquire_db_maintenance_read_gate().await;
-                match cold_state
-                    .proxy
-                    .list_keys_pending_quota_sync(twenty_four_hours_secs())
-                    .await
-                {
-                    Ok(list) => list,
-                    Err(err) => {
-                        tracing::warn!(
-                            component = "quota_sync",
-                            event = "list_pending_failed",
-                            scope = "cold",
-                            err = %err,
-                        );
-                        vec![]
-                    }
-                }
-            };
-
-            for key_id in keys {
-                let delay = random_delay_secs(300);
-                cold_state
-                    .proxy
-                    .backend_time()
-                    .sleep(Duration::from_secs(delay))
-                    .await;
-                let Some(_) = enqueue_scheduled_job_logged(
-                    cold_state.as_ref(),
-                    "quota_sync",
-                    Some(&key_id),
-                    TRIGGER_SOURCE_SCHEDULER,
-                    "quota-sync",
-                )
-                .await
-                else {
-                    continue;
-                };
-            }
-
-            // Plan todo 19 (M4): serpapi /account lane riding the SAME cold
-            // sweep (24h pending threshold) — never a new loop or interval.
-            run_serpapi_pending_quota_sync_lane(cold_state.as_ref(), true).await;
+            run_quota_sync_sweep(cold_state.as_ref(), true, 300).await;
 
             cold_state
                 .proxy
@@ -837,49 +799,7 @@ fn spawn_quota_sync_scheduler(state: Arc<AppState>) {
     let hot_state = state;
     tokio::spawn(async move {
         loop {
-            let keys = {
-                let _maintenance = acquire_db_maintenance_read_gate().await;
-                match hot_state
-                    .proxy
-                    .list_keys_pending_hot_quota_sync(two_hours_secs(), fifteen_minutes_secs())
-                    .await
-                {
-                    Ok(list) => list,
-                    Err(err) => {
-                        tracing::warn!(
-                            component = "quota_sync",
-                            event = "list_pending_failed",
-                            scope = "hot",
-                            err = %err,
-                        );
-                        vec![]
-                    }
-                }
-            };
-
-            for key_id in keys {
-                let delay = random_delay_secs(60);
-                hot_state
-                    .proxy
-                    .backend_time()
-                    .sleep(Duration::from_secs(delay))
-                    .await;
-                let Some(_) = enqueue_scheduled_job_logged(
-                    hot_state.as_ref(),
-                    "quota_sync/hot",
-                    Some(&key_id),
-                    TRIGGER_SOURCE_SCHEDULER,
-                    "quota-sync-hot",
-                )
-                .await
-                else {
-                    continue;
-                };
-            }
-
-            // Plan todo 19 (M4): serpapi /account lane riding the SAME hot
-            // sweep (2h-active/15m-stale thresholds).
-            run_serpapi_pending_quota_sync_lane(hot_state.as_ref(), false).await;
+            run_quota_sync_sweep(hot_state.as_ref(), false, 60).await;
 
             hot_state
                 .proxy
@@ -888,6 +808,71 @@ fn spawn_quota_sync_scheduler(state: Arc<AppState>) {
                 .await;
         }
     });
+}
+
+/// ONE quota-sync sweep (cold = 24h pending threshold, hot = 2h-active/15m
+/// stale thresholds). The serpapi `/account` lane enqueues FIRST — a Tavily
+/// backlog must never delay it — and the Tavily lane then enqueues at most
+/// `PER_SWEEP_ENQUEUE_CAP` keys. `jitter_max_inclusive` bounds the random
+/// pacing delay before each enqueue (300s cold / 60s hot in production).
+async fn run_quota_sync_sweep(state: &AppState, cold: bool, jitter_max_inclusive: u64) {
+    let scope = if cold { "cold" } else { "hot" };
+    let keys = {
+        let _maintenance = acquire_db_maintenance_read_gate().await;
+        let listed = if cold {
+            state
+                .proxy
+                .list_keys_pending_quota_sync(twenty_four_hours_secs())
+                .await
+        } else {
+            state
+                .proxy
+                .list_keys_pending_hot_quota_sync(two_hours_secs(), fifteen_minutes_secs())
+                .await
+        };
+        match listed {
+            Ok(list) => list,
+            Err(err) => {
+                tracing::warn!(
+                    component = "quota_sync",
+                    event = "list_pending_failed",
+                    scope = scope,
+                    err = %err,
+                );
+                vec![]
+            }
+        }
+    };
+
+    // Plan todo 19 (M4): serpapi /account lane riding the SAME sweep — never a
+    // new loop or interval. Enqueued FIRST: a Tavily backlog must never delay
+    // this lane.
+    run_serpapi_pending_quota_sync_lane(state, cold, jitter_max_inclusive).await;
+
+    let (job_type, log_prefix) = if cold {
+        ("quota_sync", "quota-sync")
+    } else {
+        ("quota_sync/hot", "quota-sync-hot")
+    };
+    for key_id in keys.into_iter().take(PER_SWEEP_ENQUEUE_CAP) {
+        let delay = random_delay_secs(jitter_max_inclusive);
+        state
+            .proxy
+            .backend_time()
+            .sleep(Duration::from_secs(delay))
+            .await;
+        let Some(_) = enqueue_scheduled_job_logged(
+            state,
+            job_type,
+            Some(&key_id),
+            TRIGGER_SOURCE_SCHEDULER,
+            log_prefix,
+        )
+        .await
+        else {
+            continue;
+        };
+    }
 }
 
 fn spawn_token_usage_rollup_scheduler(state: Arc<AppState>) {
