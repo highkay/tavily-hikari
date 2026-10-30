@@ -35,6 +35,20 @@ usage-limit 响应，又因偶发小请求成功被自动恢复到 `active`。�
 - `month_start` 使用既有 UTC 月起点口径，与 `reset_monthly()` 一致。
 - 重复命中同一 Key / 月份时保持一条记录，并保留更低的 `quota_remaining`。
 
+## 选择层的零余额过滤（2026-10-28 补充）
+
+线上审查发现一条断掉的管道：配额同步把 `quota_remaining=0` 如实落库，但不做任何
+摘除动作，depletion 记录只在真实流量吃到 `432` 时才写。于是同步已知为空的 Key
+仍然是可选的 `active`，每个这样的 Key 都要烧掉一次真实请求才被摘除。
+
+修复：所有 `active` 层选 Key 路径（含跨 Key 重试与可用性预判）统一加
+`(quota_remaining IS NULL OR quota_remaining > 0)` 条件。`NULL` 必须放行，它表示未
+同步或不限量（Brave 的不限量月份约定写 `NULL`）。`exhausted` 兜底层不动。
+
+这一过滤同时挡住月翻复活：`reset_monthly` 在 UTC 月翻时把全部 `exhausted` 翻回
+`active`、depletion 记录同时按新月失效，但余额为 0 的 Key 在同步刷新前仍不可被
+选中。
+
 ## 验收标准
 
 - `quota_remaining = 15` 且上游返回 `432` 时写入当前月低余额耗尽记录。
