@@ -25,6 +25,8 @@ use sqlx::{
 
 #[path = "common/support_binaries.rs"]
 mod support_binaries;
+#[path = "common/zhihu_facade_harness.rs"]
+mod zhihu_harness;
 
 // ---------------------------------------------------------------------------
 // Shared harness (all provider sections).
@@ -3490,5 +3492,291 @@ mod keenable {
         assert_eq!(quota_limit, None);
         assert_eq!(synced_at, None);
         assert_eq!(harness.keenable_passive_sample_count().await, 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Zhihu REST facade section (keenable-integration plan todo 9).
+// ---------------------------------------------------------------------------
+
+mod zhihu {
+    const ZHIHU_SEARCH_PATH: &str = "/api/zhihu/api/v1/content/zhihu_search";
+    const GLOBAL_SEARCH_PATH: &str = "/api/zhihu/api/v1/content/global_search";
+
+    use super::*;
+    use zhihu_harness::{attempt_row, charged_credits, spawn_harness};
+
+    /// Happy path: both GET routes return the native envelope verbatim (the
+    /// fields the facade must not strip included), settle exactly 1 credit
+    /// per `Code=0`, stamp a provider='zhihu' row with the upstream status in
+    /// both status columns, and forward the POOLED Bearer plus a fresh
+    /// server-side timestamp.
+    #[tokio::test]
+    async fn zhihu_happy_search_bills_one_credit_and_passes_native_envelope() {
+        let harness = spawn_harness("facades-zhihu-happy", &["tok-good"]).await;
+
+        for (route, query, kind, operation, hash) in [
+            (
+                ZHIHU_SEARCH_PATH,
+                "Query=AI&Count=3",
+                "api:zhihu/zhihu_search",
+                "zhihu_http_zhihu_search",
+                "mock-zhihu_search-hash",
+            ),
+            (
+                GLOBAL_SEARCH_PATH,
+                "Query=AI&Count=3",
+                "api:zhihu/global_search",
+                "zhihu_http_global_search",
+                "mock-global_search-hash",
+            ),
+        ] {
+            let (token, token_id) = create_test_token(&harness.base_url).await;
+            let (status, body) = harness
+                .get_facade_with_token(&format!("{route}?{query}"), &token)
+                .await;
+            assert_eq!(status, reqwest::StatusCode::OK, "{route}");
+            assert_eq!(body["Code"], json!(0), "{route}");
+            assert_eq!(body["Message"], json!("success"), "{route}");
+            assert_eq!(body["Data"]["SearchHashId"], json!(hash), "{route}");
+            let item = &body["Data"]["Items"][0];
+            assert_eq!(item["ContentType"], json!("Article"), "{route}");
+            assert!(item["CreateTime"].is_u64(), "{route}");
+            assert!(item["RankingScore"].is_f64(), "{route}");
+
+            let pool = harness.pool().await;
+            let row = attempt_row(&pool, &token_id).await;
+            assert_eq!(row.method, "GET", "{route}");
+            assert_eq!(row.path, route, "{route}");
+            assert_eq!(row.query.as_deref(), Some(query), "{route}");
+            assert_eq!(row.status_code, 200, "{route}");
+            assert_eq!(row.tavily_status_code, Some(200), "{route}");
+            assert_eq!(row.result_status, "success", "{route}");
+            assert_eq!(row.request_kind_key, kind, "{route}");
+            assert_eq!(row.provider, "zhihu", "{route}");
+            assert_eq!(
+                row.upstream_operation.as_deref(),
+                Some(operation),
+                "{route}"
+            );
+            assert_eq!(row.failure_kind, None, "{route}");
+            assert_eq!(row.key_effect_code, "none", "{route}");
+            assert!(
+                row.response_body
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains(hash)
+            );
+            let body_text = row.response_body.as_deref().unwrap_or_default();
+            assert!(!body_text.contains("tok-good"), "pooled secret persisted");
+            assert!(
+                row.query
+                    .as_deref()
+                    .unwrap_or_default()
+                    .find("th-")
+                    .is_none()
+            );
+            assert_eq!(charged_credits(&pool, &token_id).await, 1, "{route}");
+            let month_count: i64 = sqlx::query_scalar(
+                "SELECT COALESCE((SELECT month_count FROM auth_token_quota \
+                  WHERE token_id = ? LIMIT 1), 0)",
+            )
+            .bind(&token_id)
+            .fetch_one(&pool)
+            .await
+            .expect("token quota row");
+            assert_eq!(month_count, 1, "{route}");
+            pool.close().await;
+        }
+
+        // The mock saw exactly one call per endpoint; the pooled secret rides
+        // `Authorization: Bearer` and the timestamp is server-generated.
+        let metrics = harness.mock_metrics().await;
+        assert_eq!(metrics["zhihu_search"], json!(1));
+        assert_eq!(metrics["global_search"], json!(1));
+        assert_eq!(metrics["last_authorization"], json!("Bearer tok-good"));
+        assert_ne!(metrics["last_x_request_timestamp"], json!(null));
+        assert_ne!(metrics["last_x_request_timestamp"], json!(""));
+        assert_eq!(
+            harness.last_bodies().await["global_search"],
+            json!("Query=AI&Count=3"),
+            "the stripped client query forwards unchanged"
+        );
+    }
+
+    /// Local contract guard: `Query` required/non-empty and `Count` capped at
+    /// 10/20 are typed 400s with ZERO upstream calls, rows, or credits;
+    /// `Count<=0` and `SortBy` pass through to the upstream.
+    #[tokio::test]
+    async fn zhihu_query_and_count_guards_reject_with_zero_upstream_cost() {
+        let harness = spawn_harness("facades-zhihu-guard", &["tok-good"]).await;
+        let before = harness.mock_metrics().await;
+        assert_eq!(before["zhihu_search"], json!(0));
+        assert_eq!(before["global_search"], json!(0));
+
+        for (query, message) in [
+            ("?Count=3", "Query is required and must not be empty"),
+            ("?Query=&Count=3", "Query is required and must not be empty"),
+            ("?Query=%20%20", "Query is required and must not be empty"),
+            (
+                "?Query=AI&Count=11",
+                "Count must be at most 10 for zhihu_search",
+            ),
+            (
+                "?Query=AI&Count=50",
+                "Count must be at most 10 for zhihu_search",
+            ),
+        ] {
+            let (status, body) = harness
+                .get_facade(&format!("{ZHIHU_SEARCH_PATH}{query}"))
+                .await;
+            assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{query}");
+            assert_eq!(body["error"], json!("invalid_request"), "{query}");
+            assert_eq!(body["message"], json!(message), "{query}");
+        }
+
+        // The global route has the 20 cap.
+        let (status, body) = harness
+            .get_facade(&format!("{GLOBAL_SEARCH_PATH}?Query=AI&Count=21"))
+            .await;
+        assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["message"],
+            json!("Count must be at most 20 for global_search")
+        );
+
+        // Rejected calls never reached the mock and never billed.
+        assert_eq!(harness.mock_metrics().await, before);
+        let pool = harness.pool().await;
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM observability.request_logs")
+            .fetch_one(&pool)
+            .await
+            .expect("row count");
+        assert_eq!(rows, 0, "guard rejections persist no rows");
+        assert_eq!(charged_credits(&pool, &harness.token_id).await, 0);
+        pool.close().await;
+
+        // `Count=0` passes through (upstream default) and bills the single
+        // success credit; `SortBy` is forwarded unvalidated.
+        let (status, body) = harness
+            .get_facade(&format!(
+                "{ZHIHU_SEARCH_PATH}?Query=AI&Count=0&SortBy=up_vote"
+            ))
+            .await;
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(body["Code"], json!(0));
+        assert_eq!(
+            harness.last_bodies().await["zhihu_search"],
+            json!("Query=AI&Count=0&SortBy=up_vote")
+        );
+        let pool = harness.pool().await;
+        assert_eq!(charged_credits(&pool, &harness.token_id).await, 1);
+        pool.close().await;
+    }
+
+    /// `Code=20001` arrives as HTTP 200 with the native envelope unchanged,
+    /// quarantines the pooled Access Secret, and settles ZERO credits.
+    #[tokio::test]
+    async fn zhihu_auth_code_20001_quarantines_key_with_zero_credit() {
+        let harness = spawn_harness("facades-zhihu-auth", &["tok-auth"]).await;
+        let (status, body) = harness
+            .get_facade(&format!("{ZHIHU_SEARCH_PATH}?Query=AI&Count=3"))
+            .await;
+        assert_eq!(status, reqwest::StatusCode::OK, "transport stays 200");
+        assert_eq!(body["Code"], json!(20001));
+        assert_eq!(body["Message"], json!("Authorization failed"));
+        assert_eq!(harness.mock_metrics().await["zhihu_search"], json!(1));
+
+        let pool = harness.pool().await;
+        let row = attempt_row(&pool, &harness.token_id).await;
+        assert_eq!(row.status_code, 200);
+        assert_eq!(row.tavily_status_code, Some(200));
+        assert_eq!(row.result_status, "error");
+        assert_eq!(
+            row.failure_kind.as_deref(),
+            Some("upstream_account_deactivated_401")
+        );
+        assert_eq!(row.key_effect_code, "quarantined");
+        assert!(
+            row.response_body
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Authorization failed")
+        );
+        let quarantined: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM api_key_quarantines q JOIN api_keys k ON k.id = q.key_id \
+              WHERE k.api_key = 'tok-auth' AND q.cleared_at IS NULL \
+              AND q.reason_code = 'invalid_api_key'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("quarantine scan");
+        assert_eq!(quarantined, 1, "20001 must quarantine the pooled secret");
+        assert_eq!(charged_credits(&pool, &harness.token_id).await, 0);
+        pool.close().await;
+    }
+
+    /// Non-auth codes keep the HTTP 200 envelope and bill nothing: 30001 arms
+    /// the shared backoff (key stays active), 90001 is transient, 10001 is a
+    /// client error that never marks the key.
+    #[tokio::test]
+    async fn zhihu_non_auth_codes_bill_nothing_and_never_mark_client_errors() {
+        for (key, code, failure_kind, key_effect) in [
+            (
+                "tok-rate",
+                30001i64,
+                "upstream_rate_limited_429",
+                "transient_backoff_set",
+            ),
+            ("tok-internal", 90001, "upstream_gateway_5xx", "none"),
+            ("tok-badparam", 10001, "other", "none"),
+        ] {
+            let harness = spawn_harness("facades-zhihu-code", &[key]).await;
+            let (status, body) = harness
+                .get_facade(&format!("{ZHIHU_SEARCH_PATH}?Query=AI&Count=3"))
+                .await;
+            assert_eq!(status, reqwest::StatusCode::OK, "{key}");
+            assert_eq!(body["Code"], json!(code), "{key}");
+
+            let pool = harness.pool().await;
+            let row = attempt_row(&pool, &harness.token_id).await;
+            assert_eq!(row.status_code, 200, "{key}");
+            assert_eq!(row.tavily_status_code, Some(200), "{key}");
+            assert_eq!(row.result_status, "error", "{key}");
+            assert_eq!(row.failure_kind.as_deref(), Some(failure_kind), "{key}");
+            assert_eq!(row.key_effect_code, key_effect, "{key}");
+            assert_eq!(charged_credits(&pool, &harness.token_id).await, 0, "{key}");
+
+            let key_status: String =
+                sqlx::query_scalar("SELECT status FROM api_keys WHERE api_key = ?")
+                    .bind(key)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("key row");
+            assert_eq!(key_status, "active", "{key} must not be exhausted");
+            let quarantines: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM api_key_quarantines q JOIN api_keys k ON k.id = q.key_id \
+                  WHERE k.api_key = ? AND q.cleared_at IS NULL",
+            )
+            .bind(key)
+            .fetch_one(&pool)
+            .await
+            .expect("quarantine scan");
+            assert_eq!(quarantines, 0, "{key} is not an auth failure");
+            if code == 30001 {
+                let backoff: i64 = sqlx::query_scalar(
+                    "SELECT b.retry_after_secs FROM api_key_transient_backoffs b \
+                      JOIN api_keys k ON k.id = b.key_id \
+                      WHERE k.api_key = ? AND b.scope = 'http_global' \
+                      AND b.reason_code = 'upstream_rate_limited_429'",
+                )
+                .bind(key)
+                .fetch_one(&pool)
+                .await
+                .expect("backoff row");
+                assert_eq!(backoff, 60, "30001 carries no Retry-After: 60s default");
+            }
+            pool.close().await;
+        }
     }
 }

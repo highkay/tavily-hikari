@@ -9,7 +9,7 @@ pub(crate) use provider_failure_classification::{
     EXA_BUDGET_TAG_TEAM_BUDGET_EXCEEDED, ExaBudgetTag, ProviderFailureEvidence,
     ProviderFailureSignal, brave_rate_limit_reset_secs, classify_provider_failure,
     exa_budget_tag_evidence, extract_sse_json_messages, failure_kind_from_proxy_error,
-    low_quota_depletion_applies,
+    low_quota_depletion_applies, zhihu_envelope_code_is_zero,
 };
 pub use provider_failure_classification::{
     McpKeyMigrationSignal, mcp_key_migration_signal, mcp_response_has_any_error,

@@ -63,6 +63,18 @@ pub use proxy_provider_facade_brave::{BraveFacadeOutcome, brave_facade_outcome};
 mod proxy_provider_facade_keenable;
 pub use proxy_provider_facade_keenable::{KeenableFacadeOutcome, keenable_facade_outcome};
 
+// Zhihu REST execution layer (keenable-integration plan todo 9): both native
+// GET content routes through the generic executor with Bearer + server-side
+// `X-Request-Timestamp` (todo 4), the HTTP-200 `{Code,Message,Data}` envelope
+// classified by the todo-3 Zhihu arm (20001 quarantine, 30001 backoff, 90001
+// transient, 10001/unknown client error), provider-stamped request_logs with
+// redacted bodies, and the bin-side outcome projection whose
+// `business_success` is true only for `Code == 0` (zero credits otherwise).
+mod proxy_provider_facade_zhihu;
+pub use proxy_provider_facade_zhihu::{
+    ZhihuFacadeOutcome, validate_zhihu_rest_query, zhihu_facade_outcome,
+};
+
 // SerpApi hosted MCP passthrough execution layer (plan todo 15; amendments
 // M6/M7): the upstream-MCP path generalized by ProviderSpec — ingress-aware
 // SERPAPI_MCP_UPSTREAM URL building, pooled-key Bearer injection (never the
@@ -388,12 +400,16 @@ impl TavilyProxy {
                             self.record_keenable_rest_facade_attempt(&attempt_ctx)
                                 .await?
                         }
-                        // Zhihu (todo-2 compile gate): the generic recorder
-                        // books the attempt row until todo 9 replaces it with
-                        // the envelope-aware recorder.
-                        providers::ProviderId::Tavily
-                        | providers::ProviderId::Serpapi
-                        | providers::ProviderId::Zhihu => {
+                        // Zhihu (todo 9): the envelope-aware record path
+                        // (Code → health/log status, 20001 quarantine, 30001
+                        // backoff) replaces the generic boundary arm.
+                        providers::ProviderId::Zhihu => {
+                            self.record_zhihu_rest_facade_attempt(&attempt_ctx)
+                                .await?
+                        }
+                        // Legacy Tavily branch keeps the generic recorder
+                        // (a no-op for non-SerpApi).
+                        providers::ProviderId::Tavily | providers::ProviderId::Serpapi => {
                             self.record_provider_rest_facade_attempt(&attempt_ctx)
                                 .await?
                         }
@@ -492,12 +508,21 @@ impl TavilyProxy {
                             )
                             .await?;
                         }
-                        // Zhihu (todo-2 compile gate): the generic
-                        // transport-error logger owns it until todo 9 lands its
-                        // own record path.
-                        providers::ProviderId::Tavily
-                        | providers::ProviderId::Serpapi
-                        | providers::ProviderId::Zhihu => {
+                        // Zhihu (todo 9): provider-stamped transport-error
+                        // row (the envelope never produces this arm).
+                        providers::ProviderId::Zhihu => {
+                            self.log_zhihu_rest_facade_transport_error(
+                                &request,
+                                &attempt_lease,
+                                &sanitized_headers,
+                                &err,
+                                fallback_reason,
+                            )
+                            .await?;
+                        }
+                        // Legacy Tavily branch keeps the generic
+                        // transport-error logger (no-op gate).
+                        providers::ProviderId::Tavily | providers::ProviderId::Serpapi => {
                             self.log_provider_rest_facade_transport_error(
                                 &request,
                                 &attempt_lease,
@@ -635,13 +660,9 @@ impl TavilyProxy {
             providers::ProviderId::Brave => Ok(self.provider_upstreams.brave_rest.clone()),
             // Keenable (todo 7): the resolved KEENABLE_UPSTREAM base.
             providers::ProviderId::Keenable => Ok(self.provider_upstreams.keenable_rest.clone()),
-            // Typed boundary (keenable-integration todo 9): the Zhihu facade
-            // executor is not wired yet; the resolved base fails loudly instead
-            // of letting a facade call reach a default upstream. Never a
-            // silent success.
-            providers::ProviderId::Zhihu => Err(ProxyError::Other(
-                "zhihu REST facade is not wired yet".to_string(),
-            )),
+            // Zhihu (keenable-integration todo 9): the REST base is live and
+            // the envelope-aware record path owns the attempt.
+            providers::ProviderId::Zhihu => Ok(self.provider_upstreams.zhihu_rest.clone()),
         }
     }
 }

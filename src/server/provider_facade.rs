@@ -17,10 +17,10 @@
 use super::*;
 use tavily_hikari::{
     BraveFacadeOutcome, ExaFacadeOutcome, KeenableFacadeOutcome, ProviderRestFacadeRequest,
-    SerpapiFacadeOutcome, TokenBillingGuard, TokenRequestKind, brave_facade_outcome,
-    exa_facade_outcome, keenable_facade_outcome,
+    SerpapiFacadeOutcome, TokenBillingGuard, TokenRequestKind, ZhihuFacadeOutcome,
+    brave_facade_outcome, exa_facade_outcome, keenable_facade_outcome,
     providers::{self, ProviderId},
-    serpapi_facade_outcome,
+    serpapi_facade_outcome, validate_zhihu_rest_query, zhihu_facade_outcome,
 };
 
 // SerpApi hosted MCP passthrough pipeline (plan todo 15): session-provider
@@ -485,6 +485,16 @@ async fn provider_rest_facade(
     // The stripped query is the ONLY query text forwarded, logged, or recorded.
     let stripped_query = auth.query.clone();
 
+    // Zhihu local contract (plan todo 9): `Query` required/non-empty and
+    // `Count` capped at 10/20 BEFORE the quota gates and any upstream call, so
+    // a rejected request costs zero credits and zero upstream traffic.
+    if route.provider == ProviderId::Zhihu
+        && let Err(message) =
+            validate_zhihu_rest_query(route.upstream_path, stripped_query.as_deref())
+    {
+        return invalid_tavily_http_request_response(message);
+    }
+
     // SerpApi convenience POST (plan todo 12): map the JSON body fields onto
     // upstream query params BEFORE the gates so a malformed body is a cheap
     // typed 400 with zero upstream cost. The lib executor completes the
@@ -734,37 +744,33 @@ async fn provider_rest_facade(
             // business-call finalization. Brave (todo 14) also carries the M11
             // passive harvest lib-side; only Tavily keeps the untouched
             // success/error fallback (it never reaches this seam).
-            let facade_outcome = match route.provider {
-                ProviderId::Serpapi => Some(ProviderFacadeOutcomeView::from(
-                    serpapi_facade_outcome(response.status, &response.body),
-                )),
-                ProviderId::Exa => Some(ProviderFacadeOutcomeView::from(exa_facade_outcome(
-                    response.status,
-                    &response.body,
-                ))),
-                ProviderId::Brave => Some(ProviderFacadeOutcomeView::from(brave_facade_outcome(
-                    response.status,
-                    &response.body,
-                ))),
-                ProviderId::Tavily => None,
-                // Keenable (todo 7): the classifier-driven projection carries
-                // business_success (signal == Ok), so the settlement gates on
-                // the signal — a 2xx body with an authentication_error
-                // envelope never bills.
-                ProviderId::Keenable => Some(ProviderFacadeOutcomeView::from(
-                    keenable_facade_outcome(response.status, &response.body),
-                )),
-                // Typed todo-2 boundary (todo 9 replaces it): if it ever
-                // fires, log it and project NO outcome — never a billing
-                // record, never a silent success.
-                ProviderId::Zhihu => {
-                    eprintln!(
-                        "provider facade outcome projection pending for {provider}",
-                        provider = route.provider
-                    );
-                    None
-                }
-            };
+            let facade_outcome =
+                match route.provider {
+                    ProviderId::Serpapi => Some(ProviderFacadeOutcomeView::from(
+                        serpapi_facade_outcome(response.status, &response.body),
+                    )),
+                    ProviderId::Exa => Some(ProviderFacadeOutcomeView::from(exa_facade_outcome(
+                        response.status,
+                        &response.body,
+                    ))),
+                    ProviderId::Brave => Some(ProviderFacadeOutcomeView::from(
+                        brave_facade_outcome(response.status, &response.body),
+                    )),
+                    ProviderId::Tavily => None,
+                    // Keenable (todo 7): the classifier-driven projection carries
+                    // business_success (signal == Ok), so the settlement gates on
+                    // the signal — a 2xx body with an authentication_error
+                    // envelope never bills.
+                    ProviderId::Keenable => Some(ProviderFacadeOutcomeView::from(
+                        keenable_facade_outcome(response.status, &response.body),
+                    )),
+                    // Zhihu (todo 9): the HTTP-200 envelope is projected through
+                    // the todo-3 classifier; `business_success` is true only for
+                    // `Code == 0`, so every non-zero code settles zero credits.
+                    ProviderId::Zhihu => Some(ProviderFacadeOutcomeView::from(
+                        zhihu_facade_outcome(response.status, &response.body),
+                    )),
+                };
             let outcome_status = match &facade_outcome {
                 Some(outcome) => outcome.result_status,
                 None if response.status.is_success() => "success",
@@ -1214,18 +1220,20 @@ fn prepare_exa_post_body(body: &[u8]) -> Result<Vec<u8>, &'static str> {
 }
 
 /// Classifier-driven token-log outcome shared by the settling REST facades
-/// (SerpApi todo 12, Exa todo 13, Keenable todo 7); the lib-side projections
-/// fold onto this view so the billing recorder stays single-sourced.
+/// (SerpApi todo 12, Exa todo 13, Brave todo 14, Keenable todo 7, Zhihu todo
+/// 9); the lib-side projections fold onto this view so the billing recorder
+/// stays single-sourced.
 #[derive(Clone, Copy)]
 struct ProviderFacadeOutcomeView {
     /// `success` / `quota_exhausted` / `error` (shared OUTCOME_* vocabulary).
     result_status: &'static str,
     failure_kind: Option<&'static str>,
-    /// Billing gate (keenable-integration todo 7): true exactly when the call
-    /// settled credits. The three existing providers derive it from
+    /// Billing gate (keenable-integration todos 7/9): true exactly when the
+    /// call settled credits. The three existing providers derive it from
     /// `result_status == "success"` (identical to the pre-todo-7 2xx gate
     /// for every reachable response); Keenable sets it from the classifier
-    /// signal, because its envelope can auth-fail on a 2xx body.
+    /// signal (its envelope can auth-fail on a 2xx body) and Zhihu from
+    /// `Code == 0` (its HTTP-200 envelope carries a non-zero Code on failure).
     business_success: bool,
 }
 
@@ -1269,6 +1277,16 @@ impl From<BraveFacadeOutcome> for ProviderFacadeOutcomeView {
     }
 }
 
+impl From<ZhihuFacadeOutcome> for ProviderFacadeOutcomeView {
+    fn from(outcome: ZhihuFacadeOutcome) -> Self {
+        Self {
+            result_status: outcome.result_status,
+            failure_kind: outcome.failure_kind,
+            business_success: outcome.business_success,
+        }
+    }
+}
+
 /// Everything the provider REST facade billing/attempt recording needs,
 /// grouped so the facade flow stays readable (mirrors the handlers/tavily.rs
 /// settle block).
@@ -1295,7 +1313,8 @@ struct ProviderFacadeBilling<'a> {
 /// M22: provider responses are NEVER inspected for billing beyond the
 /// lib-side outcome projection — business success is the projected outcome
 /// (2xx for SerpApi/Exa/Brave; the classifier signal for Keenable, whose
-/// envelope can auth-fail on a 2xx body) and the credit amount is the
+/// envelope can auth-fail on a 2xx body; `Code == 0` for Zhihu, whose HTTP-200
+/// envelope carries a non-zero Code on failure) and the credit amount is the
 /// registry table value. Local persistence
 /// failures never replace the verbatim upstream response (duplicate-charge
 /// protection, handlers/tavily.rs:1512-1514 rule).

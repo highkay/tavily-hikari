@@ -205,6 +205,15 @@ fn classify_zhihu_failure(evidence: &ProviderFailureEvidence<'_>) -> ProviderFai
     }
 }
 
+/// Exact Zhihu business-success predicate shared with the facade outcome
+/// projection and billing: the native envelope's `Code` parses to `0`.
+/// [`classify_zhihu_failure`] falls back to the HTTP status for a body without
+/// a `Code` (a malformed 200 classifies `Ok`), so billing needs this stricter
+/// check beside the signal.
+pub(crate) fn zhihu_envelope_code_is_zero(body: &[u8]) -> bool {
+    json_i64_field(body, &["Code"]) == Some(0)
+}
+
 fn default_provider_failure_signal(status: u16) -> ProviderFailureSignal {
     if (200..300).contains(&status) {
         ProviderFailureSignal::Ok
