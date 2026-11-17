@@ -143,13 +143,65 @@ pub(crate) fn classify_provider_failure(
         ProviderId::Serpapi => classify_serpapi_failure(evidence),
         ProviderId::Exa => classify_exa_failure(evidence),
         ProviderId::Brave => classify_brave_failure(evidence),
-        // Compile-gate boundaries (plan todo 2): Keenable's `type`/`code`
-        // envelope and Zhihu's HTTP-200 `Code` envelope are classified by
-        // todo 3; until then only the status default runs — a documented
-        // boundary, never a silent success arm.
-        ProviderId::Keenable | ProviderId::Zhihu => {
-            default_provider_failure_signal(evidence.status)
-        }
+        ProviderId::Keenable => classify_keenable_failure(evidence),
+        ProviderId::Zhihu => classify_zhihu_failure(evidence),
+    }
+}
+
+/// Keenable `/v1` error envelope (SPEC "Keenable error table"):
+/// `{error, message, type, code}` with a closed seven-value `type` set. Branch
+/// on `type`/`code` only; `error`/`message` are display text.
+///
+/// `billing_error` splits on status: any 402 code means the account cannot
+/// pay (exhaust the key), while 451 is a legal/regional client refusal that
+/// must not cost the key. `permission_error` splits on code: only the two
+/// credential codes are auth failures; `target_blocked` and friends are the
+/// caller's problem. `target_error` is always a client error and never marks
+/// a key, however the upstream framed the status. An unknown or missing
+/// `type` falls back to the status default, never a guessed type.
+fn classify_keenable_failure(evidence: &ProviderFailureEvidence<'_>) -> ProviderFailureSignal {
+    let error_type =
+        json_string_field(evidence.body, &["type"]).map(|value| value.to_ascii_lowercase());
+    let error_code =
+        json_string_field(evidence.body, &["code"]).map(|value| value.to_ascii_lowercase());
+    match error_type.as_deref() {
+        Some("authentication_error") => ProviderFailureSignal::AuthFailed,
+        Some("billing_error") => match evidence.status {
+            402 => ProviderFailureSignal::Exhausted,
+            451 => ProviderFailureSignal::ClientError,
+            _ => default_provider_failure_signal(evidence.status),
+        },
+        Some("permission_error") => match error_code.as_deref() {
+            Some("credentials_forbidden" | "forbidden") => ProviderFailureSignal::AuthFailed,
+            _ => ProviderFailureSignal::ClientError,
+        },
+        Some("target_error") => ProviderFailureSignal::ClientError,
+        Some("rate_limit_error") => ProviderFailureSignal::RateLimited {
+            retry_after_secs: json_u64_field(evidence.body, &["retry_after_seconds"])
+                .or_else(|| retry_after_header_secs(evidence.headers)),
+        },
+        Some("api_error") => ProviderFailureSignal::ServerTransient,
+        Some("invalid_request_error") => ProviderFailureSignal::ClientError,
+        _ => default_provider_failure_signal(evidence.status),
+    }
+}
+
+/// Zhihu shares one HTTP-200 envelope for success and failure (SPEC "Zhihu
+/// error table"): `{Code, Message, Data}`. Only `Code == 0` is a success;
+/// `30001` is throughput and must never exhaust the key; an unknown non-zero
+/// code is a client error so a new code is never retried blindly. A non-JSON
+/// body or a missing `Code` falls back to the HTTP status default.
+fn classify_zhihu_failure(evidence: &ProviderFailureEvidence<'_>) -> ProviderFailureSignal {
+    match json_i64_field(evidence.body, &["Code"]) {
+        Some(0) => ProviderFailureSignal::Ok,
+        Some(10001) => ProviderFailureSignal::ClientError,
+        Some(20001) => ProviderFailureSignal::AuthFailed,
+        Some(30001) => ProviderFailureSignal::RateLimited {
+            retry_after_secs: None,
+        },
+        Some(90001) => ProviderFailureSignal::ServerTransient,
+        Some(_) => ProviderFailureSignal::ClientError,
+        None => default_provider_failure_signal(evidence.status),
     }
 }
 
@@ -323,6 +375,28 @@ fn json_string_field(body: &[u8], path: &[&str]) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+/// Integer field lookup for envelopes keyed on a number (`Code`,
+/// `retry_after_seconds`). Numeric strings are accepted because upstream
+/// envelopes in this family have been observed stringifying counters.
+fn json_i64_field(body: &[u8], path: &[&str]) -> Option<i64> {
+    let parsed = serde_json::from_slice::<Value>(body).ok()?;
+    let (last, parents) = path.split_last()?;
+    let parent = parents
+        .iter()
+        .try_fold(&parsed, |value, key| value.get(key))?;
+    match parent.get(*last)? {
+        Value::Number(number) => number
+            .as_i64()
+            .or_else(|| number.as_u64().and_then(|value| i64::try_from(value).ok())),
+        Value::String(text) => text.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+fn json_u64_field(body: &[u8], path: &[&str]) -> Option<u64> {
+    u64::try_from(json_i64_field(body, path)?).ok()
 }
 
 /// Brave envelope `{error:{code,...}}`. Live-probed: INVALID token = 422
