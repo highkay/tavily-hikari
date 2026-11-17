@@ -1418,28 +1418,391 @@ fn provider_mcp_ingress_paths_are_pinned() {
     assert_eq!(provider_mcp_ingress_path(ProviderId::Zhihu), "/zhihu/mcp");
 }
 
-/// Typed todo-2 boundary (keenable-integration plan): until todo 3 lands the
-/// envelope classifiers, both new providers classify through the status
-/// default only — documented boundary behavior, never a silent success arm.
+// ---------------------------------------------------------------------------
+// Plan keenable-integration todo 3: Keenable `type`/`code` envelope and Zhihu
+// HTTP-200 `Code` envelope. Every row is asserted explicitly, so a green run
+// cannot hide a wrong mapping (misleading-success guard).
+// ---------------------------------------------------------------------------
+
+fn keenable_error_body(error_type: &str, code: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "error": code,
+        "message": "probe message",
+        "type": error_type,
+        "code": code,
+    }))
+    .expect("keenable error body serializes")
+}
+
+fn keenable_error_body_with_retry_after(code: &str, retry_after_seconds: i64) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "error": code,
+        "message": "probe message",
+        "type": "rate_limit_error",
+        "code": code,
+        "retry_after_seconds": retry_after_seconds,
+    }))
+    .expect("keenable rate-limit body serializes")
+}
+
+fn zhihu_envelope(code: i64) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "Code": code,
+        "Message": "probe message",
+        "Data": null,
+    }))
+    .expect("zhihu envelope serializes")
+}
+
+/// QA scenario (happy): a Keenable `402 insufficient_credits` exhausts the key.
 #[test]
-fn keenable_and_zhihu_classify_through_the_status_default_until_todo_3() {
+fn qa_keenable_402_insufficient_credits_exhausts_the_key() {
+    let signal = classify(
+        ProviderId::Keenable,
+        402,
+        &keenable_error_body("billing_error", "insufficient_credits"),
+    );
+
+    assert_eq!(signal, ProviderFailureSignal::Exhausted);
+    assert_ne!(signal, ProviderFailureSignal::AuthFailed);
+}
+
+/// QA scenario (failure): Keenable `403 target_blocked` is the caller's fault.
+/// Neither shape (permission_error or target_error) may mark the key dead, and
+/// a target_error over a retryable status must not become a backoff either.
+#[test]
+fn qa_keenable_403_target_blocked_is_a_client_error_not_auth_failure() {
+    for body in [
+        keenable_error_body("permission_error", "target_blocked"),
+        keenable_error_body("target_error", "target_blocked"),
+    ] {
+        let signal = classify(ProviderId::Keenable, 403, &body);
+
+        assert_eq!(signal, ProviderFailureSignal::ClientError);
+        assert_ne!(signal, ProviderFailureSignal::AuthFailed);
+    }
+
+    let target_rate_limited = classify(
+        ProviderId::Keenable,
+        429,
+        &keenable_error_body("target_error", "target_rate_limited"),
+    );
+    assert_eq!(target_rate_limited, ProviderFailureSignal::ClientError);
+}
+
+#[test]
+fn keenable_failure_matrix_covers_contract_statuses() {
+    // Given the Keenable error table (SPEC "Keenable error table"): a flat
+    // `{error, message, type, code}` body with a closed `type` set, where the
+    // HTTP status is evidence only for the types that split on it.
+    let cases: Vec<(u16, Vec<u8>, ProviderFailureSignal)> = vec![
+        (
+            200,
+            br#"{"query":"q","mode":"pro","results":[],"usage":{"credits_remaining":9}}"#.to_vec(),
+            ProviderFailureSignal::Ok,
+        ),
+        (
+            400,
+            keenable_error_body("invalid_request_error", "missing_parameter"),
+            ProviderFailureSignal::ClientError,
+        ),
+        (
+            400,
+            keenable_error_body("invalid_request_error", "unknown_parameter"),
+            ProviderFailureSignal::ClientError,
+        ),
+        (
+            401,
+            keenable_error_body("authentication_error", "invalid_api_key"),
+            ProviderFailureSignal::AuthFailed,
+        ),
+        (
+            402,
+            keenable_error_body("billing_error", "insufficient_credits"),
+            ProviderFailureSignal::Exhausted,
+        ),
+        (
+            402,
+            keenable_error_body("billing_error", "payment_required"),
+            ProviderFailureSignal::Exhausted,
+        ),
+        (
+            451,
+            keenable_error_body("billing_error", "payment_required"),
+            ProviderFailureSignal::ClientError,
+        ),
+        (
+            403,
+            keenable_error_body("permission_error", "credentials_forbidden"),
+            ProviderFailureSignal::AuthFailed,
+        ),
+        (
+            403,
+            keenable_error_body("permission_error", "forbidden"),
+            ProviderFailureSignal::AuthFailed,
+        ),
+        (
+            403,
+            keenable_error_body("permission_error", "target_blocked"),
+            ProviderFailureSignal::ClientError,
+        ),
+        (
+            403,
+            keenable_error_body("permission_error", "private_url_not_allowed"),
+            ProviderFailureSignal::ClientError,
+        ),
+        (
+            403,
+            keenable_error_body("permission_error", "mode_requires_api_key"),
+            ProviderFailureSignal::ClientError,
+        ),
+        (
+            403,
+            keenable_error_body("permission_error", "mcp_host_not_allowed"),
+            ProviderFailureSignal::ClientError,
+        ),
+        (
+            403,
+            keenable_error_body("permission_error", "mcp_origin_not_allowed"),
+            ProviderFailureSignal::ClientError,
+        ),
+        (
+            403,
+            keenable_error_body("permission_error", "time_machine_not_enabled"),
+            ProviderFailureSignal::ClientError,
+        ),
+        (
+            403,
+            br#"{"type":"permission_error","error":"forbidden"}"#.to_vec(),
+            ProviderFailureSignal::ClientError,
+        ),
+        (
+            403,
+            keenable_error_body("target_error", "target_blocked"),
+            ProviderFailureSignal::ClientError,
+        ),
+        (
+            404,
+            keenable_error_body("target_error", "content_not_extracted"),
+            ProviderFailureSignal::ClientError,
+        ),
+        (
+            422,
+            keenable_error_body("target_error", "content_not_extracted"),
+            ProviderFailureSignal::ClientError,
+        ),
+        (
+            429,
+            keenable_error_body("target_error", "target_rate_limited"),
+            ProviderFailureSignal::ClientError,
+        ),
+        (
+            502,
+            keenable_error_body("target_error", "target_timeout"),
+            ProviderFailureSignal::ClientError,
+        ),
+        (
+            504,
+            keenable_error_body("target_error", "target_timeout"),
+            ProviderFailureSignal::ClientError,
+        ),
+        (
+            422,
+            keenable_error_body("api_error", "search_failed_upstream"),
+            ProviderFailureSignal::ServerTransient,
+        ),
+        (
+            500,
+            keenable_error_body("api_error", "internal_error"),
+            ProviderFailureSignal::ServerTransient,
+        ),
+        (
+            503,
+            keenable_error_body("api_error", "search_failed_upstream"),
+            ProviderFailureSignal::ServerTransient,
+        ),
+        (
+            529,
+            keenable_error_body("api_error", "search_overloaded"),
+            ProviderFailureSignal::ServerTransient,
+        ),
+        (
+            429,
+            keenable_error_body("rate_limit_error", "rate_limited"),
+            ProviderFailureSignal::RateLimited {
+                retry_after_secs: None,
+            },
+        ),
+        (
+            400,
+            keenable_error_body("rate_limit_error", "rate_limit_per_second"),
+            ProviderFailureSignal::RateLimited {
+                retry_after_secs: None,
+            },
+        ),
+        (
+            422,
+            keenable_error_body("invalid_request_error", "invalid_request"),
+            ProviderFailureSignal::ClientError,
+        ),
+        (
+            200,
+            keenable_error_body("mystery_type", "mystery_code"),
+            ProviderFailureSignal::Ok,
+        ),
+        (
+            500,
+            keenable_error_body("mystery_type", "mystery_code"),
+            ProviderFailureSignal::ServerTransient,
+        ),
+    ];
+
+    for (status, body, expected) in &cases {
+        assert_eq!(
+            classify(ProviderId::Keenable, *status, body),
+            *expected,
+            "keenable status {status} body {}",
+            String::from_utf8_lossy(body)
+        );
+    }
+}
+
+#[test]
+fn keenable_rate_limit_error_captures_retry_after_sources() {
+    // Given a rate_limit_error whose body advertises the wait
+    let with_body = keenable_error_body_with_retry_after("rate_limited", 7);
+    let headers = headers_with(&[("retry-after", "3")]);
+
+    // When classified with a contradictory header, Then the structured body wins
     assert_eq!(
-        classify(ProviderId::Keenable, 200, br#"{}"#),
-        ProviderFailureSignal::Ok
+        classify_with_headers(ProviderId::Keenable, 429, &headers, &with_body),
+        ProviderFailureSignal::RateLimited {
+            retry_after_secs: Some(7)
+        }
+    );
+
+    // Given no body hint, Then the Retry-After header is the fallback
+    let body_only = keenable_error_body("rate_limit_error", "rate_limited");
+    assert_eq!(
+        classify_with_headers(ProviderId::Keenable, 429, &headers, &body_only),
+        ProviderFailureSignal::RateLimited {
+            retry_after_secs: Some(3)
+        }
+    );
+
+    // Given neither source, Then no hint is invented
+    assert_eq!(
+        classify(ProviderId::Keenable, 429, &body_only),
+        ProviderFailureSignal::RateLimited {
+            retry_after_secs: None
+        }
+    );
+}
+
+#[test]
+fn zhihu_failure_matrix_covers_code_envelope() {
+    // Given the shared HTTP-200 `{Code, Message, Data}` envelope
+    let cases: &[(i64, ProviderFailureSignal)] = &[
+        (0, ProviderFailureSignal::Ok),
+        (10001, ProviderFailureSignal::ClientError),
+        (20001, ProviderFailureSignal::AuthFailed),
+        (
+            30001,
+            ProviderFailureSignal::RateLimited {
+                retry_after_secs: None,
+            },
+        ),
+        (90001, ProviderFailureSignal::ServerTransient),
+        (12345, ProviderFailureSignal::ClientError),
+    ];
+
+    for (code, expected) in cases {
+        assert_eq!(
+            classify(ProviderId::Zhihu, 200, &zhihu_envelope(*code)),
+            *expected,
+            "zhihu Code {code}"
+        );
+    }
+
+    // QA contrasts pinned explicitly, not left implied by the table
+    assert_ne!(
+        classify(ProviderId::Zhihu, 200, &zhihu_envelope(30001)),
+        ProviderFailureSignal::Exhausted
     );
     assert_eq!(
-        classify(ProviderId::Zhihu, 200, br#"{"Code":20001}"#),
-        ProviderFailureSignal::Ok,
-        "the Code envelope is todo 3's work; todo 2 must not over-classify"
+        classify(ProviderId::Zhihu, 200, &zhihu_envelope(20001)),
+        ProviderFailureSignal::AuthFailed
     );
-    assert_eq!(
-        classify(ProviderId::Keenable, 503, br#"{}"#),
-        ProviderFailureSignal::ServerTransient
-    );
-    assert_eq!(
-        classify(ProviderId::Zhihu, 400, br#"{}"#),
-        ProviderFailureSignal::ClientError
-    );
+}
+
+/// Adversarial class malformed_input: a non-JSON body, a missing `type`, or a
+/// missing `Code` must fall through to the status default instead of being
+/// guessed into a key-penalizing signal.
+#[test]
+fn keenable_and_zhihu_malformed_bodies_fall_back_to_the_status_default() {
+    for (status, body, expected) in [
+        (
+            200u16,
+            b"not json at all".as_slice(),
+            ProviderFailureSignal::Ok,
+        ),
+        (
+            403,
+            b"<html>forbidden</html>".as_slice(),
+            ProviderFailureSignal::ClientError,
+        ),
+        (503, b"".as_slice(), ProviderFailureSignal::ServerTransient),
+        (
+            503,
+            br#"{"code":"search_upstream_error"}"#.as_slice(),
+            ProviderFailureSignal::ServerTransient,
+        ),
+        (
+            200,
+            br#"{"error":"ok"}"#.as_slice(),
+            ProviderFailureSignal::Ok,
+        ),
+    ] {
+        assert_eq!(
+            classify(ProviderId::Keenable, status, body),
+            expected,
+            "keenable fallback {status}"
+        );
+    }
+
+    for (status, body, expected) in [
+        (
+            200u16,
+            b"not json at all".as_slice(),
+            ProviderFailureSignal::Ok,
+        ),
+        (
+            502,
+            b"<html>bad gateway</html>".as_slice(),
+            ProviderFailureSignal::ServerTransient,
+        ),
+        (
+            200,
+            br#"{"Message":"missing code","Data":null}"#.as_slice(),
+            ProviderFailureSignal::Ok,
+        ),
+        (
+            500,
+            br#"{"Data":{}}"#.as_slice(),
+            ProviderFailureSignal::ServerTransient,
+        ),
+        (
+            200,
+            br#"{"Code":"success"}"#.as_slice(),
+            ProviderFailureSignal::Ok,
+        ),
+    ] {
+        assert_eq!(
+            classify(ProviderId::Zhihu, status, body),
+            expected,
+            "zhihu fallback {status}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
