@@ -464,6 +464,16 @@ async fn run_manual_key_quota_sync_with_outcome(
                 .to_string(),
         )
         .with_provider(ProviderId::Exa)),
+        // Typed todo-2 boundary (todo 12 replaces it): Keenable returns its
+        // last passive snapshot and Zhihu runs the live /api/v1/quota read
+        // once the quota adapter lands. Until then the sync is a typed 501
+        // sync_pending — never a live call, never a snapshot, never a key mark.
+        ProviderId::Keenable | ProviderId::Zhihu => Err(ManualQuotaSyncError::new(
+            StatusCode::NOT_IMPLEMENTED,
+            "sync_pending",
+            format!("{provider} quota sync is not wired yet"),
+        )
+        .with_provider(provider)),
     }
 }
 

@@ -143,6 +143,13 @@ pub(crate) fn classify_provider_failure(
         ProviderId::Serpapi => classify_serpapi_failure(evidence),
         ProviderId::Exa => classify_exa_failure(evidence),
         ProviderId::Brave => classify_brave_failure(evidence),
+        // Compile-gate boundaries (plan todo 2): Keenable's `type`/`code`
+        // envelope and Zhihu's HTTP-200 `Code` envelope are classified by
+        // todo 3; until then only the status default runs — a documented
+        // boundary, never a silent success arm.
+        ProviderId::Keenable | ProviderId::Zhihu => {
+            default_provider_failure_signal(evidence.status)
+        }
     }
 }
 

@@ -1,8 +1,8 @@
 use std::str::FromStr;
 
 use crate::providers::{
-    BRAVE, EXA, EgressPolicy, KeyAuthInjection, McpMode, ProviderId, RecoveryPolicy, SERPAPI,
-    TAVILY, UnknownProviderId,
+    BRAVE, EXA, EgressPolicy, KEENABLE, KeyAuthInjection, McpMode, ProviderId, RecoveryPolicy,
+    SERPAPI, TAVILY, UnknownProviderId, ZHIHU,
 };
 
 /// Display, the SQLTEXT helper `as_str`, and FromStr must agree on one stable
@@ -15,6 +15,8 @@ fn provider_id_display_from_str_roundtrip_all_four() {
         (ProviderId::Serpapi, "serpapi"),
         (ProviderId::Exa, "exa"),
         (ProviderId::Brave, "brave"),
+        (ProviderId::Keenable, "keenable"),
+        (ProviderId::Zhihu, "zhihu"),
     ];
     for (id, key) in cases {
         // When/Then: Display and as_str emit the stable key; FromStr recovers
@@ -46,6 +48,8 @@ fn provider_id_serde_uses_lowercase_renames() {
         (ProviderId::Serpapi, "serpapi"),
         (ProviderId::Exa, "exa"),
         (ProviderId::Brave, "brave"),
+        (ProviderId::Keenable, "keenable"),
+        (ProviderId::Zhihu, "zhihu"),
     ];
     for (id, key) in cases {
         let json = serde_json::to_string(&id).expect("provider id serializes");
@@ -163,6 +167,64 @@ fn brave_spec_defaults_and_credits() {
     assert_eq!((BRAVE.credits)("images"), 0);
 }
 
+#[test]
+fn keenable_spec_defaults_and_credits() {
+    assert_eq!(KEENABLE.id, ProviderId::Keenable);
+    assert_eq!(KEENABLE.rest_base_default, "https://api.keenable.ai");
+    // Hosted MCP passthrough (the vendor's canonical tool catalog rides it).
+    assert_eq!(
+        KEENABLE.mcp_upstream_default,
+        Some("https://api.keenable.ai/mcp")
+    );
+    assert_eq!(KEENABLE.mcp_mode, McpMode::Passthrough);
+    assert_eq!(
+        KEENABLE.upstream_key_injection,
+        KeyAuthInjection::Header { name: "X-API-Key" }
+    );
+    assert_eq!(KEENABLE.client_auth_query_slot, None);
+    assert_eq!(KEENABLE.client_auth_header_slot, Some("X-API-Key"));
+    // Passive harvest of `usage.credits_remaining` from keyed responses.
+    const { assert!(KEENABLE.supports_quota_sync) };
+    assert_eq!(KEENABLE.recovery, RecoveryPolicy::UtcMonth);
+    assert_eq!(KEENABLE.egress, EgressPolicy::DirectAllowed);
+    assert_eq!((KEENABLE.credits)("search"), 1);
+    assert_eq!((KEENABLE.credits)("fetch"), 1);
+    assert_eq!((KEENABLE.credits)("unknown"), 0);
+}
+
+#[test]
+fn zhihu_spec_defaults_and_credits() {
+    assert_eq!(ZHIHU.id, ProviderId::Zhihu);
+    assert_eq!(ZHIHU.rest_base_default, "https://developer.zhihu.com");
+    // The official Zhihu MCP is SSE-only (held a connection open in probing);
+    // a LOCAL facade is the supported path — no hosted MCP default.
+    assert_eq!(ZHIHU.mcp_upstream_default, None);
+    assert_eq!(ZHIHU.mcp_mode, McpMode::LocalFacade);
+    assert_eq!(ZHIHU.upstream_key_injection, KeyAuthInjection::Bearer);
+    // The universal Hikari Bearer is the client credential; no native client
+    // query or header slot exists.
+    assert_eq!(ZHIHU.client_auth_query_slot, None);
+    assert_eq!(ZHIHU.client_auth_header_slot, None);
+    // Active read of the free `/api/v1/quota` natural-day source.
+    const { assert!(ZHIHU.supports_quota_sync) };
+    assert_eq!(ZHIHU.recovery, RecoveryPolicy::NaturalDay);
+    assert_eq!(ZHIHU.egress, EgressPolicy::DirectAllowed);
+    assert_eq!((ZHIHU.credits)("zhihu_search"), 1);
+    assert_eq!((ZHIHU.credits)("global_search"), 1);
+    assert_eq!((ZHIHU.credits)("unknown"), 0);
+}
+
+/// Zhihu resets on the NATURAL DAY (next Asia/Shanghai midnight, stored as
+/// `quota_renews_at` epoch seconds) — a distinct policy from the UTC-month
+/// flip, never conflated with it (plan GAP-4).
+#[test]
+fn natural_day_recovery_policy_is_distinct_from_utc_month() {
+    assert_ne!(RecoveryPolicy::NaturalDay, RecoveryPolicy::UtcMonth);
+    assert_eq!(ZHIHU.recovery, RecoveryPolicy::NaturalDay);
+    assert_eq!(KEENABLE.recovery, RecoveryPolicy::UtcMonth);
+    assert_eq!(TAVILY.recovery, RecoveryPolicy::UtcMonth);
+}
+
 /// The egress stance is the ONE registry field consumed by a live seam: the
 /// forward-proxy plan builder and its direct fallback. Pin it so a provider
 /// cannot silently regain the doomed direct attempt that produced 340
@@ -174,6 +236,8 @@ fn brave_requires_proxy_egress_while_other_providers_allow_direct() {
     assert_eq!(TAVILY.egress, EgressPolicy::DirectAllowed);
     assert_eq!(SERPAPI.egress, EgressPolicy::DirectAllowed);
     assert_eq!(EXA.egress, EgressPolicy::DirectAllowed);
+    assert_eq!(KEENABLE.egress, EgressPolicy::DirectAllowed);
+    assert_eq!(ZHIHU.egress, EgressPolicy::DirectAllowed);
 }
 
 /// Negative arm: the registry lookup is the only stance source, so a provider
@@ -185,6 +249,8 @@ fn spec_for_returns_the_registry_stance_for_every_provider() {
         (ProviderId::Serpapi, EgressPolicy::DirectAllowed),
         (ProviderId::Exa, EgressPolicy::DirectAllowed),
         (ProviderId::Brave, EgressPolicy::ProxyRequired),
+        (ProviderId::Keenable, EgressPolicy::DirectAllowed),
+        (ProviderId::Zhihu, EgressPolicy::DirectAllowed),
     ] {
         assert_eq!(crate::providers::spec_for(id).egress, expected);
         assert_eq!(crate::providers::spec_for(id).id, id);

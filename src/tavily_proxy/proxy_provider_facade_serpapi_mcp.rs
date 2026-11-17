@@ -42,9 +42,14 @@ use super::*;
 pub fn provider_mcp_upstream_operation(provider: providers::ProviderId) -> Option<&'static str> {
     match provider {
         providers::ProviderId::Serpapi => Some("serpapi_mcp"),
+        // Keenable is a hosted passthrough whose "keenable_mcp" label lands
+        // with todo 8; Zhihu is a local facade (todo 10) with no hosted
+        // passthrough operation. Until then: no operation, no upstream call.
         providers::ProviderId::Tavily
         | providers::ProviderId::Exa
-        | providers::ProviderId::Brave => None,
+        | providers::ProviderId::Brave
+        | providers::ProviderId::Keenable
+        | providers::ProviderId::Zhihu => None,
     }
 }
 

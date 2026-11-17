@@ -680,6 +680,17 @@ async fn provider_rest_facade(
                     &response.body,
                 ))),
                 ProviderId::Tavily => None,
+                // Typed todo-2 boundary (todos 7/9 replace it): no REST route
+                // is registered for either provider until todo 6, so this arm
+                // is unreachable; if it ever fires, log it and project NO
+                // outcome — never a billing record, never a silent success.
+                ProviderId::Keenable | ProviderId::Zhihu => {
+                    eprintln!(
+                        "provider facade outcome projection pending for {provider}",
+                        provider = route.provider
+                    );
+                    None
+                }
             };
             let outcome_status = match &facade_outcome {
                 Some(outcome) => outcome.result_status,
@@ -772,7 +783,7 @@ async fn provider_rest_facade(
 /// dispatch to their LOCAL facades on the shared framework — every registered
 /// provider ingress is wired, and the typed pending fallback below now only
 /// guards unexpected provider ids (Tavily never routes here).
-async fn provider_mcp_facade(
+pub(super) async fn provider_mcp_facade(
     state: Arc<AppState>,
     req: Request<Body>,
     provider: ProviderId,
@@ -841,6 +852,18 @@ async fn provider_mcp_facade(
                 return Err(StatusCode::INTERNAL_SERVER_ERROR);
             }
         }
+    }
+
+    // Typed todo-2 boundaries: the Keenable hosted passthrough (todo 8) and
+    // the Zhihu local facade (todo 10) replace their arms behind the same
+    // seam. Until then both surfaces answer with the typed pending boundary
+    // below — never a 200, never an upstream call, never a key mark.
+    if provider == ProviderId::Keenable || provider == ProviderId::Zhihu {
+        eprintln!(
+            "provider MCP dispatch pending for {provider} ({path})",
+            provider = provider
+        );
+        return provider_mcp_execution_pending_response(provider);
     }
 
     // SerpApi hosted passthrough (todo 15), the Brave LOCAL facade (todo 16),

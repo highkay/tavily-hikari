@@ -1765,9 +1765,14 @@ impl TavilyProxy {
                 self.apply_upstream_project_id_header(sanitized, original_headers, auth_token_id)
                     .await
             }
+            // Non-Tavily providers (incl. the todo-2 Keenable/Zhihu
+            // boundary) strip any forged client value; the system-settings
+            // policy is never read for them.
             crate::providers::ProviderId::Serpapi
             | crate::providers::ProviderId::Exa
-            | crate::providers::ProviderId::Brave => {
+            | crate::providers::ProviderId::Brave
+            | crate::providers::ProviderId::Keenable
+            | crate::providers::ProviderId::Zhihu => {
                 sanitized.headers.remove("x-project-id");
                 sanitized.forwarded.retain(|name| name != "x-project-id");
                 Ok(None)
@@ -1953,9 +1958,13 @@ impl TavilyProxy {
     fn mcp_key_migration_backoff_scope(provider: providers::ProviderId) -> &'static str {
         match provider {
             providers::ProviderId::Tavily => MCP_SESSION_INIT_BACKOFF_SCOPE,
+            // Keenable/Zhihu keep the existing shared HTTP scope until todo 11
+            // decides a per-provider scope.
             providers::ProviderId::Serpapi
             | providers::ProviderId::Exa
-            | providers::ProviderId::Brave => HTTP_GLOBAL_BACKOFF_SCOPE,
+            | providers::ProviderId::Brave
+            | providers::ProviderId::Keenable
+            | providers::ProviderId::Zhihu => HTTP_GLOBAL_BACKOFF_SCOPE,
         }
     }
 
