@@ -816,8 +816,16 @@ fn redact_sensitive(input: &str) -> String {
     }
     // Redact header-like phrase "<name>: <value>" for every provider key
     // header (naive pass, case-insensitive): Tavily `Tavily-Api-Key`,
-    // Exa `x-api-key`, Brave `X-Subscription-Token` (plan todo 4).
-    const HEADER_PHRASES: &[&str] = &["tavily-api-key", "x-api-key", "x-subscription-token"];
+    // Exa `x-api-key`, Brave `X-Subscription-Token` (plan todo 4), and the
+    // Zhihu upstream `Authorization: Bearer ...` (keenable-integration todo 4:
+    // the pooled Access Secret rides it upstream and must never surface in a
+    // display string).
+    const HEADER_PHRASES: &[&str] = &[
+        "tavily-api-key",
+        "x-api-key",
+        "x-subscription-token",
+        "authorization",
+    ];
     let mut out = String::new();
     let mut i = 0usize;
     let s_lower = s.to_lowercase();

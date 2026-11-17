@@ -597,6 +597,67 @@ pub(crate) fn sanitize_brave_http_headers_inner(headers: &HeaderMap) -> Sanitize
     }
 }
 
+/// Outbound header allowlist for the Keenable REST facade (keenable-integration
+/// todo 4): {accept, accept-encoding, content-type}. A client-supplied
+/// `X-API-Key` never rides through — the pooled upstream key is injected as
+/// `X-API-Key` at the facade per attempt — and `x-project-id` is a Tavily-only
+/// upstream identity policy the provider gate strips.
+// Consumed by the Keenable REST facade sanitizer dispatch (keenable-integration todos 6/7).
+pub(crate) fn sanitize_keenable_http_headers_inner(headers: &HeaderMap) -> SanitizedHeaders {
+    const ALLOWED_HEADERS: &[&str] = &["accept", "accept-encoding", "content-type"];
+
+    let mut sanitized = HeaderMap::new();
+    let mut forwarded = Vec::new();
+    let mut dropped = Vec::new();
+
+    for (name, value) in headers.iter() {
+        let key = name.as_str().to_ascii_lowercase();
+        if !ALLOWED_HEADERS.iter().any(|allowed| key == *allowed) {
+            dropped.push(key);
+            continue;
+        }
+        sanitized.insert(name.clone(), value.clone());
+        forwarded.push(key);
+    }
+
+    SanitizedHeaders {
+        headers: sanitized,
+        forwarded,
+        dropped,
+    }
+}
+
+/// Outbound header allowlist for the Zhihu REST facade (keenable-integration
+/// todo 4): {accept, accept-encoding, content-type}. A client `authorization`
+/// (the universal Hikari Bearer is the client credential, never an upstream
+/// credential) and a client `x-request-timestamp` are dropped here; the pooled
+/// Access Secret is injected as `Authorization: Bearer` and the timestamp is
+/// generated fresh from the backend clock per attempt at the executor seam.
+// Consumed by the Zhihu REST facade sanitizer dispatch (keenable-integration todos 6/9).
+pub(crate) fn sanitize_zhihu_http_headers_inner(headers: &HeaderMap) -> SanitizedHeaders {
+    const ALLOWED_HEADERS: &[&str] = &["accept", "accept-encoding", "content-type"];
+
+    let mut sanitized = HeaderMap::new();
+    let mut forwarded = Vec::new();
+    let mut dropped = Vec::new();
+
+    for (name, value) in headers.iter() {
+        let key = name.as_str().to_ascii_lowercase();
+        if !ALLOWED_HEADERS.iter().any(|allowed| key == *allowed) {
+            dropped.push(key);
+            continue;
+        }
+        sanitized.insert(name.clone(), value.clone());
+        forwarded.push(key);
+    }
+
+    SanitizedHeaders {
+        headers: sanitized,
+        forwarded,
+        dropped,
+    }
+}
+
 pub(crate) fn origin_from_url(url: &Url) -> String {
     let mut origin = match url.host_str() {
         Some(host) => format!("{}://{}", url.scheme(), host),

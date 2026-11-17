@@ -44,6 +44,7 @@ mod provider_failure_classification;
 mod provider_health_matrix;
 mod provider_pool_scoping;
 mod provider_quota_sync_adapters;
+mod provider_rest_header_policy;
 mod proxy_affinity_and_summary;
 mod proxy_affinity_runtime_geo;
 mod reconciliation_controller;
