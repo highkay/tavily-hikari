@@ -2860,6 +2860,7 @@ include!("key_store_users_and_oauth.rs");
 include!("key_store_linuxdo_credit_recharge.rs");
 include!("key_store_request_log_body_retention.rs");
 include!("key_store_token_logs.rs");
+include!("key_store_token_logs_recovery.rs");
 include!("key_store_alert_models.rs");
 include!("key_store_alerts.rs");
 include!("key_store_alert_canonical_catalog.rs");
