@@ -103,6 +103,69 @@ Tavily behavior. Substantive terms are recorded in `CONTEXT.md` under Multi-Prov
   The text classifier stays as the fallback for every other row, but a wording change can no
   longer silently downgrade these diagnoses to `transport_send_error`.
 
+## Keenable and Zhihu
+
+Recorded 2026-11-16 from live probes against both providers and their official docs. The probe
+captures live under `.omo/evidence/keenable-integration/probes/`, and the operative contract for the
+todos that follow is `docs/specs/keenable-zhihu-providers/SPEC.md`.
+
+Keenable serves web search and page fetch from `api.keenable.ai` with the `X-API-Key` header
+(`Authorization: Bearer <key>` is also accepted, and `X-API-Key` wins when both are sent). The REST
+surface is `POST /v1/search` and `GET /v1/fetch`, and the hosted MCP server is `POST https://api.keenable.ai/mcp`, which answers Streamable HTTP JSON with exactly `search_web_pages` and
+`fetch_page_content`. Every keyed success returns a `usage` object (`sku`, `amount`, `credits`,
+`paid`, `credits_remaining`), so `usage.credits_remaining` is the passive org balance; MCP tool
+results carry the same object under `_meta["keenable/usage"]`. Errors are one flat JSON body whose
+`type` is a closed set of seven values. The mapping is: `authentication_error` to auth-fail;
+`billing_error` on `402` to exhausted and on `451` to client error; `permission_error` to auth-fail
+only for `credentials_forbidden`/`forbidden` and otherwise to client error; `target_error` to client
+error regardless of status, never a key penalty; `rate_limit_error` to rate-limited from
+`retry_after_seconds` or `Retry-After`; `api_error` to transient; `invalid_request_error` to client
+error; an unknown or missing `type` falls back to the HTTP status default. Authenticated traffic is
+capped at 10 requests per second per organization, the free allowance is 100,000 requests per month
+and resets monthly, then $4 per 1,000 requests.
+
+Zhihu serves in-site and web-wide search from `developer.zhihu.com` as
+`GET /api/v1/content/zhihu_search` and `GET /api/v1/content/global_search`, authenticated with
+`Authorization: Bearer <access secret>` plus a required `X-Request-Timestamp` in Unix seconds with
+at most 10 minutes of skew; the proxy generates the timestamp server-side. Success and failure both
+arrive as HTTP 200 with a `{Code,Message,Data}` envelope: `0` ok, `10001` parameter error, `20001`
+auth failure, `30001` rate limit, `90001` internal error; an unknown non-zero `Code` is a client
+error. `Count` caps at 10 for `zhihu_search` and 20 for `global_search`; a client `Count` above the
+cap is rejected locally with a typed 400 instead of the upstream's silent truncation, `Count <= 0`
+passes through to the upstream default of 10, and `SortBy`/`Filter`/`SearchDB` pass through
+unvalidated. `GET /api/v1/quota` is free and returns `TotalQuota`/`TotalUsed`/`RemainingQuota` per
+API for the current natural day, which makes it both the active quota source and the zero-cost
+validation probe. Zhihu's official MCP server is SSE-only; a plain request held the connection open
+in probing, so the supported MCP surface is a local facade, not a passthrough.
+
+The decisions above extend as follows:
+
+- Register both providers. Keenable carries `X-API-Key` as both its client-native auth slot and its
+  upstream injection slot (stripped from client input before logging, then re-injected from the
+  pool), plus `UtcMonth` recovery and a hosted MCP passthrough at `/keenable/mcp`. Zhihu carries
+  `Bearer` injection with no client-native header slot (the universal Hikari Bearer holds the `th-`
+  token), a new `RecoveryPolicy::NaturalDay` whose `quota_renews_at` is the next Asia/Shanghai
+  midnight, and a local MCP facade at `/zhihu/mcp` with `zhihu_search` and `zhihu_global_search`.
+  An exhausted Zhihu key flips active at that boundary and never on a UTC month or renewal-date
+  boundary.
+- Bill 1 local credit per successful upstream call on the one shared wallet: Keenable search and
+  fetch, Zhihu `zhihu_search` and `global_search`, and each MCP `tools/call`. Zhihu settles only
+  when `Code == 0` despite the HTTP 200; `initialize`, `ping`, `tools/list`, and notifications stay
+  free.
+- Harvest Keenable passively from `usage.credits_remaining` and `_meta["keenable/usage"]`, and sync
+  Zhihu actively from the free `/api/v1/quota`, storing the minimum remaining across the two search
+  APIs and the next natural-day reset. Both egress stances are `DirectAllowed`, and the registry
+  remains the only source of egress policy.
+- Validate keys at zero cost: Keenable probes `POST /v1/search` with a missing `query` (a `400 missing_parameter` proves the key works, a `401` proves it does not), Zhihu probes the free
+  `/api/v1/quota` (`Code=0` valid, `20001` invalid).
+- Offer Zhihu to end users through the shared credit wallet with an operator terms note, and never
+  through multi-account rotation or farming. The account-scoped Access Secret stays in the operator
+  key pool behind the `th-` token.
+
+Nothing on the existing Tavily, SerpApi, Exa, or Brave paths changes: their allowlists, credit
+tables, golden behavior, and the Tavily-432 depletion gate stay byte-stable, and the stub-only
+upstream rule extends to the two new providers.
+
 ## Consequences
 
 - Exa hosted-MCP passthrough is deferred. The local facade is the only Exa MCP surface for now:

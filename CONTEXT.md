@@ -351,4 +351,21 @@ _Avoid_: worker is running, last slice was verified
   through to a hosted MCP server. Exa and Brave use local facades; SerpApi uses passthrough.
 - `per-provider credit table`: the per-operation local credit prices charged from the one shared
   token wallet (serpapi search `1`; exa search `1`, contents `1`, answer `2`; brave web `1`, news
-  `1`, llm_context `2`).
+  `1`, llm_context `2`; keenable search/fetch `1`/`1`; zhihu zhihu_search/global_search `1`/`1`).
+- `credential-envelope classifier`: a provider failure-classifier arm built on the upstream's typed
+  error envelope instead of HTTP status alone: Keenable's top-level `type` plus `code` body, Zhihu's
+  HTTP-200 `Code` field. Branching is on the typed key, never on `error` or `message` text.
+- `natural-day quota`: an upstream allowance that resets at a natural-day boundary. Zhihu's free
+  `/api/v1/quota` reports total/used/remaining for the current natural day, and the `NaturalDay`
+  recovery policy restores an exhausted Zhihu key when the backend clock reaches `quota_renews_at`
+  (the next Asia/Shanghai midnight), never on a UTC month or renewal-date boundary.
+- `passive credit harvest`: reading a provider's remaining balance from fields already present on a
+  normal keyed response body, with no extra request: Keenable's `usage.credits_remaining` on REST
+  responses and `_meta["keenable/usage"]` on MCP tool results. Persisted only on a material change,
+  like `passive quota harvest`.
+- `native-shape provider facade`: a provider surface that forwards the vendor's request parameters
+  and response body unchanged apart from redaction, never translating to or from the Tavily schema.
+  Keenable and Zhihu join SerpApi, Exa, and Brave on this rule.
+- `zero-cost validation probe`: the provider-scoped admin key-validation call that consults only
+  free upstream surfaces, billing nothing and consuming no quota: Keenable's missing-`query` `POST /v1/search` (a `400 missing_parameter` versus a `401`), Zhihu's `GET /api/v1/quota` (`Code=0`
+  versus `20001`).
