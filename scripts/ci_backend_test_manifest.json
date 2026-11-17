@@ -28,6 +28,8 @@
         "--bin",
         "mock_exa",
         "--bin",
+        "mock_keenable",
+        "--bin",
         "mock_mcp_client",
         "--bin",
         "mock_serpapi",
@@ -35,6 +37,8 @@
         "mock_tavily",
         "--bin",
         "mock_upstream",
+        "--bin",
+        "mock_zhihu",
         "--bin",
         "monthly_quota_rebase",
         "--bin",
@@ -57,6 +61,12 @@
       "list_args": [
         "--test",
         "mcp_session_affinity_e2e"
+      ]
+    },
+    "integration:mock_upstream_contract": {
+      "list_args": [
+        "--test",
+        "mock_upstream_contract"
       ]
     },
     "integration:provider_facades_contract": {
@@ -695,6 +705,8 @@
         "--bin",
         "mock_exa",
         "--bin",
+        "mock_keenable",
+        "--bin",
         "mock_mcp_client",
         "--bin",
         "mock_serpapi",
@@ -702,6 +714,8 @@
         "mock_tavily",
         "--bin",
         "mock_upstream",
+        "--bin",
+        "mock_zhihu",
         "--bin",
         "monthly_quota_rebase",
         "--bin",
@@ -1159,6 +1173,17 @@
       "run_args": [
         "--test",
         "mcp_session_affinity_e2e"
+      ]
+    },
+    {
+      "id": "integration-mock-upstream-contract",
+      "kind": "integration",
+      "name": "Integration Mock Upstream Contract",
+      "estimated_seconds": 8,
+      "coverage_target": "integration:mock_upstream_contract",
+      "run_args": [
+        "--test",
+        "mock_upstream_contract"
       ]
     },
     {

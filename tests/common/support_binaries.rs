@@ -32,3 +32,14 @@ pub fn resolve_support_binary(env_var: &str, compile_time_path: &str) -> PathBuf
         file_name.to_string_lossy()
     );
 }
+
+pub fn mock_keenable_binary() -> PathBuf {
+    resolve_support_binary(
+        "MOCK_KEENABLE_TEST_BIN",
+        env!("CARGO_BIN_EXE_mock_keenable"),
+    )
+}
+
+pub fn mock_zhihu_binary() -> PathBuf {
+    resolve_support_binary("MOCK_ZHIHU_TEST_BIN", env!("CARGO_BIN_EXE_mock_zhihu"))
+}

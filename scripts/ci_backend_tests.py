@@ -168,6 +168,10 @@ SUPPORT_BINARIES_BY_TARGET = {
     "integration:mcp_session_affinity_e2e": {
         "TAVILY_HIKARI_TEST_BIN": "tavily-hikari",
     },
+    "integration:mock_upstream_contract": {
+        "MOCK_KEENABLE_TEST_BIN": "mock_keenable",
+        "MOCK_ZHIHU_TEST_BIN": "mock_zhihu",
+    },
     "integration:provider_facades_contract": {
         "MOCK_BRAVE_TEST_BIN": "mock_brave",
         "MOCK_EXA_TEST_BIN": "mock_exa",
