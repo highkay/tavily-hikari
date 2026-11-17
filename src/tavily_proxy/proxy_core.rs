@@ -585,6 +585,10 @@ impl TavilyProxy {
                 (ProviderId::Serpapi, &providers.serpapi_keys),
                 (ProviderId::Exa, &providers.exa_keys),
                 (ProviderId::Brave, &providers.brave_keys),
+                // keenable-integration todo 6: the Keenable/Zhihu env key lists
+                // bootstrap through the same provider-scoped sync seam.
+                (ProviderId::Keenable, &providers.keenable_keys),
+                (ProviderId::Zhihu, &providers.zhihu_keys),
             ] {
                 let sanitized_provider_keys: Vec<String> = provider_keys
                     .iter()
@@ -739,6 +743,9 @@ impl TavilyProxy {
             serpapi_mcp_upstream = %proxy.provider_upstreams.serpapi_mcp,
             exa_upstream = %proxy.provider_upstreams.exa_rest,
             brave_upstream = %proxy.provider_upstreams.brave_rest,
+            keenable_upstream = %proxy.provider_upstreams.keenable_rest,
+            keenable_mcp_upstream = %proxy.provider_upstreams.keenable_mcp,
+            zhihu_upstream = %proxy.provider_upstreams.zhihu_rest,
             "forward-proxy startup resolved provider upstream endpoints"
         );
         info!(

@@ -598,10 +598,10 @@ impl TavilyProxy {
             providers::ProviderId::Serpapi => Ok(self.provider_upstreams.serpapi_rest.clone()),
             providers::ProviderId::Exa => Ok(self.provider_upstreams.exa_rest.clone()),
             providers::ProviderId::Brave => Ok(self.provider_upstreams.brave_rest.clone()),
-            // Typed todo-2 boundary (keenable-integration todos 6/7 replace
-            // it): no REST route is registered for either provider yet, so
-            // the resolved base fails loudly instead of letting a facade
-            // call reach a default upstream. Never a silent success.
+            // Typed boundary (keenable-integration): todo 6 registered the
+            // REST routes, but the facade executors land with todos 7/9; until
+            // then the resolved base fails loudly instead of letting a
+            // facade call reach a default upstream. Never a silent success.
             providers::ProviderId::Keenable => Err(ProxyError::Other(
                 "keenable REST facade is not wired yet".to_string(),
             )),
@@ -678,10 +678,20 @@ pub fn provider_rest_upstream_operation(
             "/res/v1/llm/context" => Some("brave_http_llm_context"),
             _ => None,
         },
-        // Typed todo-2 boundary: todo 6 registers the Keenable/Zhihu REST
-        // routes and their operation labels; until then no operation exists,
-        // which no route can ever consult.
-        providers::ProviderId::Keenable | providers::ProviderId::Zhihu => None,
+        // keenable-integration todo 6: the registered REST routes' operation
+        // labels. The executor base stays the typed todo-2 boundary until
+        // todos 7/9 wire the facade record paths, so a route hit can never
+        // consult these labels before their owners land.
+        providers::ProviderId::Keenable => match upstream_path {
+            "/v1/search" => Some("keenable_http_search"),
+            "/v1/fetch" => Some("keenable_http_fetch"),
+            _ => None,
+        },
+        providers::ProviderId::Zhihu => match upstream_path {
+            "/api/v1/content/zhihu_search" => Some("zhihu_http_zhihu_search"),
+            "/api/v1/content/global_search" => Some("zhihu_http_global_search"),
+            _ => None,
+        },
         providers::ProviderId::Tavily => None,
     }
 }

@@ -123,6 +123,14 @@ use super::*;
             serpapi_keys: vec!["mock-serpapi-key".to_string()],
             exa_keys: vec!["mock-exa-key".to_string()],
             brave_keys: vec!["mock-brave-key".to_string()],
+            // keenable-integration todo 6: stub-only upstreams (127.0.0.1
+            // mocks); the REST executor boundary makes no upstream call until
+            // todos 7/9 land.
+            keenable_upstream: format!("http://{rest_addr}"),
+            keenable_mcp_upstream: format!("http://{mcp_addr}/gw/mcp"),
+            zhihu_upstream: format!("http://{rest_addr}"),
+            keenable_keys: vec!["mock-keenable-key".to_string()],
+            zhihu_keys: vec!["mock-zhihu-key".to_string()],
         };
         let proxy = TavilyProxy::with_providers_in_ha_mode(
             vec!["tvly-provider-facade-key".to_string()],
@@ -1317,6 +1325,13 @@ use super::*;
             serpapi_keys: pool_keys.serpapi,
             exa_keys: pool_keys.exa,
             brave_keys: pool_keys.brave,
+            // keenable-integration todo 6: stub-only upstreams; the retry
+            // seam stays untouched by the typed todo-6 boundary.
+            keenable_upstream: upstream.clone(),
+            keenable_mcp_upstream: format!("{upstream}/gw/mcp"),
+            zhihu_upstream: upstream.clone(),
+            keenable_keys: Vec::new(),
+            zhihu_keys: Vec::new(),
         };
         let proxy = TavilyProxy::with_providers_in_ha_mode(
             vec!["tvly-facade-retry-key".to_string()],
@@ -2774,6 +2789,11 @@ use super::*;
             serpapi_keys: pool_keys,
             exa_keys: vec!["mock-exa-key".to_string()],
             brave_keys: vec!["mock-brave-key".to_string()],
+            keenable_upstream: format!("http://{rest_addr}"),
+            keenable_mcp_upstream: format!("http://{mcp_addr}/gw/mcp"),
+            zhihu_upstream: format!("http://{rest_addr}"),
+            keenable_keys: vec!["mock-keenable-key".to_string()],
+            zhihu_keys: vec!["mock-zhihu-key".to_string()],
         };
         let proxy = TavilyProxy::with_providers_in_ha_mode(
             vec!["tvly-provider-mcp-migration-key".to_string()],

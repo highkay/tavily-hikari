@@ -1003,6 +1003,14 @@ pub const SERPAPI_MCP_UPSTREAM_DEFAULT: &str = match crate::providers::SERPAPI.m
     None => panic!("SERPAPI provider spec must define a hosted MCP upstream default"),
 };
 
+/// Keenable hosted MCP upstream default (keenable-integration todo 6), with
+/// the same compile-time registry unwrapping contract as the SerpApi default.
+pub const KEENABLE_MCP_UPSTREAM_DEFAULT: &str =
+    match crate::providers::KEENABLE.mcp_upstream_default {
+        Some(value) => value,
+        None => panic!("KEENABLE provider spec must define a hosted MCP upstream default"),
+    };
+
 /// Per-provider upstream endpoints plus env bootstrap key lists (multi-provider
 /// plan todo 7). `Default` mirrors the static provider registry and carries no
 /// bootstrap keys, so a Tavily-only installation stays byte-identical: absent
@@ -1016,6 +1024,13 @@ pub struct ProviderBootstrap {
     pub serpapi_keys: Vec<String>,
     pub exa_keys: Vec<String>,
     pub brave_keys: Vec<String>,
+    // keenable-integration todo 6: the Keenable/Zhihu upstreams and env key
+    // lists. Absent config keeps the registry defaults and untouched rows.
+    pub keenable_upstream: String,
+    pub keenable_mcp_upstream: String,
+    pub zhihu_upstream: String,
+    pub keenable_keys: Vec<String>,
+    pub zhihu_keys: Vec<String>,
 }
 
 impl Default for ProviderBootstrap {
@@ -1028,6 +1043,11 @@ impl Default for ProviderBootstrap {
             serpapi_keys: Vec::new(),
             exa_keys: Vec::new(),
             brave_keys: Vec::new(),
+            keenable_upstream: crate::providers::KEENABLE.rest_base_default.to_owned(),
+            keenable_mcp_upstream: KEENABLE_MCP_UPSTREAM_DEFAULT.to_owned(),
+            zhihu_upstream: crate::providers::ZHIHU.rest_base_default.to_owned(),
+            keenable_keys: Vec::new(),
+            zhihu_keys: Vec::new(),
         }
     }
 }
@@ -1041,6 +1061,12 @@ pub(crate) struct ProviderUpstreams {
     pub(crate) serpapi_mcp: Url,
     pub(crate) exa_rest: Url,
     pub(crate) brave_rest: Url,
+    // keenable-integration todo 6: parsed once at construction; the facade
+    // executors (todos 7-10) consume them, so the fields stay typed config
+    // until then.
+    pub(crate) keenable_rest: Url,
+    pub(crate) keenable_mcp: Url,
+    pub(crate) zhihu_rest: Url,
 }
 
 fn parse_provider_upstream(endpoint: &str) -> Result<Url, ProxyError> {
@@ -1057,6 +1083,9 @@ impl ProviderUpstreams {
             serpapi_mcp: parse_provider_upstream(&config.serpapi_mcp_upstream)?,
             exa_rest: parse_provider_upstream(&config.exa_upstream)?,
             brave_rest: parse_provider_upstream(&config.brave_upstream)?,
+            keenable_rest: parse_provider_upstream(&config.keenable_upstream)?,
+            keenable_mcp: parse_provider_upstream(&config.keenable_mcp_upstream)?,
+            zhihu_rest: parse_provider_upstream(&config.zhihu_upstream)?,
         })
     }
 }

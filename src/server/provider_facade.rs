@@ -156,6 +156,50 @@ const PROVIDER_REST_ROUTES: &[ProviderRestRoute] = &[
         credits_op: "llm_context",
         upstream_operation: "brave_http_llm_context",
     },
+    // keenable-integration todo 6: the Keenable REST pair (native `/v1`
+    // mirroring under the provider prefix, like Brave's `/res/v1`). The
+    // executor stays the typed todo-2 boundary until todos 7/9 wire the
+    // facade record paths; nothing here changes an existing route.
+    ProviderRestRoute {
+        path: "/api/keenable/v1/search",
+        kind_path: "/api/keenable/search",
+        provider: ProviderId::Keenable,
+        allow_get: false,
+        allow_post: true,
+        upstream_path: "/v1/search",
+        credits_op: "search",
+        upstream_operation: "keenable_http_search",
+    },
+    ProviderRestRoute {
+        path: "/api/keenable/v1/fetch",
+        kind_path: "/api/keenable/fetch",
+        provider: ProviderId::Keenable,
+        allow_get: true,
+        allow_post: false,
+        upstream_path: "/v1/fetch",
+        credits_op: "fetch",
+        upstream_operation: "keenable_http_fetch",
+    },
+    ProviderRestRoute {
+        path: "/api/zhihu/api/v1/content/zhihu_search",
+        kind_path: "/api/zhihu/zhihu_search",
+        provider: ProviderId::Zhihu,
+        allow_get: true,
+        allow_post: false,
+        upstream_path: "/api/v1/content/zhihu_search",
+        credits_op: "zhihu_search",
+        upstream_operation: "zhihu_http_zhihu_search",
+    },
+    ProviderRestRoute {
+        path: "/api/zhihu/api/v1/content/global_search",
+        kind_path: "/api/zhihu/global_search",
+        provider: ProviderId::Zhihu,
+        allow_get: true,
+        allow_post: false,
+        upstream_path: "/api/v1/content/global_search",
+        credits_op: "global_search",
+        upstream_operation: "zhihu_http_global_search",
+    },
 ];
 
 /// Provider MCP ingress registrations. Tavily's `/mcp` keeps its pinned
@@ -164,6 +208,11 @@ const PROVIDER_MCP_INGRESS_ROUTES: &[(ProviderId, &str)] = &[
     (ProviderId::Serpapi, "/serpapi/mcp"),
     (ProviderId::Exa, "/exa/mcp"),
     (ProviderId::Brave, "/brave/mcp"),
+    // keenable-integration todo 6: both ingresses keep the typed todo-2
+    // `provider_mcp_pending` dispatch until todo 8 (Keenable hosted
+    // passthrough) and todo 10 (Zhihu local facade) land.
+    (ProviderId::Keenable, "/keenable/mcp"),
+    (ProviderId::Zhihu, "/zhihu/mcp"),
 ];
 
 pub(super) fn resolve_provider_rest_route(path: &str) -> Option<&'static ProviderRestRoute> {
@@ -242,6 +291,23 @@ pub(super) fn provider_facade_routes() -> Router<Arc<AppState>> {
         .route("/exa/mcp/*path", any(provider_mcp_subpath_reject_entry))
         .route("/brave/mcp", any(provider_mcp_facade_entry))
         .route("/brave/mcp/*path", any(provider_mcp_subpath_reject_entry))
+        .route("/api/keenable/v1/search", post(provider_rest_facade_entry))
+        .route("/api/keenable/v1/fetch", get(provider_rest_facade_entry))
+        .route(
+            "/api/zhihu/api/v1/content/zhihu_search",
+            get(provider_rest_facade_entry),
+        )
+        .route(
+            "/api/zhihu/api/v1/content/global_search",
+            get(provider_rest_facade_entry),
+        )
+        .route("/keenable/mcp", any(provider_mcp_facade_entry))
+        .route(
+            "/keenable/mcp/*path",
+            any(provider_mcp_subpath_reject_entry),
+        )
+        .route("/zhihu/mcp", any(provider_mcp_facade_entry))
+        .route("/zhihu/mcp/*path", any(provider_mcp_subpath_reject_entry))
 }
 
 async fn provider_rest_facade_entry(

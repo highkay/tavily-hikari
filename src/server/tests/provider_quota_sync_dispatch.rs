@@ -157,6 +157,10 @@ async fn spawn_dispatch_harness(prefix: &str) -> DispatchHarness {
         serpapi_keys: vec![SERPAPI_SECRET.to_string()],
         exa_keys: vec![EXA_SECRET.to_string()],
         brave_keys: vec![BRAVE_SECRET.to_string()],
+        // keenable-integration todo 6: no quota-sync adapter exists for either
+        // provider here (todo 12 owns it); registry defaults keep the rows
+        // untouched and the dispatch never dials them.
+        ..tavily_hikari::ProviderBootstrap::default()
     };
     let proxy = TavilyProxy::with_providers_in_ha_mode(
         vec![TAVILY_SECRET.to_string()],

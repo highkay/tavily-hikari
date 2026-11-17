@@ -23,6 +23,8 @@ fn provider_bootstrap_defaults_match_registry_and_parse() {
     assert!(config.serpapi_keys.is_empty());
     assert!(config.exa_keys.is_empty());
     assert!(config.brave_keys.is_empty());
+    assert!(config.keenable_keys.is_empty());
+    assert!(config.zhihu_keys.is_empty());
 
     let upstreams = ProviderUpstreams::parse(&config).expect("registry defaults parse");
     assert_eq!(
@@ -46,6 +48,25 @@ fn provider_bootstrap_defaults_match_registry_and_parse() {
         upstreams.brave_rest,
         url::Url::parse(providers::BRAVE.rest_base_default).expect("brave rest default")
     );
+    // keenable-integration todo 6: the new provider bases parse from the
+    // registry defaults through the same single seam.
+    assert_eq!(
+        upstreams.keenable_rest,
+        url::Url::parse(providers::KEENABLE.rest_base_default).expect("keenable rest default")
+    );
+    assert_eq!(
+        upstreams.keenable_mcp,
+        url::Url::parse(
+            providers::KEENABLE
+                .mcp_upstream_default
+                .expect("keenable hosted mcp default exists")
+        )
+        .expect("keenable mcp default")
+    );
+    assert_eq!(
+        upstreams.zhihu_rest,
+        url::Url::parse(providers::ZHIHU.rest_base_default).expect("zhihu rest default")
+    );
 }
 
 #[test]
@@ -55,6 +76,9 @@ fn provider_upstreams_parse_rejects_invalid_urls_with_typed_error() {
         bootstrap_with(|c| c.serpapi_mcp_upstream = "::bad::".to_owned()),
         bootstrap_with(|c| c.exa_upstream = "::bad::".to_owned()),
         bootstrap_with(|c| c.brave_upstream = "::bad::".to_owned()),
+        bootstrap_with(|c| c.keenable_upstream = "::bad::".to_owned()),
+        bootstrap_with(|c| c.keenable_mcp_upstream = "::bad::".to_owned()),
+        bootstrap_with(|c| c.zhihu_upstream = "::bad::".to_owned()),
     ] {
         match ProviderUpstreams::parse(&config) {
             Err(ProxyError::InvalidEndpoint { endpoint, .. }) => {
@@ -94,6 +118,8 @@ async fn sync_keys_stamps_provider_and_scopes_soft_delete_to_same_provider() {
         (providers::ProviderId::Serpapi, "serp-1"),
         (providers::ProviderId::Exa, "exa-1"),
         (providers::ProviderId::Brave, "brave-1"),
+        (providers::ProviderId::Keenable, "ken-1"),
+        (providers::ProviderId::Zhihu, "zh-1"),
     ] {
         store
             .sync_keys(provider, &[key.to_owned()])
@@ -116,6 +142,16 @@ async fn sync_keys_stamps_provider_and_scopes_soft_delete_to_same_provider() {
     assert_eq!(
         key_row(&store, "brave-1").await,
         Some(("brave".to_owned(), true))
+    );
+    // keenable-integration todo 6: both new providers stamp their rows the
+    // same way.
+    assert_eq!(
+        key_row(&store, "ken-1").await,
+        Some(("keenable".to_owned(), true))
+    );
+    assert_eq!(
+        key_row(&store, "zh-1").await,
+        Some(("zhihu".to_owned(), true))
     );
 
     // Tavily re-sync soft-deletes ONLY same-provider extras (M5 direction 1).
@@ -232,6 +268,8 @@ async fn provider_bootstrap_absent_env_leaves_provider_rows_untouched() {
 
     let bootstrap = bootstrap_with(|config| {
         config.serpapi_keys = vec![" serp-boot ".to_owned(), "".to_owned()];
+        config.keenable_keys = vec![" ken-boot ".to_owned(), "".to_owned()];
+        config.zhihu_keys = vec!["zh-boot".to_owned()];
     });
     let proxy = TavilyProxy::with_providers_in_ha_mode(
         vec!["tvly-boot".to_owned()],
@@ -258,6 +296,16 @@ async fn provider_bootstrap_absent_env_leaves_provider_rows_untouched() {
     assert_eq!(
         key_row(&proxy.key_store, "serp-boot").await,
         Some(("serpapi".to_owned(), true))
+    );
+    // keenable-integration todo 6: the new env lists bootstrap through the
+    // same provider-scoped seam (trimmed, empties dropped, stamped).
+    assert_eq!(
+        key_row(&proxy.key_store, "ken-boot").await,
+        Some(("keenable".to_owned(), true))
+    );
+    assert_eq!(
+        key_row(&proxy.key_store, "zh-boot").await,
+        Some(("zhihu".to_owned(), true))
     );
     // The Tavily bootstrap keeps flowing through the same provider-scoped path.
     assert_eq!(

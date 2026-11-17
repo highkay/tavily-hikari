@@ -35,10 +35,11 @@ use argon2::password_hash::PasswordHash;
 use clap::{Parser, Subcommand};
 use dotenvy::dotenv;
 use tavily_hikari::{
-    AdminPasskeyScope, DEFAULT_UPSTREAM, HaConfig, HaMode, LOW_QUOTA_DEPLETION_THRESHOLD_DEFAULT,
-    ProviderBootstrap, RuntimeLogFormat, SERPAPI_MCP_UPSTREAM_DEFAULT, TavilyProxy,
-    TavilyProxyOptions, create_admin_passkey_reset_token_for_database,
-    providers::{BRAVE, EXA, SERPAPI},
+    AdminPasskeyScope, DEFAULT_UPSTREAM, HaConfig, HaMode, KEENABLE_MCP_UPSTREAM_DEFAULT,
+    LOW_QUOTA_DEPLETION_THRESHOLD_DEFAULT, ProviderBootstrap, RuntimeLogFormat,
+    SERPAPI_MCP_UPSTREAM_DEFAULT, TavilyProxy, TavilyProxyOptions,
+    create_admin_passkey_reset_token_for_database,
+    providers::{BRAVE, EXA, KEENABLE, SERPAPI, ZHIHU},
 };
 use tracing::{info, warn};
 
@@ -85,6 +86,26 @@ struct Cli {
     #[arg(long, env = "BRAVE_UPSTREAM", default_value = BRAVE.rest_base_default)]
     brave_upstream: String,
 
+    /// Keenable REST 上游基础地址（支持路径前缀反代）
+    #[arg(
+        long,
+        env = "KEENABLE_UPSTREAM",
+        default_value = KEENABLE.rest_base_default
+    )]
+    keenable_upstream: String,
+
+    /// Keenable 托管 MCP 上游端点（支持路径前缀反代）
+    #[arg(
+        long,
+        env = "KEENABLE_MCP_UPSTREAM",
+        default_value = KEENABLE_MCP_UPSTREAM_DEFAULT
+    )]
+    keenable_mcp_upstream: String,
+
+    /// Zhihu REST 上游基础地址（支持路径前缀反代）
+    #[arg(long, env = "ZHIHU_UPSTREAM", default_value = ZHIHU.rest_base_default)]
+    zhihu_upstream: String,
+
     /// SerpApi API keys（逗号分隔或重复传参；未设置时不改动该 provider 的密钥行）
     #[arg(
         long,
@@ -111,6 +132,24 @@ struct Cli {
         hide_env_values = true
     )]
     brave_keys: Vec<String>,
+
+    /// Keenable API keys（逗号分隔或重复传参；未设置时不改动该 provider 的密钥行）
+    #[arg(
+        long,
+        value_delimiter = ',',
+        env = "KEENABLE_API_KEYS",
+        hide_env_values = true
+    )]
+    keenable_keys: Vec<String>,
+
+    /// Zhihu Access Secrets（逗号分隔或重复传参；未设置时不改动该 provider 的密钥行）
+    #[arg(
+        long,
+        value_delimiter = ',',
+        env = "ZHIHU_API_KEYS",
+        hide_env_values = true
+    )]
+    zhihu_keys: Vec<String>,
 
     /// 代理监听地址
     #[arg(long, env = "PROXY_BIND", default_value = "127.0.0.1")]
@@ -524,6 +563,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         serpapi_keys: cli.serpapi_keys,
         exa_keys: cli.exa_keys,
         brave_keys: cli.brave_keys,
+        keenable_upstream: cli.keenable_upstream,
+        keenable_mcp_upstream: cli.keenable_mcp_upstream,
+        zhihu_upstream: cli.zhihu_upstream,
+        keenable_keys: cli.keenable_keys,
+        zhihu_keys: cli.zhihu_keys,
     };
     let proxy = TavilyProxy::with_providers_in_ha_mode(
         cli.keys,
@@ -1006,6 +1050,11 @@ mod main_tests {
             "SERPAPI_API_KEYS",
             "EXA_API_KEYS",
             "BRAVE_API_KEYS",
+            "KEENABLE_UPSTREAM",
+            "KEENABLE_MCP_UPSTREAM",
+            "ZHIHU_UPSTREAM",
+            "KEENABLE_API_KEYS",
+            "ZHIHU_API_KEYS",
         ] {
             // SAFETY: called while holding provider_env_guard; no other test
             // thread reads or writes these process-env keys concurrently.
@@ -1036,9 +1085,25 @@ mod main_tests {
             cli.brave_upstream,
             tavily_hikari::providers::BRAVE.rest_base_default
         );
+        assert_eq!(
+            cli.keenable_upstream,
+            tavily_hikari::providers::KEENABLE.rest_base_default
+        );
+        assert_eq!(
+            cli.keenable_mcp_upstream,
+            tavily_hikari::providers::KEENABLE
+                .mcp_upstream_default
+                .expect("keenable hosted mcp default exists")
+        );
+        assert_eq!(
+            cli.zhihu_upstream,
+            tavily_hikari::providers::ZHIHU.rest_base_default
+        );
         assert!(cli.serpapi_keys.is_empty());
         assert!(cli.exa_keys.is_empty());
         assert!(cli.brave_keys.is_empty());
+        assert!(cli.keenable_keys.is_empty());
+        assert!(cli.zhihu_keys.is_empty());
     }
 
     #[test]
@@ -1055,12 +1120,21 @@ mod main_tests {
             "http://127.0.0.1:59102",
             "--brave-upstream",
             "http://127.0.0.1:59103",
+            "--keenable-upstream",
+            "http://127.0.0.1:59104/gw",
+            "--keenable-mcp-upstream",
+            "http://127.0.0.1:59104/gw/mcp",
+            "--zhihu-upstream",
+            "http://127.0.0.1:59105",
         ])
         .expect("custom provider flags parse");
         assert_eq!(cli.serpapi_upstream, "http://127.0.0.1:59101/gw");
         assert_eq!(cli.serpapi_mcp_upstream, "http://127.0.0.1:59101/gw/mcp");
         assert_eq!(cli.exa_upstream, "http://127.0.0.1:59102");
         assert_eq!(cli.brave_upstream, "http://127.0.0.1:59103");
+        assert_eq!(cli.keenable_upstream, "http://127.0.0.1:59104/gw");
+        assert_eq!(cli.keenable_mcp_upstream, "http://127.0.0.1:59104/gw/mcp");
+        assert_eq!(cli.zhihu_upstream, "http://127.0.0.1:59105");
     }
 
     #[test]
@@ -1074,6 +1148,9 @@ mod main_tests {
             std::env::set_var("EXA_API_KEYS", "ex-1");
             std::env::set_var("BRAVE_API_KEYS", "br-1");
             std::env::set_var("SERPAPI_UPSTREAM", "http://127.0.0.1:59111");
+            std::env::set_var("KEENABLE_API_KEYS", "ken-1,ken-2");
+            std::env::set_var("ZHIHU_API_KEYS", "zh-1");
+            std::env::set_var("ZHIHU_UPSTREAM", "http://127.0.0.1:59114");
         }
         let cli = super::Cli::try_parse_from(["tavily-hikari"]).expect("env-backed parse");
         assert_eq!(
@@ -1083,6 +1160,12 @@ mod main_tests {
         assert_eq!(cli.exa_keys, vec!["ex-1".to_string()]);
         assert_eq!(cli.brave_keys, vec!["br-1".to_string()]);
         assert_eq!(cli.serpapi_upstream, "http://127.0.0.1:59111");
+        assert_eq!(
+            cli.keenable_keys,
+            vec!["ken-1".to_string(), "ken-2".to_string()]
+        );
+        assert_eq!(cli.zhihu_keys, vec!["zh-1".to_string()]);
+        assert_eq!(cli.zhihu_upstream, "http://127.0.0.1:59114");
 
         let cli = super::Cli::try_parse_from([
             "tavily-hikari",
@@ -1090,10 +1173,16 @@ mod main_tests {
             "http://127.0.0.1:59112",
             "--serpapi-keys",
             "sp-flag",
+            "--keenable-upstream",
+            "http://127.0.0.1:59113",
+            "--keenable-keys",
+            "ken-flag",
         ])
         .expect("flag-over-env parse");
         assert_eq!(cli.serpapi_upstream, "http://127.0.0.1:59112");
         assert_eq!(cli.serpapi_keys, vec!["sp-flag".to_string()]);
+        assert_eq!(cli.keenable_upstream, "http://127.0.0.1:59113");
+        assert_eq!(cli.keenable_keys, vec!["ken-flag".to_string()]);
         clear_provider_config_env();
     }
 }

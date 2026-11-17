@@ -1011,6 +1011,23 @@ pub(crate) const PROVIDER_REQUEST_KINDS: &[(&str, &str)] = &[
     ("mcp:exa/web_search", "MCP | exa/web_search"),
     ("mcp:exa/web_fetch", "MCP | exa/web_fetch"),
     ("mcp:exa/answer", "MCP | exa/answer"),
+    // keenable-integration todo 6: the Keenable REST pair, the Zhihu REST
+    // pair, and both providers' MCP tools (todo 8 hosted passthrough /
+    // todo 10 local facade names) ride the same closed catalog.
+    ("api:keenable/search", "API | keenable/search"),
+    ("api:keenable/fetch", "API | keenable/fetch"),
+    ("api:zhihu/zhihu_search", "API | zhihu/zhihu_search"),
+    ("api:zhihu/global_search", "API | zhihu/global_search"),
+    (
+        "mcp:keenable/search_web_pages",
+        "MCP | keenable/search_web_pages",
+    ),
+    (
+        "mcp:keenable/fetch_page_content",
+        "MCP | keenable/fetch_page_content",
+    ),
+    ("mcp:zhihu/zhihu_search", "MCP | zhihu/zhihu_search"),
+    ("mcp:zhihu/global_search", "MCP | zhihu/global_search"),
 ];
 
 const PROVIDER_REST_PATH_KINDS: &[(&str, &str)] = &[
@@ -1030,6 +1047,24 @@ const PROVIDER_REST_PATH_KINDS: &[(&str, &str)] = &[
     ("/api/brave/res/v1/web/search", "api:brave/web"),
     ("/api/brave/res/v1/news/search", "api:brave/news"),
     ("/api/brave/res/v1/llm/context", "api:brave/llm-context"),
+    // keenable-integration todo 6: BOTH the registered native paths and the
+    // canonical kind paths classify to the same kind, so the registered
+    // `/v1` (Keenable) and `/api/v1/content` (Zhihu) routes resolve the same
+    // kinds any stored-path surface classifies.
+    ("/api/keenable/v1/search", "api:keenable/search"),
+    ("/api/keenable/search", "api:keenable/search"),
+    ("/api/keenable/v1/fetch", "api:keenable/fetch"),
+    ("/api/keenable/fetch", "api:keenable/fetch"),
+    (
+        "/api/zhihu/api/v1/content/zhihu_search",
+        "api:zhihu/zhihu_search",
+    ),
+    ("/api/zhihu/zhihu_search", "api:zhihu/zhihu_search"),
+    (
+        "/api/zhihu/api/v1/content/global_search",
+        "api:zhihu/global_search",
+    ),
+    ("/api/zhihu/global_search", "api:zhihu/global_search"),
 ];
 
 const PROVIDER_MCP_TOOL_KINDS: &[(ProviderId, &str, &str)] = &[
@@ -1046,6 +1081,24 @@ const PROVIDER_MCP_TOOL_KINDS: &[(ProviderId, &str, &str)] = &[
     (ProviderId::Brave, "brave_web_search", "brave/web_search"),
     (ProviderId::Brave, "brave_news_search", "brave/news_search"),
     (ProviderId::Brave, "brave_llm_context", "brave/llm_context"),
+    // keenable-integration todo 6: the hosted-MCP tool names (todo 8
+    // Keenable passthrough) and the local-facade tool names (todo 10 Zhihu).
+    (
+        ProviderId::Keenable,
+        "search_web_pages",
+        "keenable/search_web_pages",
+    ),
+    (
+        ProviderId::Keenable,
+        "fetch_page_content",
+        "keenable/fetch_page_content",
+    ),
+    (ProviderId::Zhihu, "zhihu_search", "zhihu/zhihu_search"),
+    (
+        ProviderId::Zhihu,
+        "zhihu_global_search",
+        "zhihu/global_search",
+    ),
 ];
 
 fn provider_token_request_kind(canonical_key: &str) -> TokenRequestKind {
@@ -1388,6 +1441,15 @@ pub fn classify_token_request_kind(path: &str, body: Option<&[u8]>) -> TokenRequ
         }
         _ if path.starts_with("/brave/mcp") => {
             classify_provider_mcp_request_kind(ProviderId::Brave, path, body)
+        }
+        // keenable-integration todo 6: the new provider MCP ingresses. The
+        // arm order is safe: neither ingress starts with "/mcp" (the Tavily
+        // arm keeps its pinned literal `/mcp` scope).
+        _ if path.starts_with("/keenable/mcp") => {
+            classify_provider_mcp_request_kind(ProviderId::Keenable, path, body)
+        }
+        _ if path.starts_with("/zhihu/mcp") => {
+            classify_provider_mcp_request_kind(ProviderId::Zhihu, path, body)
         }
         _ => build_api_unknown_path_kind(path),
     }

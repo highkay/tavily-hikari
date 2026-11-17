@@ -76,6 +76,10 @@ export default defineConfig(({ mode }) => {
         '/serpapi': { target: proxyTarget, changeOrigin: true },
         '/exa': { target: proxyTarget, changeOrigin: true },
         '/brave': { target: proxyTarget, changeOrigin: true },
+        // keenable-integration todo 6: the Keenable/Zhihu provider endpoints
+        // (REST facades + MCP ingresses) mirror the same dev proxy.
+        '/keenable': { target: proxyTarget, changeOrigin: true },
+        '/zhihu': { target: proxyTarget, changeOrigin: true },
         '/health': withForwardAuth(proxyTarget, forwardAuthValue),
       },
     },

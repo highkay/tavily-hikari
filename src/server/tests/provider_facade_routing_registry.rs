@@ -22,6 +22,11 @@ use super::*;
             serpapi_keys: vec!["mock-serpapi-key".to_string()],
             exa_keys: vec!["mock-exa-key".to_string()],
             brave_keys: vec!["mock-brave-key".to_string()],
+            keenable_upstream: "http://127.0.0.1:1".to_string(),
+            keenable_mcp_upstream: "http://127.0.0.1:1/mcp".to_string(),
+            zhihu_upstream: "http://127.0.0.1:1".to_string(),
+            keenable_keys: vec!["mock-keenable-key".to_string()],
+            zhihu_keys: vec!["mock-zhihu-key".to_string()],
         };
         let proxy = TavilyProxy::with_providers_in_ha_mode(
             vec!["tvly-mcp-pending".to_string()],

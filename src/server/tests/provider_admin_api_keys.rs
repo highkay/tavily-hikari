@@ -356,6 +356,10 @@ async fn spawn_provider_admin_harness_with(
         serpapi_keys: Vec::new(),
         exa_keys: Vec::new(),
         brave_keys: Vec::new(),
+        // keenable-integration todo 6: no admin-API facade is registered for
+        // either provider here (todo 13 owns it); registry defaults keep the
+        // rows untouched and no probe ever dials them.
+        ..tavily_hikari::ProviderBootstrap::default()
     };
     let proxy = TavilyProxy::with_providers_in_ha_mode(
         Vec::<String>::new(),
