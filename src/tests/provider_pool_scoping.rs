@@ -408,6 +408,86 @@ async fn reset_monthly_recovers_each_provider_by_policy() {
     assert_eq!(serpapi_lease.id, key_id(&store.pool, "srp-c3").await);
 }
 
+/// Zhihu `NaturalDay` recovery (plan keenable-integration todo 2): an
+/// exhausted Zhihu key flips exhausted -> active ONLY once the backend clock
+/// reaches `quota_renews_at` (the next Asia/Shanghai midnight, stored as
+/// epoch seconds by the todo-12 quota sync). A UTC month boundary NEVER
+/// flips a Zhihu key whose daily renewal is still in the future, while a
+/// Keenable (UtcMonth) key in the same pool recovers on the month flip.
+#[tokio::test]
+async fn zhihu_natural_day_recovery_flips_only_at_quota_renews_at() {
+    let db_path = temp_db_path("provider-pool-natural-day");
+    let db_str = db_path.to_string_lossy().to_string();
+    let (backend_time, clock) = BackendTime::manual(utc_ts("2026-11-17T09:30:00Z"));
+    let store = KeyStore::new_with_time(&db_str, backend_time)
+        .await
+        .expect("store");
+
+    let zhihu_keys = ["zh-day-a", "zh-day-later"].map(str::to_string);
+    let keenable_keys = ["ken-month-a"].map(str::to_string);
+    seed_provider_keys(&store, ProviderId::Zhihu, &zhihu_keys).await;
+    seed_provider_keys(&store, ProviderId::Keenable, &keenable_keys).await;
+
+    for secret in ["zh-day-a", "zh-day-later", "ken-month-a"] {
+        assert!(
+            store
+                .mark_quota_exhausted(secret)
+                .await
+                .expect("seed exhausted")
+        );
+    }
+
+    // Next Asia/Shanghai midnight after 2026-11-17T09:30Z is
+    // 2026-11-18T00:00:00+08:00 = 2026-11-17T16:00:00Z. The later key
+    // renews at 2026-12-16T00:00:00+08:00 - AFTER the month boundary below.
+    let next_midnight = utc_ts("2026-11-17T16:00:00Z").timestamp();
+    let later_midnight = utc_ts("2026-12-15T16:00:00Z").timestamp();
+    sqlx::query("UPDATE api_keys SET quota_renews_at = ? WHERE api_key = ?")
+        .bind(next_midnight)
+        .bind("zh-day-a")
+        .execute(&store.pool)
+        .await
+        .expect("seed quota_renews_at (next midnight)");
+    sqlx::query("UPDATE api_keys SET quota_renews_at = ? WHERE api_key = ?")
+        .bind(later_midnight)
+        .bind("zh-day-later")
+        .execute(&store.pool)
+        .await
+        .expect("seed quota_renews_at (after the month boundary)");
+
+    // One second before the daily boundary: NO flip.
+    clock.set_now_utc(utc_ts("2026-11-17T15:59:59Z"));
+    store
+        .reset_monthly(ProviderId::Zhihu)
+        .await
+        .expect("zhihu reset before midnight");
+    assert_eq!(key_status(&store.pool, "zh-day-a").await, "exhausted");
+
+    // At the daily boundary (`<=` boundary): the due key flips, the later
+    // key does not.
+    clock.set_now_utc(utc_ts("2026-11-17T16:00:00Z"));
+    store
+        .reset_monthly(ProviderId::Zhihu)
+        .await
+        .expect("zhihu reset at midnight");
+    assert_eq!(key_status(&store.pool, "zh-day-a").await, "active");
+    assert_eq!(key_status(&store.pool, "zh-day-later").await, "exhausted");
+
+    // A UTC MONTH boundary never flips the not-yet-due Zhihu key (GAP-4),
+    // while the Keenable (UtcMonth) sibling recovers on the same flip.
+    clock.set_now_utc(utc_ts("2026-12-01T00:00:01Z"));
+    store
+        .reset_monthly(ProviderId::Zhihu)
+        .await
+        .expect("zhihu reset at month boundary");
+    assert_eq!(key_status(&store.pool, "zh-day-later").await, "exhausted");
+    store
+        .reset_monthly(ProviderId::Keenable)
+        .await
+        .expect("keenable reset at month boundary");
+    assert_eq!(key_status(&store.pool, "ken-month-a").await, "active");
+}
+
 /// Exa SuccessOnly recovery: exhausted Exa keys cross calendar boundaries
 /// without flipping and recover ONLY through the success-restore path
 /// (`restore_active_status`, wired for every provider via

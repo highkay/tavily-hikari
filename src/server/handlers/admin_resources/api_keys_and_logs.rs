@@ -229,6 +229,7 @@ fn validate_result_provider_echo(
     match provider {
         ProviderId::Tavily => None,
         ProviderId::Serpapi | ProviderId::Exa | ProviderId::Brave => Some(provider),
+        ProviderId::Keenable | ProviderId::Zhihu => Some(provider),
     }
 }
 
@@ -256,6 +257,14 @@ async fn validate_key_for_provider(
         }
         ProviderId::Serpapi | ProviderId::Exa | ProviderId::Brave => {
             validate_provider_probe_key(&probe_client, &proxy, pending).await
+        }
+        // Typed todo-2 boundary (keenable-integration todo 13 replaces it):
+        // the zero-cost probes (Keenable missing-`query` 400-vs-401; Zhihu
+        // free /api/v1/quota) are not wired yet. NEVER an upstream call, never
+        // a billable hit, never a key mark.
+        ProviderId::Keenable | ProviderId::Zhihu => {
+            let provider = pending.provider;
+            provider_probe_result(pending, provider_probe_pending_outcome(provider))
         }
     }
 }
@@ -356,8 +365,31 @@ async fn validate_provider_probe_key(
         ProviderId::Tavily => ProviderProbeOutcome::error(
             "tavily keys use the legacy usage probe path".to_string(),
         ),
+        // Unreachable while `validate_key_for_provider` owns the typed
+        // todo-2 boundary above; kept exhaustive and typed so this seam can
+        // never silently fall through to a provider probe.
+        ProviderId::Keenable | ProviderId::Zhihu => {
+            provider_probe_pending_outcome(pending.provider)
+        }
     };
     provider_probe_result(pending, outcome)
+}
+
+/// Typed todo-2 probe-pending outcome (keenable-integration todo 13
+/// replaces it): validation never targets an upstream for Keenable/Zhihu —
+/// no live call, no billable hit, no key mark — and answers the typed
+/// `probe_pending` result so the admin UI can surface it verbatim.
+fn provider_probe_pending_outcome(
+    provider: tavily_hikari::providers::ProviderId,
+) -> ProviderProbeOutcome {
+    ProviderProbeOutcome {
+        status: "pending",
+        kind: "probe_pending",
+        reason: Some(format!("{provider} key validation probe is not wired yet")),
+        quota_limit: None,
+        quota_remaining: None,
+        detail: None,
+    }
 }
 
 async fn probe_serpapi_account(

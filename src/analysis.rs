@@ -998,6 +998,11 @@ pub(crate) fn provider_mcp_ingress_path(provider: ProviderId) -> &'static str {
         ProviderId::Serpapi => "/serpapi/mcp",
         ProviderId::Exa => "/exa/mcp",
         ProviderId::Brave => "/brave/mcp",
+        // Todo-2 compile-gate arms: todo 6 registers the ingress routes and
+        // their kind classification; the ingress paths are pinned here so the
+        // dispatch boundary and the route table can never drift apart.
+        ProviderId::Keenable => "/keenable/mcp",
+        ProviderId::Zhihu => "/zhihu/mcp",
     }
 }
 

@@ -13,8 +13,8 @@ mod tests;
 
 pub use id::{ProviderId, UnknownProviderId};
 pub use spec::{
-    BRAVE, EXA, EgressPolicy, KeyAuthInjection, McpMode, ProviderSpec, RecoveryPolicy, SERPAPI,
-    TAVILY,
+    BRAVE, EXA, EgressPolicy, KEENABLE, KeyAuthInjection, McpMode, ProviderSpec, RecoveryPolicy,
+    SERPAPI, TAVILY, ZHIHU,
 };
 
 /// Exhaustive registry lookup (plan todo 11): the ONE path from a runtime
@@ -27,5 +27,7 @@ pub fn spec_for(id: ProviderId) -> &'static ProviderSpec {
         ProviderId::Serpapi => &SERPAPI,
         ProviderId::Exa => &EXA,
         ProviderId::Brave => &BRAVE,
+        ProviderId::Keenable => &KEENABLE,
+        ProviderId::Zhihu => &ZHIHU,
     }
 }

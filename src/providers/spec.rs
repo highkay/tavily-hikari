@@ -39,6 +39,10 @@ pub enum RecoveryPolicy {
     /// Exhaustion clears per the month window advertised by `X-RateLimit-Reset`
     /// (Brave passive harvest).
     RateLimitResetWindow,
+    /// Exhaustion clears at `quota_renews_at` — the NEXT Asia/Shanghai
+    /// midnight, stored as epoch seconds — never on a UTC month boundary
+    /// (Zhihu daily quota).
+    NaturalDay,
 }
 
 /// Whether a provider's upstream can be reached through the synthetic
@@ -129,6 +133,22 @@ fn brave_credits(op: &str) -> u32 {
     }
 }
 
+/// Keenable per-op credits: search 1, fetch 1.
+fn keenable_credits(op: &str) -> u32 {
+    match op {
+        "search" | "fetch" => 1,
+        _ => 0,
+    }
+}
+
+/// Zhihu per-op credits: zhihu_search 1, global_search 1.
+fn zhihu_credits(op: &str) -> u32 {
+    match op {
+        "zhihu_search" | "global_search" => 1,
+        _ => 0,
+    }
+}
+
 /// Tavily — mirrors today's constants as METADATA ONLY.
 pub const TAVILY: ProviderSpec = ProviderSpec {
     id: ProviderId::Tavily,
@@ -202,4 +222,43 @@ pub const BRAVE: ProviderSpec = ProviderSpec {
     // Brave is GFW-blocked on the deployment LAN: direct attempts always die
     // as transport errors while masking proxy-node exile (2026-10-22 audit).
     egress: EgressPolicy::ProxyRequired,
+};
+
+/// Keenable — hosted MCP passthrough with `X-API-Key` injection.
+pub const KEENABLE: ProviderSpec = ProviderSpec {
+    id: ProviderId::Keenable,
+    rest_base_default: "https://api.keenable.ai",
+    mcp_upstream_default: Some("https://api.keenable.ai/mcp"),
+    mcp_mode: McpMode::Passthrough,
+    upstream_key_injection: KeyAuthInjection::Header { name: "X-API-Key" },
+    client_auth_query_slot: None,
+    // Client-facing native header slot mirroring the upstream injection.
+    client_auth_header_slot: Some("X-API-Key"),
+    credits: keenable_credits,
+    // Passive harvest of `usage.credits_remaining` from every keyed
+    // response (REST and MCP `_meta`).
+    supports_quota_sync: true,
+    recovery: RecoveryPolicy::UtcMonth,
+    egress: EgressPolicy::DirectAllowed,
+};
+
+/// Zhihu — local MCP facade; the universal Hikari Bearer token is the ONLY
+/// client credential (no native client header slot).
+pub const ZHIHU: ProviderSpec = ProviderSpec {
+    id: ProviderId::Zhihu,
+    rest_base_default: "https://developer.zhihu.com",
+    // Zhihu's official MCP is SSE-only and held a connection open in probing;
+    // a local facade is the supported path, so there is no hosted MCP default.
+    mcp_upstream_default: None,
+    mcp_mode: McpMode::LocalFacade,
+    upstream_key_injection: KeyAuthInjection::Bearer,
+    client_auth_query_slot: None,
+    // The universal Hikari Bearer is the client credential; the Zhihu Access
+    // Secret is upstream-only (Bearer + server-side X-Request-Timestamp).
+    client_auth_header_slot: None,
+    credits: zhihu_credits,
+    // Active read of the free `/api/v1/quota` natural-day quota source.
+    supports_quota_sync: true,
+    recovery: RecoveryPolicy::NaturalDay,
+    egress: EgressPolicy::DirectAllowed,
 };

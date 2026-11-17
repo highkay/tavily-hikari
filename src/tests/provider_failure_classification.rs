@@ -1410,6 +1410,36 @@ fn provider_mcp_ingress_paths_are_pinned() {
     );
     assert_eq!(provider_mcp_ingress_path(ProviderId::Exa), "/exa/mcp");
     assert_eq!(provider_mcp_ingress_path(ProviderId::Brave), "/brave/mcp");
+    // Todo-2 pins (keenable-integration): the ingress paths todo 6 mounts.
+    assert_eq!(
+        provider_mcp_ingress_path(ProviderId::Keenable),
+        "/keenable/mcp"
+    );
+    assert_eq!(provider_mcp_ingress_path(ProviderId::Zhihu), "/zhihu/mcp");
+}
+
+/// Typed todo-2 boundary (keenable-integration plan): until todo 3 lands the
+/// envelope classifiers, both new providers classify through the status
+/// default only — documented boundary behavior, never a silent success arm.
+#[test]
+fn keenable_and_zhihu_classify_through_the_status_default_until_todo_3() {
+    assert_eq!(
+        classify(ProviderId::Keenable, 200, br#"{}"#),
+        ProviderFailureSignal::Ok
+    );
+    assert_eq!(
+        classify(ProviderId::Zhihu, 200, br#"{"Code":20001}"#),
+        ProviderFailureSignal::Ok,
+        "the Code envelope is todo 3's work; todo 2 must not over-classify"
+    );
+    assert_eq!(
+        classify(ProviderId::Keenable, 503, br#"{}"#),
+        ProviderFailureSignal::ServerTransient
+    );
+    assert_eq!(
+        classify(ProviderId::Zhihu, 400, br#"{}"#),
+        ProviderFailureSignal::ClientError
+    );
 }
 
 // ---------------------------------------------------------------------------

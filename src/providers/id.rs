@@ -22,9 +22,10 @@ impl std::error::Error for UnknownProviderId {}
 
 /// Stable identity of every provider this proxy fronts.
 ///
-/// The lowercase keys (`tavily`, `serpapi`, `exa`, `brave`) are the ONE
-/// wire/DB spelling shared by serde, [`fmt::Display`], [`FromStr`], and
-/// [`ProviderId::as_str`] (the SQLTEXT binding helper).
+/// The lowercase keys (`tavily`, `serpapi`, `exa`, `brave`, `keenable`,
+/// `zhihu`) are the ONE wire/DB spelling shared by serde,
+/// [`fmt::Display`], [`FromStr`], and [`ProviderId::as_str`] (the SQLTEXT
+/// binding helper).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderId {
@@ -32,6 +33,8 @@ pub enum ProviderId {
     Serpapi,
     Exa,
     Brave,
+    Keenable,
+    Zhihu,
 }
 
 impl ProviderId {
@@ -43,6 +46,8 @@ impl ProviderId {
             Self::Serpapi => "serpapi",
             Self::Exa => "exa",
             Self::Brave => "brave",
+            Self::Keenable => "keenable",
+            Self::Zhihu => "zhihu",
         }
     }
 
@@ -70,6 +75,8 @@ impl FromStr for ProviderId {
             "serpapi" => Ok(Self::Serpapi),
             "exa" => Ok(Self::Exa),
             "brave" => Ok(Self::Brave),
+            "keenable" => Ok(Self::Keenable),
+            "zhihu" => Ok(Self::Zhihu),
             _ => Err(UnknownProviderId {
                 input: value.to_owned(),
             }),

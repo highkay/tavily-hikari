@@ -352,8 +352,14 @@ impl TavilyProxy {
                             self.record_brave_rest_facade_attempt(&attempt_ctx, &headers)
                                 .await?
                         }
+                        // Keenable/Zhihu (todo-2 compile gate): the generic
+                        // recorder books the attempt row; todos 7/9 replace it
+                        // with their passive-harvest / envelope-aware recorders.
+                        // Unreachable until todo 6 registers their routes.
                         providers::ProviderId::Tavily
-                        | providers::ProviderId::Serpapi => {
+                        | providers::ProviderId::Serpapi
+                        | providers::ProviderId::Keenable
+                        | providers::ProviderId::Zhihu => {
                             self.record_provider_rest_facade_attempt(&attempt_ctx)
                                 .await?
                         }
@@ -446,8 +452,13 @@ impl TavilyProxy {
                             )
                             .await?;
                         }
+                        // Keenable/Zhihu (todo-2 compile gate): the generic
+                        // transport-error logger owns them until todos 7/9 land
+                        // their own record paths (unreachable until todo 6).
                         providers::ProviderId::Tavily
-                        | providers::ProviderId::Serpapi => {
+                        | providers::ProviderId::Serpapi
+                        | providers::ProviderId::Keenable
+                        | providers::ProviderId::Zhihu => {
                             self.log_provider_rest_facade_transport_error(
                                 &request,
                                 &attempt_lease,
@@ -583,6 +594,16 @@ impl TavilyProxy {
             providers::ProviderId::Serpapi => Ok(self.provider_upstreams.serpapi_rest.clone()),
             providers::ProviderId::Exa => Ok(self.provider_upstreams.exa_rest.clone()),
             providers::ProviderId::Brave => Ok(self.provider_upstreams.brave_rest.clone()),
+            // Typed todo-2 boundary (keenable-integration todos 6/7 replace
+            // it): no REST route is registered for either provider yet, so
+            // the resolved base fails loudly instead of letting a facade
+            // call reach a default upstream. Never a silent success.
+            providers::ProviderId::Keenable => Err(ProxyError::Other(
+                "keenable REST facade is not wired yet".to_string(),
+            )),
+            providers::ProviderId::Zhihu => Err(ProxyError::Other(
+                "zhihu REST facade is not wired yet".to_string(),
+            )),
         }
     }
 }
@@ -653,6 +674,10 @@ pub fn provider_rest_upstream_operation(
             "/res/v1/llm/context" => Some("brave_http_llm_context"),
             _ => None,
         },
+        // Typed todo-2 boundary: todo 6 registers the Keenable/Zhihu REST
+        // routes and their operation labels; until then no operation exists,
+        // which no route can ever consult.
+        providers::ProviderId::Keenable | providers::ProviderId::Zhihu => None,
         providers::ProviderId::Tavily => None,
     }
 }
@@ -769,6 +794,12 @@ fn provider_rest_key_injection(
         providers::ProviderId::Exa | providers::ProviderId::Brave => spec.upstream_key_injection,
         // Unreachable: provider_rest_base rejects Tavily before injection.
         providers::ProviderId::Tavily => spec.upstream_key_injection,
+        // Unreachable todo-2 boundary: provider_rest_base rejects both
+        // providers with a typed error before injection (todos 4/6 own the
+        // final REST slot semantics).
+        providers::ProviderId::Keenable | providers::ProviderId::Zhihu => {
+            spec.upstream_key_injection
+        }
     }
 }
 
@@ -783,6 +814,10 @@ fn provider_rest_header_sanitizer(
         providers::ProviderId::Serpapi => Some(sanitize_serpapi_http_headers_inner),
         providers::ProviderId::Exa => Some(sanitize_exa_http_headers_inner),
         providers::ProviderId::Brave => Some(sanitize_brave_http_headers_inner),
+        // Typed todo-2 boundary: todo 4 lands both allowlists. Unreachable
+        // until then — provider_rest_base rejects both providers with a
+        // typed error before any header handling.
+        providers::ProviderId::Keenable | providers::ProviderId::Zhihu => None,
     }
 }
 
