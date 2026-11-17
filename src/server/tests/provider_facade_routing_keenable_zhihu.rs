@@ -1,10 +1,12 @@
 //! Plan keenable-integration todo 6 bin coverage: the Keenable/Zhihu REST
 //! route table, MCP ingress registration, request-kind catalog wiring, and
-//! the config surface. The executor bodies stay the typed todo-2 boundaries
-//! until todos 7-10 land, so the full-server cases pin those boundary
-//! responses (typed 500/501, ZERO upstream calls) instead of pretending a
-//! live facade — never a silent success and never an accidental dial of a
-//! production endpoint.
+//! the config surface. Since todo 7 the Keenable REST routes EXECUTE through
+//! the facade record path, so the full-server case pins their live
+//! stub-upstream behavior (verbatim passthrough + 1 settled credit); the
+//! Keenable MCP ingress and both Zhihu surfaces keep the typed todo-2
+//! boundaries until todos 8-10 land (typed 500/501, ZERO upstream calls) —
+//! never a silent success and never an accidental dial of a production
+//! endpoint.
 
 use super::core_support_and_parsing::{connect_sqlite_test_pool, temp_db_path};
 use super::*;
@@ -507,16 +509,19 @@ async fn keenable_and_zhihu_mcp_ingresses_answer_the_typed_pending_boundary() {
     assert_eq!(upstream_attempt_count(&harness), 0);
 }
 
-/// The four new REST routes are live through the gate stack (auth + quota
-/// gates pass) but the executor stays the typed todo-2 boundary until todos
-/// 7/9 wire the facade record paths: a typed 500 `proxy_error`, ZERO upstream
-/// calls, an error token-log row carrying the new kind, and never a billed
-/// credit.
+/// Through the REAL router, the Keenable REST routes EXECUTE (keenable-integration
+/// todo 7 wired the facade record path): the search request dials the stub
+/// upstream at its native `/v1/search` path and returns the stub body
+/// verbatim with 1 settled credit on the classifier-Ok outcome. The Zhihu
+/// routes keep the typed todo-2 boundary until todo 9 wires their
+/// envelope-aware record path: a typed 500 `proxy_error`, ZERO upstream calls,
+/// an error token-log row carrying the new kind, and never a billed credit.
 #[tokio::test]
-async fn keenable_zhihu_rest_routes_answer_the_typed_executor_boundary() {
+async fn keenable_rest_routes_execute_while_zhihu_keeps_the_typed_boundary() {
     let harness = spawn_keenable_zhihu_harness("keenable-zhihu-rest-boundary").await;
     let client = Client::new();
 
+    // Keenable search: executed end-to-end against the stub upstream.
     let search = client
         .post(format!("http://{}/api/keenable/v1/search", harness.addr))
         .header("authorization", format!("Bearer {}", harness.token))
@@ -525,10 +530,15 @@ async fn keenable_zhihu_rest_routes_answer_the_typed_executor_boundary() {
         .send()
         .await
         .expect("keenable search request");
-    assert_eq!(search.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(search.status(), StatusCode::OK);
     let body: Value = search.json().await.expect("json body");
-    assert_eq!(body.get("error").and_then(Value::as_str), Some("proxy_error"));
+    assert_eq!(
+        body,
+        serde_json::json!({"stub": "ok"}),
+        "the stub body passes through verbatim (no transformation)"
+    );
 
+    // Zhihu: still the typed todo-2 boundary (todo 9 replaces it).
     let zhihu = client
         .get(format!(
             "http://{}/api/zhihu/api/v1/content/zhihu_search?Query=AI&Count=3",
@@ -542,12 +552,16 @@ async fn keenable_zhihu_rest_routes_answer_the_typed_executor_boundary() {
     let body: Value = zhihu.json().await.expect("json body");
     assert_eq!(body.get("error").and_then(Value::as_str), Some("proxy_error"));
 
-    // Zero upstream calls: no facade execution exists before todos 7/9, so
-    // nothing may ever dial the configured upstreams (stub-only rule).
-    assert_eq!(upstream_attempt_count(&harness), 0);
+    // Exactly ONE upstream call: the executing Keenable search dialed the
+    // stub at its native path; the Zhihu boundary never dials anything.
+    {
+        let attempts = harness.upstream_attempts.lock().expect("attempts lock");
+        assert_eq!(&*attempts, &["/v1/search".to_string()], "upstream attempts");
+    }
 
-    // The error token-log rows carry the NEW kinds (misleading-success guard:
-    // the kind surface is asserted, not just the status code).
+    // Token-log rows (misleading-success guard: the kind surface and the
+    // billing outcome are asserted, not just the status codes): the Keenable
+    // success settles 1 credit, the Zhihu boundary stays an unbilled error.
     let pool = connect_sqlite_test_pool(&harness.db_str).await;
     let rows = sqlx::query(
         "SELECT request_kind_key, result_status, business_credits \
@@ -557,19 +571,20 @@ async fn keenable_zhihu_rest_routes_answer_the_typed_executor_boundary() {
     .await
     .expect("token logs");
     let expected = [
-        ("api:keenable/search", "error"),
-        ("api:zhihu/zhihu_search", "error"),
+        ("api:keenable/search", "success", Some(1)),
+        ("api:zhihu/zhihu_search", "error", None),
     ];
-    assert_eq!(rows.len(), expected.len(), "one error row per request");
-    for (row, (kind, status)) in rows.iter().zip(expected) {
+    assert_eq!(rows.len(), expected.len(), "one row per request");
+    for (row, (kind, status, credits)) in rows.iter().zip(expected) {
         assert_eq!(
             row.get::<Option<String>, _>("request_kind_key").as_deref(),
             Some(kind)
         );
         assert_eq!(row.get::<String, _>("result_status"), status);
-        assert!(
-            !matches!(row.get::<Option<i64>, _>("business_credits"), Some(n) if n > 0),
-            "the boundary never bills a credit"
+        assert_eq!(
+            row.get::<Option<i64>, _>("business_credits"),
+            credits,
+            "{kind} credit settlement"
         );
     }
     pool.close().await;

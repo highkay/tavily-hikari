@@ -24,6 +24,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 const KEY_GOOD: &str = "key-good";
+/// Scripted partial arm (keenable-integration todo 7 adversarial): a 200
+/// whose body carries NO `usage` object — the facade must still treat it as
+/// business success (the SPEC allows `usage` to be absent) while the
+/// passive credit harvest skips it cleanly.
+const KEY_PARTIAL: &str = "key-partial";
 const KEY_EXHAUSTED: &str = "key-exhausted";
 const KEY_AUTH: &str = "key-auth";
 const KEY_RATE: &str = "key-rate";
@@ -61,6 +66,7 @@ struct Cli {
 #[derive(Debug, PartialEq, Eq)]
 enum KeyStatus {
     Valid,
+    Partial,
     Exhausted,
     Invalid,
     RateLimited,
@@ -112,6 +118,7 @@ impl MockState {
     fn classify(&self, key: &str) -> KeyStatus {
         match key {
             KEY_GOOD => KeyStatus::Valid,
+            KEY_PARTIAL => KeyStatus::Partial,
             KEY_EXHAUSTED => KeyStatus::Exhausted,
             KEY_AUTH => KeyStatus::Invalid,
             KEY_RATE => KeyStatus::RateLimited,
@@ -279,6 +286,17 @@ async fn authorize(state: &MockState, headers: &HeaderMap) -> Option<Response> {
     }
     match state.classify(&key) {
         KeyStatus::Valid => None,
+        KeyStatus::Partial => Some(
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "query": "partial",
+                    "results": [],
+                    "partial": true
+                })),
+            )
+                .into_response(),
+        ),
         KeyStatus::Slow => {
             state.counters.slow_requests.fetch_add(1, Ordering::Relaxed);
             tokio::time::sleep(Duration::from_millis(state.slow_delay_ms)).await;

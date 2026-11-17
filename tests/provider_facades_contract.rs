@@ -2669,3 +2669,826 @@ mod brave {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Keenable REST facade section (keenable-integration todo 7).
+// ---------------------------------------------------------------------------
+
+mod keenable {
+    use super::*;
+
+    /// Exact bodies mock_keenable emits (mirrors src/bin/mock_keenable.rs so
+    /// the verbatim-passthrough assertions compare against the stub's
+    /// contract). Every harness spawns a FRESH mock, so the first successful
+    /// call on a mock bills its starting 100_000 credits down to 99_999.
+    fn mock_search_body(credits: i64) -> Value {
+        json!({
+            "query": "mock rust",
+            "mode": "pro",
+            "results": [
+                {
+                    "title": "Mock Keenable Result",
+                    "url": "https://example.com/1",
+                    "description": "mock description",
+                    "snippet": "mock snippet",
+                    "published_at": "2026-01-01"
+                }
+            ],
+            "usage": {
+                "sku": "search",
+                "amount": 1,
+                "credits": 1,
+                "paid": false,
+                "credits_remaining": credits
+            }
+        })
+    }
+
+    fn mock_fetch_body(credits: i64) -> Value {
+        json!({
+            "url": "https://example.com/page",
+            "title": "Mock Page",
+            "content": "mock page content",
+            "description": "",
+            "truncated": false,
+            // The mock derives this from content.len(): "mock page content" = 17.
+            "total_chars": 17,
+            "usage": {
+                "sku": "fetch",
+                "amount": 1,
+                "credits": 1,
+                "paid": false,
+                "credits_remaining": credits
+            }
+        })
+    }
+
+    fn mock_insufficient_credits_body() -> Value {
+        json!({
+            "error": "Insufficient credits",
+            "type": "billing_error",
+            "code": "insufficient_credits",
+            "message": "This month's free requests and purchased credits are used up.",
+            "request_id": "mock-request-id",
+            "retryable": false,
+            "billing_url": "https://example.invalid/billing",
+            "auto_top_up_url": "https://example.invalid/auto-top-up"
+        })
+    }
+
+    fn mock_target_blocked_body() -> Value {
+        json!({
+            "error": "Upstream forbidden",
+            "type": "target_error",
+            "code": "target_blocked",
+            "message": "The target site refused the fetcher, for example with a bot check.",
+            "request_id": "mock-request-id",
+            "retryable": false
+        })
+    }
+
+    fn mock_rate_limited_body() -> Value {
+        json!({
+            "error": "Rate limit exceeded",
+            "type": "rate_limit_error",
+            "code": "rate_limit_per_second",
+            "message": "Too many requests; your organization is limited to 10 requests per second.",
+            "request_id": "mock-request-id",
+            "retryable": true,
+            "retry_after_seconds": 1,
+            "retryAfter": 1
+        })
+    }
+
+    fn mock_invalid_key_body() -> Value {
+        json!({
+            "error": "Authentication failed",
+            "type": "authentication_error",
+            "code": "invalid_api_key",
+            "message": "Invalid API key",
+            "request_id": "mock-request-id",
+            "retryable": false
+        })
+    }
+
+    /// The key-partial scripted arm: a 200 with NO usage object (todo-7
+    /// adversarial — SPEC: usage may be absent).
+    fn mock_partial_body() -> Value {
+        json!({ "query": "partial", "results": [], "partial": true })
+    }
+
+    const SEARCH_PATH: &str = "/api/keenable/v1/search";
+    const FETCH_PATH: &str = "/api/keenable/v1/fetch";
+
+    struct KeenableHarness {
+        base_url: String,
+        mock_base_url: String,
+        token: String,
+        token_id: String,
+        db_path: PathBuf,
+        db_str: String,
+        _server: ChildGuard,
+        _mock: ChildGuard,
+    }
+
+    impl Drop for KeenableHarness {
+        fn drop(&mut self) {
+            remove_sqlite_files(&self.db_path);
+        }
+    }
+
+    /// Spawn mock_keenable + the real server binary (stub upstreams ONLY;
+    /// every other provider upstream points at a dead local port so
+    /// production endpoints are unreachable by construction).
+    async fn spawn_harness(
+        prefix: &str,
+        pool_keys: &[&str],
+        mock_keys: &[&str],
+    ) -> KeenableHarness {
+        for attempt in 1..=5usize {
+            if let Some(harness) = try_spawn_harness(prefix, pool_keys, mock_keys).await {
+                return harness;
+            }
+            if attempt < 5 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+        panic!("keenable harness never became healthy after 5 spawn attempts");
+    }
+
+    async fn try_spawn_harness(
+        prefix: &str,
+        pool_keys: &[&str],
+        mock_keys: &[&str],
+    ) -> Option<KeenableHarness> {
+        let mock_port = reserve_local_port();
+        let mock = Command::new(support_binaries::mock_keenable_binary())
+            .arg("--bind")
+            .arg(format!("127.0.0.1:{mock_port}"))
+            .arg("--keys")
+            .arg(mock_keys.join(","))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn mock_keenable");
+
+        let port = reserve_local_port();
+        let db_path = temp_db_path(prefix);
+        let db_str = db_path.to_string_lossy().to_string();
+        let dead_port = reserve_local_port();
+        let server = Command::new(support_binaries::resolve_support_binary(
+            "TAVILY_HIKARI_TEST_BIN",
+            env!("CARGO_BIN_EXE_tavily-hikari"),
+        ))
+        .env("TAVILY_API_KEYS", "tvly-facade-contract-key")
+        .env(
+            "TAVILY_UPSTREAM",
+            format!("http://127.0.0.1:{dead_port}/mcp"),
+        )
+        .env("TAVILY_USAGE_BASE", format!("http://127.0.0.1:{dead_port}"))
+        .env("KEENABLE_UPSTREAM", format!("http://127.0.0.1:{mock_port}"))
+        .env(
+            "KEENABLE_MCP_UPSTREAM",
+            format!("http://127.0.0.1:{dead_port}/mcp"),
+        )
+        .env("KEENABLE_API_KEYS", pool_keys.join(","))
+        .env("SERPAPI_UPSTREAM", format!("http://127.0.0.1:{dead_port}"))
+        .env(
+            "SERPAPI_MCP_UPSTREAM",
+            format!("http://127.0.0.1:{dead_port}/mcp"),
+        )
+        .env("EXA_UPSTREAM", format!("http://127.0.0.1:{dead_port}"))
+        .env("BRAVE_UPSTREAM", format!("http://127.0.0.1:{dead_port}"))
+        .env("ZHIHU_UPSTREAM", format!("http://127.0.0.1:{dead_port}"))
+        .env("PROXY_BIND", "127.0.0.1")
+        .env("PROXY_PORT", port.to_string())
+        .env("PROXY_DB_PATH", &db_str)
+        .env("DEV_OPEN_ADMIN", "true")
+        .env("RUST_LOG", "warn,tavily_hikari=info,sqlx::query=error")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn tavily-hikari");
+
+        if !health_ready_within(port, 25).await {
+            drop(ChildGuard { child: server });
+            drop(ChildGuard { child: mock });
+            remove_sqlite_files(&db_path);
+            return None;
+        }
+        wait_for_provider_keys(&db_str, "keenable", i64::try_from(pool_keys.len()).unwrap()).await;
+        let base_url = format!("http://127.0.0.1:{port}");
+        let mock_base_url = format!("http://127.0.0.1:{mock_port}");
+        let (token, token_id) = create_test_token(&base_url).await;
+
+        Some(KeenableHarness {
+            base_url,
+            mock_base_url,
+            token,
+            token_id,
+            db_path,
+            db_str,
+            _server: ChildGuard { child: server },
+            _mock: ChildGuard { child: mock },
+        })
+    }
+
+    impl KeenableHarness {
+        async fn pool(&self) -> sqlx::SqlitePool {
+            connect_sqlite_test_pool(&self.db_str).await
+        }
+
+        /// POST one Keenable search with the harness Bearer token.
+        async fn post_search(
+            &self,
+            body: &Value,
+        ) -> (reqwest::StatusCode, reqwest::header::HeaderMap, Value) {
+            self.post_search_with_token(&self.token, body).await
+        }
+
+        /// POST one Keenable search authenticating through the NATIVE client
+        /// slot (X-API-Key carries the th- token): proves the executor
+        /// replaces the client credential with the pooled key.
+        async fn post_search_with_token(
+            &self,
+            token: &str,
+            body: &Value,
+        ) -> (reqwest::StatusCode, reqwest::header::HeaderMap, Value) {
+            let response = Client::new()
+                .post(format!("{}{SEARCH_PATH}", self.base_url))
+                .header("x-api-key", token)
+                .json(body)
+                .send()
+                .await
+                .expect("keenable search request");
+            let status = response.status();
+            let headers = response.headers().clone();
+            (status, headers, response.json().await.expect("json body"))
+        }
+
+        /// GET one Keenable fetch with the harness Bearer token.
+        async fn get_fetch(
+            &self,
+            query: &str,
+        ) -> (reqwest::StatusCode, reqwest::header::HeaderMap, Value) {
+            let response = Client::new()
+                .get(format!("{}{FETCH_PATH}?{query}", self.base_url))
+                .bearer_auth(&self.token)
+                .send()
+                .await
+                .expect("keenable fetch request");
+            let status = response.status();
+            let headers = response.headers().clone();
+            (status, headers, response.json().await.expect("json body"))
+        }
+
+        async fn mock_metrics(&self) -> Value {
+            Client::new()
+                .get(format!("{}/metrics", self.mock_base_url))
+                .send()
+                .await
+                .expect("mock metrics request")
+                .json::<Value>()
+                .await
+                .expect("mock metrics body")
+        }
+
+        async fn mock_last_bodies(&self) -> Value {
+            Client::new()
+                .get(format!("{}/last-bodies", self.mock_base_url))
+                .send()
+                .await
+                .expect("mock last-bodies request")
+                .json::<Value>()
+                .await
+                .expect("mock last-bodies body")
+        }
+
+        /// The live api_keys quota view for one keenable key: (quota_limit,
+        /// quota_remaining, quota_renews_at, quota_synced_at).
+        async fn key_quota(
+            &self,
+            api_key: &str,
+        ) -> (Option<i64>, Option<i64>, Option<i64>, Option<i64>) {
+            let pool = self.pool().await;
+            let row = sqlx::query(
+                "SELECT quota_limit, quota_remaining, quota_renews_at, quota_synced_at                  FROM api_keys WHERE api_key = ? AND provider = 'keenable'",
+            )
+            .bind(api_key)
+            .fetch_one(&pool)
+            .await
+            .expect("keenable key row");
+            let out = (
+                row.get::<Option<i64>, _>("quota_limit"),
+                row.get::<Option<i64>, _>("quota_remaining"),
+                row.get::<Option<i64>, _>("quota_renews_at"),
+                row.get::<Option<i64>, _>("quota_synced_at"),
+            );
+            pool.close().await;
+            out
+        }
+
+        async fn keenable_passive_sample_count(&self) -> i64 {
+            let pool = self.pool().await;
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM api_key_quota_sync_samples s                  JOIN api_keys k ON k.id = s.key_id                  WHERE k.provider = 'keenable' AND s.source = 'keenable_passive'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("sample count");
+            pool.close().await;
+            count
+        }
+
+        async fn charged_credits(&self, token_id: &str) -> i64 {
+            let pool = self.pool().await;
+            let credits: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(SUM(business_credits), 0) FROM billing_ledger                  WHERE token_id = ? AND billing_state = 'charged'",
+            )
+            .bind(token_id)
+            .fetch_one(&pool)
+            .await
+            .expect("ledger scan");
+            pool.close().await;
+            credits
+        }
+
+        async fn keenable_depletion_count(&self) -> i64 {
+            let pool = self.pool().await;
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM api_key_low_quota_depletions d                  JOIN api_keys k ON k.id = d.key_id WHERE k.provider = 'keenable'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("depletion scan");
+            pool.close().await;
+            count
+        }
+
+        /// The latest keenable-stamped request_logs row, decoded.
+        async fn latest_request_log_row(
+            &self,
+        ) -> (
+            String,
+            String,
+            Option<i64>,
+            Option<i64>,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) {
+            let pool = self.pool().await;
+            let row = sqlx::query(
+                "SELECT method, path, status_code, tavily_status_code, result_status,                         request_kind_key, upstream_operation,                         CAST(request_body AS TEXT) AS request_body_text,                         CAST(response_body AS TEXT) AS response_body_text                  FROM observability.request_logs WHERE provider = 'keenable'                  ORDER BY id DESC LIMIT 1",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("keenable request log row");
+            let out = (
+                row.get::<String, _>("method"),
+                row.get::<String, _>("path"),
+                row.get::<Option<i64>, _>("status_code"),
+                row.get::<Option<i64>, _>("tavily_status_code"),
+                row.get::<String, _>("result_status"),
+                row.get::<Option<String>, _>("request_kind_key"),
+                row.get::<Option<String>, _>("upstream_operation"),
+                row.get::<Option<String>, _>("request_body_text"),
+                row.get::<Option<String>, _>("response_body_text"),
+            );
+            pool.close().await;
+            out
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Acceptance tests (keenable-integration todo 7; one named test per
+    // criterion).
+    // -----------------------------------------------------------------------
+
+    /// Happy search passthrough: field-identical body, the POOLED key
+    /// reaches the upstream X-API-Key slot (never the client th- token), the
+    /// client native X-API-Key slot is stripped, 1 credit settled, the
+    /// provider-stamped request_logs row keys on the canonical kind path, and
+    /// the passive harvest persists credits_remaining with quota_limit NULL.
+    #[tokio::test]
+    async fn keenable_search_happy_passthrough_bills_one_credit_and_harvests_credits() {
+        let harness = spawn_harness("facades-keenable-happy", &["ke-pool-1"], &["ke-pool-1"]).await;
+
+        let body = json!({
+            "query": "mock rust",
+            "mode": "pro",
+            "max_results": 5,
+            "site": "example.com"
+        });
+        let (status, _headers, response_body) = harness.post_search(&body).await;
+        assert_eq!(status, reqwest::StatusCode::OK);
+        // Field-identical to the mock response (verbatim passthrough, no
+        // transformation beyond redaction).
+        assert_eq!(response_body, mock_search_body(99_999));
+
+        // The upstream saw the POOLED key in X-API-Key — never the client
+        // th- token — and exactly one search request.
+        let metrics = harness.mock_metrics().await;
+        assert_eq!(metrics["last_api_key"], json!("ke-pool-1"));
+        assert_eq!(metrics["search"], json!(1));
+
+        // The POST body forwarded byte-for-byte (modulo JSON representation):
+        // the mock's last recorded search body equals the client body.
+        let last_bodies = harness.mock_last_bodies().await;
+        assert_eq!(last_bodies["search"], body);
+
+        // request_logs row: provider stamp, canonical kind path, POST method,
+        // upstream status in the legacy tavily_status_code column, operation.
+        let (
+            method,
+            path,
+            status_code,
+            tavily_status_code,
+            result_status,
+            kind_key,
+            operation,
+            request_body_text,
+            _response_text,
+        ) = harness.latest_request_log_row().await;
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/api/keenable/search");
+        assert_eq!(status_code, Some(200));
+        assert_eq!(tavily_status_code, Some(200));
+        assert_eq!(result_status, "success");
+        assert_eq!(kind_key.as_deref(), Some("api:keenable/search"));
+        assert_eq!(operation.as_deref(), Some("keenable_http_search"));
+
+        // The persisted body carries the query fields but NEVER the pooled
+        // key nor the th- token.
+        let request_body_text = request_body_text.expect("persisted request body");
+        assert!(request_body_text.contains("mock rust"));
+        assert!(!request_body_text.contains("ke-pool-1"));
+        assert!(!request_body_text.contains(&harness.token));
+
+        // Billing: exactly 1 credit settled.
+        assert_eq!(harness.charged_credits(&harness.token_id).await, 1);
+
+        // Passive harvest: credits_remaining persisted on the key, quota_limit
+        // stays NULL, quota_renews_at untouched, one keenable_passive sample.
+        let (quota_limit, quota_remaining, quota_renews_at, quota_synced_at) =
+            harness.key_quota("ke-pool-1").await;
+        assert_eq!(quota_remaining, Some(99_999));
+        assert_eq!(quota_limit, None, "a prepaid balance has no plan limit");
+        assert_eq!(
+            quota_renews_at, None,
+            "no calendar reset on a passive sample"
+        );
+        assert!(quota_synced_at.is_some());
+        assert_eq!(harness.keenable_passive_sample_count().await, 1);
+        assert_eq!(harness.keenable_depletion_count().await, 0);
+    }
+
+    /// Happy fetch passthrough: the GET query string forwards UNCHANGED, the
+    /// native fetch body returns verbatim, 1 credit settled, and the fetch
+    /// kind/operation land on the request_logs row.
+    #[tokio::test]
+    async fn keenable_fetch_happy_passthrough_bills_one_credit_and_keeps_the_query() {
+        let harness = spawn_harness("facades-keenable-fetch", &["ke-pool-1"], &["ke-pool-1"]).await;
+
+        let query = "url=https%3A%2F%2Fexample.com%2Fpage&max_chars=500&live=true";
+        let (status, _headers, body) = harness.get_fetch(query).await;
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(body, mock_fetch_body(99_999));
+
+        // The query string arrived at the upstream unchanged.
+        let last_bodies = harness.mock_last_bodies().await;
+        assert_eq!(last_bodies["fetch"], json!(query));
+        let metrics = harness.mock_metrics().await;
+        assert_eq!(metrics["fetch"], json!(1));
+
+        let (
+            method,
+            path,
+            status_code,
+            tavily_status_code,
+            result_status,
+            kind_key,
+            operation,
+            _request_body_text,
+            _response_text,
+        ) = harness.latest_request_log_row().await;
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/api/keenable/fetch");
+        assert_eq!(status_code, Some(200));
+        assert_eq!(tavily_status_code, Some(200));
+        assert_eq!(result_status, "success");
+        assert_eq!(kind_key.as_deref(), Some("api:keenable/fetch"));
+        assert_eq!(operation.as_deref(), Some("keenable_http_fetch"));
+
+        assert_eq!(harness.charged_credits(&harness.token_id).await, 1);
+
+        let (quota_limit, quota_remaining, _quota_renews_at, quota_synced_at) =
+            harness.key_quota("ke-pool-1").await;
+        assert_eq!(quota_remaining, Some(99_999));
+        assert_eq!(quota_limit, None);
+        assert!(quota_synced_at.is_some());
+        assert_eq!(harness.keenable_passive_sample_count().await, 1);
+    }
+
+    /// 402 insufficient_credits marks the leased key exhausted, the bounded
+    /// cross-key retry replays on the second key, the client sees the retry's
+    /// 200 body, and exactly ONE settlement bills (the 402 attempt bills
+    /// nothing).
+    #[tokio::test]
+    async fn keenable_402_marks_exhausted_and_retries_on_the_second_key() {
+        let harness = spawn_harness(
+            "facades-keenable-402",
+            &["key-exhausted", "ke-good-2"],
+            &["ke-good-2"],
+        )
+        .await;
+
+        // Drive the LRU deterministically (serpapi/brave pattern): fresh
+        // tokens land on the untouched special key within a few leases. The
+        // 402 is absorbed in-request, so that lease is detected off the
+        // attempt rows. The mock's credit counter is global per harness and
+        // only client-visible SUCCESSES bill it (a 402 attempt never
+        // reaches the success body), so tracking the expected balance here
+        // keeps the body assertions exact for any lease order.
+        let mut expected_credits: i64 = 99_999;
+        let mut quota_token: Option<(String, String)> = None;
+        for _ in 0..3 {
+            let (token, token_id) = create_test_token(&harness.base_url).await;
+            let (status, _headers, body) = harness
+                .post_search_with_token(&token, &json!({ "query": "mock rust" }))
+                .await;
+            assert_eq!(
+                status,
+                reqwest::StatusCode::OK,
+                "an eligible pool absorbs the keenable 402"
+            );
+            assert_eq!(
+                body,
+                mock_search_body(expected_credits),
+                "the client sees the retry's bytes"
+            );
+            let pool = harness.pool().await;
+            let leased_special_key = chain_reached_status(&pool, &token_id, 402).await;
+            pool.close().await;
+            if leased_special_key {
+                quota_token = Some((token, token_id));
+                expected_credits -= 1;
+                break;
+            }
+            expected_credits -= 1;
+        }
+        let Some((quota_token, quota_token_id)) = quota_token else {
+            panic!("keenable 402 never leased while the special key is pooled");
+        };
+
+        let pool = harness.pool().await;
+        let exhausted_status: String =
+            sqlx::query_scalar("SELECT status FROM api_keys WHERE api_key = 'key-exhausted'")
+                .fetch_one(&pool)
+                .await
+                .expect("exhausted key row");
+        assert_eq!(exhausted_status, "exhausted");
+
+        let chain = facade_chain_rows(&pool, &quota_token_id).await;
+        assert_eq!(
+            chain.len(),
+            2,
+            "one request_logs row per attempt: {chain:?}"
+        );
+        assert_eq!(chain[0].api_key.as_deref(), Some("key-exhausted"));
+        assert_eq!(chain[0].status_code, Some(402));
+        assert_eq!(chain[0].result_status, "quota_exhausted");
+        assert_eq!(chain[0].key_effect_code, "marked_exhausted");
+        assert!(chain[0].failure_kind.is_none());
+        assert_eq!(chain[0].tavily_status_code, Some(402));
+        assert_eq!(
+            chain[0].fallback_reason.as_deref(),
+            Some("upstream_key_retry:attempted")
+        );
+        assert_eq!(
+            persisted_response_json(&chain[0]),
+            mock_insufficient_credits_body(),
+            "the loser row persists the 402 body verbatim"
+        );
+        assert_eq!(chain[1].api_key.as_deref(), Some("ke-good-2"));
+        assert_eq!(chain[1].status_code, Some(200));
+        assert_eq!(chain[1].result_status, "success");
+        assert_eq!(
+            chain[1].fallback_reason.as_deref(),
+            Some("upstream_key_retry:succeeded")
+        );
+
+        // ONE settlement for one logical request: the 402 attempt bills
+        // nothing, the retry bills once.
+        let charged: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM billing_ledger WHERE token_id = ? AND billing_state = 'charged'",
+        )
+        .bind(&quota_token_id)
+        .fetch_one(&pool)
+        .await
+        .expect("ledger scan");
+        assert_eq!(charged, 1);
+        pool.close().await;
+
+        // The passive harvest persisted on the surviving key (balance from the
+        // LAST success it served).
+        let (quota_limit, quota_remaining_pre, _renews_at, _synced_at) =
+            harness.key_quota("ke-good-2").await;
+        assert_eq!(quota_remaining_pre, Some(expected_credits + 1));
+        assert_eq!(quota_limit, None);
+        assert!(harness.keenable_passive_sample_count().await >= 1);
+        assert_eq!(harness.keenable_depletion_count().await, 0);
+
+        // Next request on the SAME token rebinds off the exhausted key.
+        let (status2, _headers2, body2) = harness
+            .post_search_with_token(&quota_token, &json!({ "query": "mock rust" }))
+            .await;
+        assert_eq!(status2, reqwest::StatusCode::OK);
+        assert_eq!(body2, mock_search_body(expected_credits));
+
+        // The final success refreshed the harvested balance one last time.
+        let (_quota_limit, quota_remaining, _renews_at2, _synced_at2) =
+            harness.key_quota("ke-good-2").await;
+        assert_eq!(quota_remaining, Some(expected_credits));
+    }
+
+    /// 403 target_blocked is a CLIENT error: verbatim 403 passthrough, the
+    /// key stays active, no key effect, no backoff, nothing billed.
+    #[tokio::test]
+    async fn keenable_403_target_blocked_is_a_client_error_and_never_marks_the_key() {
+        let harness = spawn_harness("facades-keenable-403", &["key-target"], &["ke-x"]).await;
+
+        let (status, _headers, body) = harness
+            .get_fetch("url=https%3A%2F%2Fexample.com%2Fblocked")
+            .await;
+        assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+        assert_eq!(body, mock_target_blocked_body(), "403 body verbatim");
+
+        let pool = harness.pool().await;
+        let key_status: String =
+            sqlx::query_scalar("SELECT status FROM api_keys WHERE api_key = 'key-target'")
+                .fetch_one(&pool)
+                .await
+                .expect("target key row");
+        assert_eq!(
+            key_status, "active",
+            "target_blocked must never mark the key"
+        );
+
+        let chain = facade_chain_rows(&pool, &harness.token_id).await;
+        assert_eq!(chain.len(), 1, "single attempt: {chain:?}");
+        assert_eq!(chain[0].status_code, Some(403));
+        assert_eq!(chain[0].result_status, "error");
+        assert_eq!(chain[0].key_effect_code, "none");
+        assert_eq!(chain[0].failure_kind.as_deref(), Some("other"));
+        assert_eq!(chain[0].tavily_status_code, Some(403));
+
+        let backoff: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM api_key_transient_backoffs b              JOIN api_keys k ON k.id = b.key_id WHERE k.api_key = 'key-target'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("backoff scan");
+        assert_eq!(backoff, 0, "a client error arms no backoff");
+        pool.close().await;
+
+        assert_eq!(harness.charged_credits(&harness.token_id).await, 0);
+        assert_eq!(harness.keenable_passive_sample_count().await, 0);
+    }
+
+    /// 429 rate_limit_error passes through verbatim with its Retry-After
+    /// header, arms the shared HTTP backoff scope (the parsed 1s Retry-After
+    /// climbs to the shared 30s ladder floor), the key stays active, and
+    /// nothing bills.
+    #[tokio::test]
+    async fn keenable_429_arms_the_shared_backoff_without_billing() {
+        let harness = spawn_harness("facades-keenable-429", &["key-rate"], &["ke-x"]).await;
+
+        let (status, headers, body) = harness.post_search(&json!({ "query": "mock rust" })).await;
+        assert_eq!(status, reqwest::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body, mock_rate_limited_body(), "429 body verbatim");
+        assert_eq!(
+            headers.get("retry-after").and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+
+        let pool = harness.pool().await;
+        let key_status: String =
+            sqlx::query_scalar("SELECT status FROM api_keys WHERE api_key = 'key-rate'")
+                .fetch_one(&pool)
+                .await
+                .expect("rate key row");
+        assert_eq!(key_status, "active");
+
+        let chain = facade_chain_rows(&pool, &harness.token_id).await;
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].status_code, Some(429));
+        assert_eq!(chain[0].result_status, "error");
+        assert_eq!(chain[0].key_effect_code, "transient_backoff_set");
+        assert_eq!(
+            chain[0].failure_kind.as_deref(),
+            Some("upstream_rate_limited_429")
+        );
+        assert_eq!(chain[0].tavily_status_code, Some(429));
+
+        let backoff = sqlx::query(
+            "SELECT b.retry_after_secs FROM api_key_transient_backoffs b               JOIN api_keys k ON k.id = b.key_id               WHERE k.api_key = 'key-rate' AND b.scope = 'http_global'               AND b.reason_code = 'upstream_rate_limited_429'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("backoff row");
+        assert_eq!(
+            backoff.get::<i64, _>("retry_after_secs"),
+            30,
+            "the generic lane clamps the 1s Retry-After to the 30s ladder floor"
+        );
+        pool.close().await;
+
+        assert_eq!(harness.charged_credits(&harness.token_id).await, 0);
+        assert_eq!(harness.keenable_passive_sample_count().await, 0);
+    }
+
+    /// 401 authentication_error quarantines the pooled key through the
+    /// existing machinery and bills nothing.
+    #[tokio::test]
+    async fn keenable_401_quarantines_without_billing() {
+        let harness = spawn_harness("facades-keenable-401", &["key-auth"], &["ke-x"]).await;
+
+        let (status, _headers, body) = harness.post_search(&json!({ "query": "mock rust" })).await;
+        assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(body, mock_invalid_key_body(), "401 body verbatim");
+
+        let pool = harness.pool().await;
+        let chain = facade_chain_rows(&pool, &harness.token_id).await;
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].status_code, Some(401));
+        assert_eq!(chain[0].result_status, "error");
+        assert_eq!(chain[0].key_effect_code, "quarantined");
+        assert_eq!(
+            chain[0].failure_kind.as_deref(),
+            Some("upstream_account_deactivated_401")
+        );
+
+        let quarantined: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM api_key_quarantines q              JOIN api_keys k ON k.id = q.key_id              WHERE k.api_key = 'key-auth' AND q.cleared_at IS NULL              AND q.reason_code = 'invalid_api_key'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("quarantine scan");
+        assert_eq!(quarantined, 1, "401 must quarantine the pooled key");
+        pool.close().await;
+
+        assert_eq!(harness.charged_credits(&harness.token_id).await, 0);
+    }
+
+    /// ADVERSARIAL (todo 7): a partial 200 with NO usage object is still
+    /// business success (the classifier sees no error type → 2xx → Ok, and
+    /// the SPEC allows usage to be absent), so 1 credit settles — but the
+    /// passive harvest skips cleanly: no sample row, the key's stored
+    /// quota stays NULL.
+    #[tokio::test]
+    async fn keenable_partial_success_without_usage_bills_but_skips_the_harvest() {
+        let harness = spawn_harness("facades-keenable-partial", &["key-partial"], &["ke-x"]).await;
+
+        let (status, _headers, body) = harness.post_search(&json!({ "query": "mock rust" })).await;
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(
+            body,
+            mock_partial_body(),
+            "the partial body passes through verbatim"
+        );
+
+        // Business success: 1 credit settled on a 200 without usage.
+        assert_eq!(harness.charged_credits(&harness.token_id).await, 1);
+
+        let (
+            method,
+            _path,
+            status_code,
+            tavily_status_code,
+            result_status,
+            kind_key,
+            _operation,
+            _request_body,
+            _response_body,
+        ) = harness.latest_request_log_row().await;
+        assert_eq!(method, "POST");
+        assert_eq!(status_code, Some(200));
+        assert_eq!(tavily_status_code, Some(200));
+        assert_eq!(result_status, "success");
+        assert_eq!(kind_key.as_deref(), Some("api:keenable/search"));
+
+        // No harvest: no usage object, no sample, quota untouched.
+        let (quota_limit, quota_remaining, _renews_at, synced_at) =
+            harness.key_quota("key-partial").await;
+        assert_eq!(
+            quota_remaining, None,
+            "no balance advertised, nothing stored"
+        );
+        assert_eq!(quota_limit, None);
+        assert_eq!(synced_at, None);
+        assert_eq!(harness.keenable_passive_sample_count().await, 0);
+    }
+}

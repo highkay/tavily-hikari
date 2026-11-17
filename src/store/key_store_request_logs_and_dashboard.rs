@@ -2256,6 +2256,62 @@ impl KeyStore {
         Ok(())
     }
 
+    /// Keenable passive quota sample (keenable-integration todo 7): a prepaid
+    /// credit balance with NO plan limit. Contract (plan todo 7): the live
+    /// `api_keys` row keeps `quota_limit` NULL (there is no plan limit to
+    /// advertise) and `quota_renews_at` is never touched (the balance has no
+    /// calendar reset; monthly free-allowance recovery is todo 11's
+    /// `reset_monthly` lane, not this sample).
+    ///
+    /// Seam limitation (documented, not widened — mirrors the Brave M11 rule):
+    /// `api_key_quota_sync_samples.quota_limit` is NOT NULL and the M11 seam
+    /// (`record_quota_sync_sample`) binds `limit: i64`, so a NULL limit is
+    /// inexpressible in the audit table without a forbidden schema migration
+    /// (pinned by `fu_b_quota_sample_seam_cannot_express_null_limit`). The
+    /// audit row therefore records the sentinel `quota_limit = 0` ("no plan
+    /// limit tracked"; a 0 contributes nothing to the dashboard's limit sums),
+    /// while the LIVE `api_keys` row this seam writes keeps `quota_limit`
+    /// NULL exactly as the todo-7 contract requires.
+    pub(crate) async fn record_quota_sync_sample_without_limit(
+        &self,
+        key_id: &str,
+        remaining: i64,
+        synced_at: i64,
+        source: &str,
+    ) -> Result<(), ProxyError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            r#"
+            INSERT INTO api_key_quota_sync_samples (
+                key_id,
+                quota_limit,
+                quota_remaining,
+                captured_at,
+                source
+            ) VALUES (?, 0, ?, ?, ?)
+            "#,
+        )
+        .bind(key_id)
+        .bind(remaining)
+        .bind(synced_at)
+        .bind(source)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"UPDATE api_keys
+               SET quota_remaining = ?, quota_synced_at = ?
+             WHERE id = ?"#,
+        )
+        .bind(remaining)
+        .bind(synced_at)
+        .bind(key_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        self.request_stats_coalescer.mark_dashboard_read_dirty().await;
+        Ok(())
+    }
+
     pub(crate) async fn fetch_dashboard_quota_sample_watermark(
         &self,
         today_end: i64,

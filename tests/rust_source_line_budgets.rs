@@ -94,6 +94,11 @@ const EXCEPTIONS: &[(&str, usize, &str)] = &[
         4580,
         "The runtime owns the shared pool, operation budgeting, transaction guards, fair maintenance admission coordinator, operation-scoped owned-finish tracking, workload aggregation, and the bounded reconciliation read session; the hardened connection-setup acquire budget extends the same surface, while cooperative query cleanup remains isolated in its dedicated child module.",
     ),
+    (
+        "tests/provider_facades_contract.rs",
+        3470,
+        "The provider REST facade contract suite keeps growing one section per provider on the shared real-binary harness; the Keenable section (keenable-integration todo 7) extends the same file instead of adding an unregistered test target while manifest registration stays with todo 20.",
+    ),
 ];
 
 fn visit(dir: &Path, out: &mut Vec<PathBuf>) {

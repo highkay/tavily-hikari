@@ -46,6 +46,23 @@ pub use proxy_provider_facade_exa::{ExaFacadeOutcome, exa_facade_outcome};
 mod proxy_provider_facade_brave;
 pub use proxy_provider_facade_brave::{BraveFacadeOutcome, brave_facade_outcome};
 
+// Keenable REST execution layer (keenable-integration todo 7): the same
+// bookkeeping contract over the todo-3 keenable classifier — 402
+// billing_error/insufficient_credits exhausts, 401/credentials auth-fails
+// into quarantine, target_error/target_blocked stays a client error that
+// never marks the key, 429 arms the shared HTTP backoff scope (generic
+// Retry-After lane until todo 11's keenable-specific sizing) — PLUS the
+// todo-7 PASSIVE CREDIT HARVEST that persists usage.credits_remaining
+// through the no-limit quota-sample seam with source `keenable_passive`
+// (best-effort, material-change-only, zero extra requests; the live key
+// keeps quota_limit NULL and quota_renews_at untouched). The bin-side
+// outcome projection additionally carries business_success (signal == Ok):
+// the classifier can auth-fail on a 2xx body, so settlement gates on the
+// signal, never on HTTP 2xx alone. The SerpApi/Exa/Brave record paths stay
+// byte-identical behind their own gates; Tavily REST never reaches this seam.
+mod proxy_provider_facade_keenable;
+pub use proxy_provider_facade_keenable::{KeenableFacadeOutcome, keenable_facade_outcome};
+
 // SerpApi hosted MCP passthrough execution layer (plan todo 15; amendments
 // M6/M7): the upstream-MCP path generalized by ProviderSpec — ingress-aware
 // SERPAPI_MCP_UPSTREAM URL building, pooled-key Bearer injection (never the
@@ -363,13 +380,19 @@ impl TavilyProxy {
                             self.record_brave_rest_facade_attempt(&attempt_ctx, &headers)
                                 .await?
                         }
-                        // Keenable/Zhihu (todo-2 compile gate): the generic
-                        // recorder books the attempt row; todos 7/9 replace it
-                        // with their passive-harvest / envelope-aware recorders.
-                        // Unreachable until todo 6 registers their routes.
+                        // Keenable (todo 7): books the attempt AND harvests
+                        // the passive credit balance from the already-buffered
+                        // response body (usage.credits_remaining, source
+                        // keenable_passive, zero extra requests).
+                        providers::ProviderId::Keenable => {
+                            self.record_keenable_rest_facade_attempt(&attempt_ctx)
+                                .await?
+                        }
+                        // Zhihu (todo-2 compile gate): the generic recorder
+                        // books the attempt row until todo 9 replaces it with
+                        // the envelope-aware recorder.
                         providers::ProviderId::Tavily
                         | providers::ProviderId::Serpapi
-                        | providers::ProviderId::Keenable
                         | providers::ProviderId::Zhihu => {
                             self.record_provider_rest_facade_attempt(&attempt_ctx)
                                 .await?
@@ -432,9 +455,10 @@ impl TavilyProxy {
                         .await?
                     };
                     let fallback_reason = retry_marker.fallback_reason(false);
-                    // SerpApi (todo 12), Exa (todo 13), and Brave (todo 14)
-                    // transport failures persist an audit row (Tavily executor
-                    // parity); Tavily keeps its legacy no-op gate here.
+                    // SerpApi (todo 12), Exa (todo 13), Brave (todo 14), and
+                    // Keenable (todo 7) transport failures persist an audit row
+                    // (Tavily executor parity); Tavily keeps its legacy no-op
+                    // gate here.
                     match request.provider {
                         providers::ProviderId::Exa => {
                             self.log_exa_rest_facade_transport_error(
@@ -456,12 +480,23 @@ impl TavilyProxy {
                             )
                             .await?;
                         }
-                        // Keenable/Zhihu (todo-2 compile gate): the generic
-                        // transport-error logger owns them until todos 7/9 land
-                        // their own record paths (unreachable until todo 6).
+                        // Keenable (todo 7): its own transport-error audit row;
+                        // nothing to harvest (no response body exists).
+                        providers::ProviderId::Keenable => {
+                            self.log_keenable_rest_facade_transport_error(
+                                &request,
+                                &attempt_lease,
+                                &sanitized_headers,
+                                &err,
+                                fallback_reason,
+                            )
+                            .await?;
+                        }
+                        // Zhihu (todo-2 compile gate): the generic
+                        // transport-error logger owns it until todo 9 lands its
+                        // own record path.
                         providers::ProviderId::Tavily
                         | providers::ProviderId::Serpapi
-                        | providers::ProviderId::Keenable
                         | providers::ProviderId::Zhihu => {
                             self.log_provider_rest_facade_transport_error(
                                 &request,
@@ -598,13 +633,12 @@ impl TavilyProxy {
             providers::ProviderId::Serpapi => Ok(self.provider_upstreams.serpapi_rest.clone()),
             providers::ProviderId::Exa => Ok(self.provider_upstreams.exa_rest.clone()),
             providers::ProviderId::Brave => Ok(self.provider_upstreams.brave_rest.clone()),
-            // Typed boundary (keenable-integration): todo 6 registered the
-            // REST routes, but the facade executors land with todos 7/9; until
-            // then the resolved base fails loudly instead of letting a
-            // facade call reach a default upstream. Never a silent success.
-            providers::ProviderId::Keenable => Err(ProxyError::Other(
-                "keenable REST facade is not wired yet".to_string(),
-            )),
+            // Keenable (todo 7): the resolved KEENABLE_UPSTREAM base.
+            providers::ProviderId::Keenable => Ok(self.provider_upstreams.keenable_rest.clone()),
+            // Typed boundary (keenable-integration todo 9): the Zhihu facade
+            // executor is not wired yet; the resolved base fails loudly instead
+            // of letting a facade call reach a default upstream. Never a
+            // silent success.
             providers::ProviderId::Zhihu => Err(ProxyError::Other(
                 "zhihu REST facade is not wired yet".to_string(),
             )),
