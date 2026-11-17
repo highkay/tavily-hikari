@@ -215,6 +215,18 @@
       ]
     },
     {
+      "id": "lib-provider-rest-header-policy",
+      "kind": "lib",
+      "name": "Lib Provider REST Header Policy",
+      "estimated_seconds": 90,
+      "coverage_target": "lib",
+      "run_args": ["--lib"],
+      "serial_prefixes": [],
+      "include_prefixes": [
+        "tests::provider_rest_header_policy::"
+      ]
+    },
+    {
       "id": "lib-request-rollup-storage",
       "kind": "lib",
       "name": "Lib Request Rollup Storage",

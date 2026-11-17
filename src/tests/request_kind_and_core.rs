@@ -1012,7 +1012,15 @@ async fn project_id_header_gate_never_emits_for_non_tavily_providers() {
 
     // When: the gate runs for each non-Tavily provider with the header already
     // present in the sanitized set (defense-in-depth beyond the allowlists).
-    for provider in [ProviderId::Serpapi, ProviderId::Exa, ProviderId::Brave] {
+    // keenable-integration todo 4: both new providers join the strip arm
+    // (x-project-id stays a Tavily-only upstream identity policy).
+    for provider in [
+        ProviderId::Serpapi,
+        ProviderId::Exa,
+        ProviderId::Brave,
+        ProviderId::Keenable,
+        ProviderId::Zhihu,
+    ] {
         let mut sanitized = SanitizedHeaders {
             headers: original.clone(),
             forwarded: vec!["x-project-id".to_string()],

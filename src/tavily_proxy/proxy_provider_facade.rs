@@ -10,7 +10,7 @@
 // facades (16-17), key-health reconcile wiring (18). Nothing here rewires
 // the Tavily request path (byte-stability rule).
 
-use reqwest::header::{AUTHORIZATION, HeaderName};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderName};
 
 // SerpApi REST execution layer (plan todo 12): response classification onto
 // the shared AttemptAnalysis contract, reconcile/backoff/request_logs
@@ -221,20 +221,31 @@ impl TavilyProxy {
             // used. Client slots were stripped at the server boundary before
             // reaching here (M17), so no client-supplied provider auth value is
             // ever relayed - on the first hit or on a retry.
-            let (url, sanitized_headers) = provider_rest_attempt_target(
+            let (url, mut sanitized_headers) = provider_rest_attempt_target(
                 request.provider,
                 spec,
                 &client_url,
                 &base_headers,
                 attempt_lease.secret.as_str(),
             )?;
+            // keenable-integration todo 4: per-attempt decoration AFTER key
+            // injection, so the Zhihu signature (fresh server-side
+            // X-Request-Timestamp from the backend clock plus a fixed
+            // Content-Type) is regenerated for EVERY attempt and can never
+            // relay a client value. Keenable decorates nothing.
+            decorate_provider_rest_attempt_headers(
+                request.provider,
+                &mut sanitized_headers,
+                &self.backend_time,
+            );
 
             let request_url = url.clone();
             let response = self
-                .send_with_forward_proxy(
+                .send_provider_rest_attempt_with_timeout(
                     request.provider,
                     &attempt_key_id,
                     request.upstream_operation,
+                    provider_rest_request_timeout(request.provider),
                     |client| {
                         let mut builder =
                             client.request(request_method.clone(), request_url.clone());
@@ -405,20 +416,13 @@ impl TavilyProxy {
                     // `NotInChain` on this arm means today's transport-error path
                     // exactly - the row below plus `Err(err)` - because nothing
                     // was buffered, and a dead attempt is never a success.
-                    let evidence = key_retry_transport_evidence(&err);
+                    let evidence = provider_rest_transport_evidence(&err);
                     let (retry_marker, retry_lease) = if terminal_attempt {
                         (ProviderFacadeRetryMarker::terminal(attempts_used), None)
                     } else {
                         self.decide_provider_facade_cross_key_retry(
                             &ProviderFacadeCrossKeyRetryProbe {
-                                signal: if evidence.transport_failure.is_some() {
-                                    ProviderFailureSignal::ServerTransient
-                                } else {
-                                    // Deferred admission or a store error: no
-                                    // retryable evidence, so the kernel stays on
-                                    // `NotRetryableOutcome`.
-                                    ProviderFailureSignal::ClientError
-                                },
+                                signal: transport_error_signal(&evidence),
                                 effective_status: None,
                                 evidence,
                                 retry_after_secs: None,
@@ -688,7 +692,7 @@ pub fn provider_rest_upstream_operation(
 /// of one logical request, so a cross-key retry differs from the first hit only
 /// by the key value and can neither append a second native key slot nor forward
 /// a stale one.
-fn provider_rest_attempt_target(
+pub(crate) fn provider_rest_attempt_target(
     provider: providers::ProviderId,
     spec: &'static providers::ProviderSpec,
     client_url: &Url,
@@ -785,7 +789,7 @@ struct ProviderFacadeCrossKeyRetryProbe<'a> {
 /// registry decision), while the SerpApi REST contract carries the pooled
 /// key in its native `api_key` query slot (pinned by the todo 12 facade
 /// contract). Exa/Brave use their registry header slots on both surfaces.
-fn provider_rest_key_injection(
+pub(crate) fn provider_rest_key_injection(
     provider: providers::ProviderId,
     spec: &'static providers::ProviderSpec,
 ) -> providers::KeyAuthInjection {
@@ -794,9 +798,11 @@ fn provider_rest_key_injection(
         providers::ProviderId::Exa | providers::ProviderId::Brave => spec.upstream_key_injection,
         // Unreachable: provider_rest_base rejects Tavily before injection.
         providers::ProviderId::Tavily => spec.upstream_key_injection,
-        // Unreachable todo-2 boundary: provider_rest_base rejects both
-        // providers with a typed error before injection (todos 4/6 own the
-        // final REST slot semantics).
+        // keenable-integration todo 4: Keenable rides the pooled key in its
+        // native `X-API-Key` header slot and Zhihu as `Authorization: Bearer`
+        // (both from the registry spec). Still unreachable through routing
+        // until todos 6/7/9 register the REST routes (provider_rest_base
+        // rejects both providers with a typed error first).
         providers::ProviderId::Keenable | providers::ProviderId::Zhihu => {
             spec.upstream_key_injection
         }
@@ -806,7 +812,7 @@ fn provider_rest_key_injection(
 /// T4 per-provider REST header allowlist dispatch (wired into live routing
 /// here per its documented consumption plan). None = no provider allowlist
 /// exists (Tavily keeps its legacy sanitizers).
-fn provider_rest_header_sanitizer(
+pub(crate) fn provider_rest_header_sanitizer(
     provider: providers::ProviderId,
 ) -> Option<fn(&HeaderMap) -> SanitizedHeaders> {
     match provider {
@@ -814,10 +820,141 @@ fn provider_rest_header_sanitizer(
         providers::ProviderId::Serpapi => Some(sanitize_serpapi_http_headers_inner),
         providers::ProviderId::Exa => Some(sanitize_exa_http_headers_inner),
         providers::ProviderId::Brave => Some(sanitize_brave_http_headers_inner),
-        // Typed todo-2 boundary: todo 4 lands both allowlists. Unreachable
-        // until then — provider_rest_base rejects both providers with a
-        // typed error before any header handling.
-        providers::ProviderId::Keenable | providers::ProviderId::Zhihu => None,
+        // keenable-integration todo 4: both allowlists are live on the executor
+        // seam. Still unreachable through routing until todo 6 registers the
+        // REST routes (provider_rest_base rejects both providers first).
+        providers::ProviderId::Keenable => Some(sanitize_keenable_http_headers_inner),
+        providers::ProviderId::Zhihu => Some(sanitize_zhihu_http_headers_inner),
+    }
+}
+
+/// Per-attempt outbound header decoration (keenable-integration todo 4),
+/// applied AFTER key injection in the executor loop. Zhihu signs every
+/// attempt with a FRESH server-side `X-Request-Timestamp` (Unix seconds,
+/// read from the backend clock - never `Utc::now()`, never a client value)
+/// plus a fixed `Content-Type: application/json`; Keenable adds nothing. The
+/// allowlist already dropped any client `authorization` /
+/// `x-request-timestamp`, so the insert can only ever write server-generated
+/// values.
+pub(crate) fn decorate_provider_rest_attempt_headers(
+    provider: providers::ProviderId,
+    sanitized_headers: &mut SanitizedHeaders,
+    backend_time: &crate::backend_time::BackendTime,
+) {
+    if provider != providers::ProviderId::Zhihu {
+        return;
+    }
+    let timestamp = backend_time.now_ts().to_string();
+    let timestamp_value = HeaderValue::from_str(&timestamp)
+        .expect("an epoch-second timestamp is always a valid header value");
+    sanitized_headers
+        .headers
+        .insert("x-request-timestamp", timestamp_value);
+    if !sanitized_headers
+        .forwarded
+        .iter()
+        .any(|name| name == "x-request-timestamp")
+    {
+        sanitized_headers
+            .forwarded
+            .push("x-request-timestamp".to_string());
+    }
+    sanitized_headers
+        .headers
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    if !sanitized_headers
+        .forwarded
+        .iter()
+        .any(|name| name == "content-type")
+    {
+        sanitized_headers.forwarded.push("content-type".to_string());
+    }
+}
+
+/// Total outbound request budget per provider REST facade
+/// (keenable-integration todo 4): Keenable 30s, Zhihu 20s. Every existing
+/// provider returns `None` and keeps its byte-stable unwrapped send.
+pub(crate) fn provider_rest_request_timeout(
+    provider: providers::ProviderId,
+) -> Option<std::time::Duration> {
+    match provider {
+        providers::ProviderId::Keenable => Some(std::time::Duration::from_secs(30)),
+        providers::ProviderId::Zhihu => Some(std::time::Duration::from_secs(20)),
+        providers::ProviderId::Tavily
+        | providers::ProviderId::Serpapi
+        | providers::ProviderId::Exa
+        | providers::ProviderId::Brave => None,
+    }
+}
+
+/// Literal error of a provider REST facade timeout expiry. The message must
+/// stay a literal: the wrapped reqwest error carries the full upstream URL,
+/// which for a query-slot provider embeds the pooled key.
+const PROVIDER_REST_REQUEST_TIMEOUT_MESSAGE: &str = "provider request timed out";
+
+fn provider_rest_request_timeout_error() -> ProxyError {
+    ProxyError::Other(PROVIDER_REST_REQUEST_TIMEOUT_MESSAGE.to_string())
+}
+
+fn is_provider_rest_request_timeout(err: &ProxyError) -> bool {
+    matches!(
+        err,
+        ProxyError::Other(message) if message == PROVIDER_REST_REQUEST_TIMEOUT_MESSAGE
+    )
+}
+
+/// Transport evidence of the executor's transport-error arm
+/// (keenable-integration todo 4): a per-provider timeout expiry IS transport
+/// evidence (a hung upstream) even though it never produced a reqwest error,
+/// so the retry kernel sees `ServerTransient`; everything else keeps the
+/// todo-6 helper's rule (only a reqwest failure is transport).
+fn provider_rest_transport_evidence(err: &ProxyError) -> KeyRetryAttemptEvidence {
+    if is_provider_rest_request_timeout(err) {
+        KeyRetryAttemptEvidence::transport(KeyRetryTransportFailure::Timeout)
+    } else {
+        key_retry_transport_evidence(err)
+    }
+}
+
+/// Signal of an attempt that never produced a response: any transport failure
+/// (including a per-provider timeout expiry) is `ServerTransient`; deferred
+/// admission or a store error carries no retryable evidence, so the kernel
+/// stays on `NotRetryableOutcome`.
+fn transport_error_signal(evidence: &KeyRetryAttemptEvidence) -> ProviderFailureSignal {
+    if evidence.transport_failure.is_some() {
+        ProviderFailureSignal::ServerTransient
+    } else {
+        ProviderFailureSignal::ClientError
+    }
+}
+
+impl TavilyProxy {
+    /// Outbound send of one provider REST facade attempt, wrapped in the
+    /// per-provider total request timeout (keenable-integration todo 4). A
+    /// timeout cancels the in-flight send - the dropped future releases every
+    /// egress resource it held (relay lease, direct slot) - and maps to the
+    /// literal `provider request timed out` error, never a secret-bearing
+    /// reqwest URL. `budget` is the resolved `provider_rest_request_timeout`
+    /// value in production and the explicit knob of the permit-release test.
+    pub(crate) async fn send_provider_rest_attempt_with_timeout<F>(
+        &self,
+        provider: providers::ProviderId,
+        api_key_id: &str,
+        request_kind: &str,
+        budget: Option<std::time::Duration>,
+        build: F,
+    ) -> Result<(reqwest::Response, forward_proxy::ForwardProxyRelayLease), ProxyError>
+    where
+        F: FnMut(reqwest::Client) -> reqwest::RequestBuilder,
+    {
+        let send = self.send_with_forward_proxy(provider, api_key_id, request_kind, build);
+        match budget {
+            Some(budget) => match tokio::time::timeout(budget, send).await {
+                Ok(result) => result,
+                Err(_elapsed) => Err(provider_rest_request_timeout_error()),
+            },
+            None => send.await,
+        }
     }
 }
 
@@ -986,5 +1123,199 @@ mod provider_facade_tests {
         assert!(!brave.headers.contains_key("x-subscription-token"));
         assert!(!brave.headers.contains_key("x-project-id"));
         assert!(!brave.headers.contains_key("user-agent"));
+    }
+
+    #[test]
+    fn keenable_and_zhihu_rest_allowlists_dispatch_and_strip_client_credentials() {
+        // keenable-integration todo 4: both new providers dispatch to their
+        // own {accept, accept-encoding, content-type} allowlists; every
+        // client credential slot, the forged Zhihu signature pair, and the
+        // Tavily-only x-project-id policy header are dropped.
+        let mut headers = HeaderMap::new();
+        headers.insert("accept", HeaderValue::from_static("application/json"));
+        headers.insert("accept-encoding", HeaderValue::from_static("gzip"));
+        headers.insert("content-type", HeaderValue::from_static("text/plain"));
+        headers.insert("authorization", HeaderValue::from_static("Bearer th-client-token"));
+        headers.insert("x-request-timestamp", HeaderValue::from_static("1"));
+        headers.insert("x-api-key", HeaderValue::from_static("evil"));
+        headers.insert("x-project-id", HeaderValue::from_static("evil"));
+        headers.insert("user-agent", HeaderValue::from_static("client/1.0"));
+        headers.insert("cookie", HeaderValue::from_static("session=1"));
+
+        for provider in [providers::ProviderId::Keenable, providers::ProviderId::Zhihu] {
+            let sanitize = provider_rest_header_sanitizer(provider).expect("sanitizer dispatch");
+            let sanitized = sanitize(&headers);
+            let mut forwarded = sanitized.forwarded.clone();
+            forwarded.sort_unstable();
+            assert_eq!(
+                forwarded,
+                vec![
+                    "accept".to_string(),
+                    "accept-encoding".to_string(),
+                    "content-type".to_string(),
+                ]
+            );
+            for dropped_name in [
+                "authorization",
+                "x-request-timestamp",
+                "x-api-key",
+                "x-project-id",
+                "user-agent",
+                "cookie",
+            ] {
+                assert!(
+                    !sanitized.headers.contains_key(dropped_name),
+                    "{provider} must not forward {dropped_name}"
+                );
+                assert!(
+                    sanitized.dropped.contains(&dropped_name.to_string()),
+                    "{provider} must record the dropped {dropped_name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn keenable_and_zhihu_rest_key_injection_uses_native_slots() {
+        // keenable-integration todo 4: the pooled key rides the provider's
+        // native upstream slot - Keenable `X-API-Key`, Zhihu Bearer - and the
+        // SerpApi query slot stays pinned by its own facade contract.
+        assert_eq!(
+            provider_rest_key_injection(
+                providers::ProviderId::Keenable,
+                providers::spec_for(providers::ProviderId::Keenable),
+            ),
+            providers::KeyAuthInjection::Header { name: "X-API-Key" }
+        );
+        assert_eq!(
+            provider_rest_key_injection(
+                providers::ProviderId::Zhihu,
+                providers::spec_for(providers::ProviderId::Zhihu),
+            ),
+            providers::KeyAuthInjection::Bearer
+        );
+        assert_eq!(
+            provider_rest_key_injection(
+                providers::ProviderId::Serpapi,
+                providers::spec_for(providers::ProviderId::Serpapi),
+            ),
+            providers::KeyAuthInjection::QueryParam { name: "api_key" }
+        );
+    }
+
+    #[test]
+    fn zhihu_attempt_decorator_stamps_fresh_timestamp_and_json_content_type() {
+        // keenable-integration todo 4: the timestamp comes from the backend
+        // clock (a manual clock here, so the vectors are deterministic and
+        // prove the value is regenerated per attempt, never Utc::now and
+        // never a client relay).
+        let (backend_time, manual) =
+            crate::backend_time::BackendTime::manual_from_ts(1_700_000_000);
+        let mut sanitized = SanitizedHeaders {
+            headers: HeaderMap::new(),
+            forwarded: vec!["content-type".to_string()],
+            dropped: vec!["x-request-timestamp".to_string()],
+        };
+
+        decorate_provider_rest_attempt_headers(
+            providers::ProviderId::Zhihu,
+            &mut sanitized,
+            &backend_time,
+        );
+        assert_eq!(
+            sanitized.headers.get("x-request-timestamp").unwrap(),
+            "1700000000"
+        );
+        assert_eq!(
+            sanitized.headers.get(CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        assert!(
+            sanitized
+                .forwarded
+                .iter()
+                .any(|name| name == "x-request-timestamp")
+        );
+
+        // A second attempt (cross-key retry) re-stamps from the SAME clock:
+        // advancing the wall clock changes the stamp, so a replayed attempt
+        // can never carry a stale timestamp.
+        manual.advance_wall(std::time::Duration::from_secs(7));
+        let mut second = SanitizedHeaders {
+            headers: HeaderMap::new(),
+            forwarded: Vec::new(),
+            dropped: Vec::new(),
+        };
+        decorate_provider_rest_attempt_headers(
+            providers::ProviderId::Zhihu,
+            &mut second,
+            &backend_time,
+        );
+        assert_eq!(
+            second.headers.get("x-request-timestamp").unwrap(),
+            "1700000007"
+        );
+
+        // Keenable decorates nothing: no timestamp, no content-type rewrite.
+        let mut keenable = SanitizedHeaders {
+            headers: HeaderMap::new(),
+            forwarded: Vec::new(),
+            dropped: Vec::new(),
+        };
+        decorate_provider_rest_attempt_headers(
+            providers::ProviderId::Keenable,
+            &mut keenable,
+            &backend_time,
+        );
+        assert!(keenable.headers.is_empty());
+        assert!(keenable.forwarded.is_empty());
+    }
+
+    #[test]
+    fn provider_rest_request_timeout_budgets_pin_the_documented_values() {
+        // keenable-integration todo 4: Keenable 30s, Zhihu 20s, every existing
+        // provider unwrapped (byte-stable send).
+        assert_eq!(
+            provider_rest_request_timeout(providers::ProviderId::Keenable),
+            Some(std::time::Duration::from_secs(30))
+        );
+        assert_eq!(
+            provider_rest_request_timeout(providers::ProviderId::Zhihu),
+            Some(std::time::Duration::from_secs(20))
+        );
+        for provider in [
+            providers::ProviderId::Tavily,
+            providers::ProviderId::Serpapi,
+            providers::ProviderId::Exa,
+            providers::ProviderId::Brave,
+        ] {
+            assert_eq!(provider_rest_request_timeout(provider), None);
+        }
+    }
+
+    #[test]
+    fn provider_rest_timeout_maps_to_server_transient_transport_evidence() {
+        // keenable-integration todo 4: the timeout expiry is transport
+        // evidence, so the executor's transport arm maps it to ServerTransient
+        // (retryable transient), and the error is the literal message with no
+        // URL and no secret; any other non-transport error keeps the
+        // not-retryable ClientError mapping.
+        let err = provider_rest_request_timeout_error();
+        assert!(is_provider_rest_request_timeout(&err));
+        assert_eq!(err.to_string(), "other error: provider request timed out");
+        let evidence = provider_rest_transport_evidence(&err);
+        assert_eq!(
+            evidence,
+            KeyRetryAttemptEvidence::transport(KeyRetryTransportFailure::Timeout)
+        );
+        assert_eq!(transport_error_signal(&evidence), ProviderFailureSignal::ServerTransient);
+
+        let other = ProxyError::Other("deferred admission".to_string());
+        assert!(!is_provider_rest_request_timeout(&other));
+        assert_eq!(provider_rest_transport_evidence(&other), KeyRetryAttemptEvidence::none());
+        assert_eq!(
+            transport_error_signal(&KeyRetryAttemptEvidence::none()),
+            ProviderFailureSignal::ClientError
+        );
     }
 }

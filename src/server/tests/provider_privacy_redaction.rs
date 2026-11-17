@@ -57,6 +57,21 @@ use super::*;
             out,
             "x-api-key: <redacted>\nX-Subscription-Token: <redacted>\ntail ok"
         );
+        // Zhihu upstream Bearer (keenable-integration todo 4): the pooled
+        // Access Secret must never surface in a display string, while a
+        // colon-less mention of the word stays untouched.
+        assert_eq!(
+            redact_sensitive("Authorization: Bearer zhihu-pooled-secret"),
+            "Authorization: <redacted>"
+        );
+        assert_eq!(
+            redact_sensitive("authorization: Bearer zhihu-pooled-secret"),
+            "authorization: <redacted>"
+        );
+        assert_eq!(
+            redact_sensitive("authorization code flow notes"),
+            "authorization code flow notes"
+        );
         // No provider secret survives any redacted surface.
         for surface in [
             "?api_key=mock-serpapi-key",
