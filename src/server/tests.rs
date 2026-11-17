@@ -55,6 +55,7 @@ mod tests {
     mod observability_audit_support;
     mod provider_admin_api_keys;
     mod provider_facade_routing;
+    mod provider_facade_routing_registry;
     mod provider_privacy_redaction;
     mod provider_quota_sync_dispatch;
     mod provider_read_surface;

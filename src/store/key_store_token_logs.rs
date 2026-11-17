@@ -1435,12 +1435,8 @@ impl KeyStore {
     /// - `SuccessOnly` (Exa): NO calendar flip at all; recovery happens via
     ///   `restore_active_status` on the next successful call or manual admin
     ///   restore.
-    /// - `NaturalDay` (Zhihu): exhausted -> active once the per-key
-    ///   `quota_renews_at` (the next Asia/Shanghai midnight, stored as epoch
-    ///   seconds by the todo-12 quota sync) is reached. Shares the
-    ///   RenewalDate flip SQL because the boundary semantics are identical —
-    ///   flip only when `status_changed_at < quota_renews_at <= now` — and
-    ///   NEVER flips on a UTC month boundary.
+    /// - `NaturalDay` (Zhihu): same renewal-date flip as `RenewalDate`,
+    ///   never a UTC month boundary.
     pub(crate) async fn reset_monthly(
         &self,
         provider: crate::providers::ProviderId,
@@ -1474,25 +1470,7 @@ impl KeyStore {
             }
             crate::providers::RecoveryPolicy::RenewalDate
             | crate::providers::RecoveryPolicy::NaturalDay => {
-                sqlx::query(
-                    r#"
-                    UPDATE api_keys
-                    SET status = ?, status_changed_at = ?
-                    WHERE status = ?
-                      AND provider = ?
-                      AND quota_renews_at IS NOT NULL
-                      AND quota_renews_at <= ?
-                      AND status_changed_at IS NOT NULL
-                      AND status_changed_at < quota_renews_at
-                    "#,
-                )
-                .bind(STATUS_ACTIVE)
-                .bind(now_ts)
-                .bind(STATUS_EXHAUSTED)
-                .bind(provider.as_str())
-                .bind(now_ts)
-                .execute(&self.pool)
-                .await?;
+                self.recover_keys_by_renewal_date(provider, now_ts).await?;
             }
             crate::providers::RecoveryPolicy::SuccessOnly => {}
         }
