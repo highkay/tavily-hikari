@@ -14,6 +14,10 @@ const EXA_VALID_KEY: &str = "exa-valid-key";
 const EXA_BAD_KEY: &str = "exa-bad-key";
 const BRAVE_VALID_KEY: &str = "brave-valid-key";
 const BRAVE_BAD_KEY: &str = "brave-bad-key";
+const KEENABLE_VALID_KEY: &str = "ken-valid-key";
+const KEENABLE_BAD_KEY: &str = "ken-bad-key";
+const ZHIHU_VALID_SECRET: &str = "zh-valid-secret";
+const ZHIHU_BAD_SECRET: &str = "zh-bad-secret";
 
 /// Per-provider mock counters. `billable` only increments on a response shape
 /// that the real provider would charge for; the M13 acceptance is that every
@@ -197,6 +201,146 @@ async fn spawn_brave_mock(counters: Arc<ProviderCounters>) -> SocketAddr {
     .await
 }
 
+// ---------- mock Keenable: missing-query 400 vs 401 ----------
+
+async fn keenable_search(
+    State(counters): State<MockCounters>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    counters.0.probe_hits.fetch_add(1, Ordering::SeqCst);
+    let key = headers
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if key != KEENABLE_VALID_KEY {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": "Authentication failed",
+                "type": "authentication_error",
+                "code": "invalid_api_key",
+                "message": "Invalid API key",
+                "retryable": false
+            })),
+        )
+            .into_response();
+    }
+    let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    let query = parsed
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if !query.is_empty() {
+        // A query would be a billable search; the zero-cost probe must never
+        // reach this arm.
+        counters.0.billable.fetch_add(1, Ordering::SeqCst);
+        return (
+            StatusCode::OK,
+            Json(json!({ "query": query, "results": [] })),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": "Missing required parameter",
+            "type": "invalid_request_error",
+            "code": "missing_parameter",
+            "message": "\"query\" is required",
+            "param": "query",
+            "retryable": false
+        })),
+    )
+        .into_response()
+}
+
+async fn spawn_keenable_mock(counters: Arc<ProviderCounters>) -> SocketAddr {
+    bind_ephemeral(
+        Router::new()
+            .route("/v1/search", post(keenable_search))
+            .route("/metrics", get(mock_metrics))
+            .with_state(MockCounters(counters)),
+    )
+    .await
+}
+
+/// Additive observation endpoint mirroring the shared mock binaries: the
+/// acceptance gate reads this to prove no billable hit ever occurred.
+async fn mock_metrics(State(counters): State<MockCounters>) -> Response {
+    Json(json!({
+        "billable": counters.0.billable(),
+        "probe_hits": counters.0.probe_hits(),
+    }))
+    .into_response()
+}
+
+// ---------- mock Zhihu: free /api/v1/quota envelope ----------
+
+fn zhihu_envelope(code: i64, message: &str, data: Value) -> Response {
+    (
+        StatusCode::OK,
+        Json(json!({ "Code": code, "Message": message, "Data": data })),
+    )
+        .into_response()
+}
+
+async fn zhihu_quota(
+    State(counters): State<MockCounters>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    counters.0.probe_hits.fetch_add(1, Ordering::SeqCst);
+    let authorization = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let has_timestamp = headers.contains_key("x-request-timestamp");
+    let has_api_ids = uri
+        .query()
+        .map(|query| {
+            form_urlencoded::parse(query.as_bytes()).any(|(key, value)| {
+                key == "APIIDs" && value == "zhihu_search,global_search"
+            })
+        })
+        .unwrap_or(false);
+    if !has_timestamp || !has_api_ids {
+        return zhihu_envelope(20001, "Authorization failed", Value::Null);
+    }
+    match authorization {
+        "Bearer zh-valid-secret" => zhihu_envelope(
+            0,
+            "success",
+            json!([
+                { "APIID": "zhihu_search", "TotalQuota": 10, "TotalUsed": 7, "RemainingQuota": 3 },
+                { "APIID": "global_search", "TotalQuota": 20, "TotalUsed": 15, "RemainingQuota": 5 }
+            ]),
+        ),
+        "Bearer zh-rate-secret" => zhihu_envelope(30001, "Rate limited", Value::Null),
+        _ => zhihu_envelope(20001, "Authorization failed", Value::Null),
+    }
+}
+
+async fn zhihu_content_billable(State(counters): State<MockCounters>) -> Response {
+    // Any content call consumes quota; the zero-cost probe must never reach
+    // this route.
+    counters.0.billable.fetch_add(1, Ordering::SeqCst);
+    zhihu_envelope(0, "success", json!({ "Items": [] }))
+}
+
+async fn spawn_zhihu_mock(counters: Arc<ProviderCounters>) -> SocketAddr {
+    bind_ephemeral(
+        Router::new()
+            .route("/api/v1/quota", get(zhihu_quota))
+            .route("/api/v1/content/zhihu_search", get(zhihu_content_billable))
+            .route("/api/v1/content/global_search", get(zhihu_content_billable))
+            .route("/metrics", get(mock_metrics))
+            .with_state(MockCounters(counters)),
+    )
+    .await
+}
+
 // ---------- mock forwarding proxy for the manual sync lane ----------
 //
 // A real HTTP forward proxy: reqwest sends absolute-form request targets when
@@ -276,6 +420,10 @@ struct ProviderAdminHarness {
     serpapi_counters: Arc<ProviderCounters>,
     exa_counters: Arc<ProviderCounters>,
     brave_counters: Arc<ProviderCounters>,
+    keenable_counters: Arc<ProviderCounters>,
+    zhihu_counters: Arc<ProviderCounters>,
+    keenable_addr: SocketAddr,
+    zhihu_addr: SocketAddr,
     admission: Arc<RemoteAttemptAdmissionController>,
     db_path: PathBuf,
 }
@@ -304,9 +452,14 @@ impl ProviderAdminHarness {
     }
 
     async fn get_json(&self, path: &str) -> (u16, Value) {
+        self.get_abs_json(&format!("http://{}{}", self.addr, path))
+            .await
+    }
+
+    async fn get_abs_json(&self, url: &str) -> (u16, Value) {
         let response = self
             .client
-            .get(format!("http://{}{}", self.addr, path))
+            .get(url)
             .send()
             .await
             .expect("request completes");
@@ -343,9 +496,13 @@ async fn spawn_provider_admin_harness_with(
     let serpapi_counters = ProviderCounters::new_arc();
     let exa_counters = ProviderCounters::new_arc();
     let brave_counters = ProviderCounters::new_arc();
+    let keenable_counters = ProviderCounters::new_arc();
+    let zhihu_counters = ProviderCounters::new_arc();
     let serpapi_addr = spawn_serpapi_mock(serpapi_counters.clone()).await;
     let exa_addr = spawn_exa_mock(exa_counters.clone()).await;
     let brave_addr = spawn_brave_mock(brave_counters.clone()).await;
+    let keenable_addr = spawn_keenable_mock(keenable_counters.clone()).await;
+    let zhihu_addr = spawn_zhihu_mock(zhihu_counters.clone()).await;
     let serpapi_upstream =
         network.serpapi_upstream.unwrap_or_else(|| format!("http://{serpapi_addr}"));
     let providers = tavily_hikari::ProviderBootstrap {
@@ -356,10 +513,13 @@ async fn spawn_provider_admin_harness_with(
         serpapi_keys: Vec::new(),
         exa_keys: Vec::new(),
         brave_keys: Vec::new(),
-        // keenable-integration todo 6: no admin-API facade is registered for
-        // either provider here (todo 13 owns it); registry defaults keep the
-        // rows untouched and no probe ever dials them.
-        ..tavily_hikari::ProviderBootstrap::default()
+        // Both providers are pinned to local mocks so no probe or sync can
+        // ever reach the production Keenable/Zhihu endpoints.
+        keenable_upstream: format!("http://{keenable_addr}"),
+        keenable_mcp_upstream: format!("http://{keenable_addr}/mcp"),
+        zhihu_upstream: format!("http://{zhihu_addr}"),
+        keenable_keys: Vec::new(),
+        zhihu_keys: Vec::new(),
     };
     let proxy = TavilyProxy::with_providers_in_ha_mode(
         Vec::<String>::new(),
@@ -423,6 +583,10 @@ async fn spawn_provider_admin_harness_with(
         serpapi_counters,
         exa_counters,
         brave_counters,
+        keenable_counters,
+        zhihu_counters,
+        keenable_addr,
+        zhihu_addr,
         admission,
         db_path,
     }
@@ -476,6 +640,26 @@ async fn create_with_provider_stamps_and_rejects_cross_provider_duplicate() {
     assert_eq!(status, 409, "tavily duplicate of brave key: {body}");
     assert_eq!(body["error"], json!("provider_conflict"));
 
+    // And the same rule holds across the keenable/zhihu boundary: the second
+    // provider never writes (no re-stamp, no duplicate row).
+    let (status, body) = harness
+        .create_key(json!({ "api_key": "k-cross-keenable", "provider": "keenable" }))
+        .await;
+    assert_eq!(status, 201, "create keenable key: {body}");
+    let (status, body) = harness
+        .create_key(json!({ "api_key": "k-cross-keenable", "provider": "zhihu" }))
+        .await;
+    assert_eq!(status, 409, "zhihu duplicate of keenable key: {body}");
+    assert_eq!(body["error"], json!("provider_conflict"));
+    assert!(
+        body["detail"].as_str().unwrap_or_default().contains("keenable"),
+        "detail names the owning provider: {body}"
+    );
+    let (_, body) = harness.get_json("/api/keys?provider=zhihu").await;
+    assert_eq!(body["total"], json!(0), "conflict wrote no zhihu row");
+    let (_, body) = harness.get_json("/api/keys?provider=keenable").await;
+    assert_eq!(body["total"], json!(1), "the owning keenable row survives");
+
     // And an unknown provider string is rejected at the boundary
     let (status, _) = harness
         .create_key(json!({ "api_key": "k-unknown-provider", "provider": "google" }))
@@ -513,6 +697,8 @@ async fn list_filter_and_detail_expose_provider_and_quota_renews_at() {
         ("k-brave", "brave"),
         ("k-exa", "exa"),
         ("k-serpapi", "serpapi"),
+        ("k-keenable", "keenable"),
+        ("k-zhihu", "zhihu"),
     ] {
         let (status, body) = harness
             .create_key(json!({ "api_key": api_key, "provider": provider }))
@@ -527,9 +713,9 @@ async fn list_filter_and_detail_expose_provider_and_quota_renews_at() {
     // When listing without a provider filter
     let (status, body) = harness.get_json("/api/keys?per_page=100").await;
     assert_eq!(status, 200);
-    assert_eq!(body["total"], json!(4), "unfiltered total");
+    assert_eq!(body["total"], json!(6), "unfiltered total");
     let items = body["items"].as_array().expect("items");
-    assert_eq!(items.len(), 4);
+    assert_eq!(items.len(), 6);
     // Then every item carries provider, and the additive DTO surface is
     // exactly the legacy key set plus `provider` (quota_renews_at stays
     // absent while NULL).
@@ -584,15 +770,30 @@ async fn list_filter_and_detail_expose_provider_and_quota_renews_at() {
         .await;
     assert_eq!(body["total"], json!(2), "multi-provider total");
 
+    for provider in ["keenable", "zhihu"] {
+        let (status, body) = harness
+            .get_json(&format!("/api/keys?provider={provider}"))
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["total"], json!(1), "{provider}-only total");
+        assert_eq!(body["items"][0]["provider"], json!(provider));
+        assert_eq!(body["items"][0]["id"], json!(ids[format!("k-{provider}").as_str()]));
+    }
+
     let (_, body) = harness.get_json("/api/keys?provider=bogus").await;
     assert_eq!(body["total"], json!(0), "unknown provider matches nothing");
 
     // When reading key detail
     let (status, body) = harness
-        .get_json(&format!("/api/keys/{}", ids["k-brave"]))
+        .get_json(&format!("/api/keys/{}", ids["k-keenable"]))
         .await;
     assert_eq!(status, 200);
-    assert_eq!(body["provider"], json!("brave"), "detail provider");
+    assert_eq!(body["provider"], json!("keenable"), "detail provider");
+    let (status, body) = harness
+        .get_json(&format!("/api/keys/{}", ids["k-zhihu"]))
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["provider"], json!("zhihu"), "detail provider");
     assert!(
         body.get("quota_renews_at").is_none() || body["quota_renews_at"].is_null(),
         "detail quota_renews_at absent while NULL: {body}"
@@ -615,7 +816,11 @@ async fn validate_matrix_probes_are_zero_cost_for_every_provider() {
                     { "api_key": EXA_VALID_KEY, "provider": "exa" },
                     { "api_key": EXA_BAD_KEY, "provider": "exa" },
                     { "api_key": BRAVE_VALID_KEY, "provider": "brave" },
-                    { "api_key": BRAVE_BAD_KEY, "provider": "brave" }
+                    { "api_key": BRAVE_BAD_KEY, "provider": "brave" },
+                    { "api_key": KEENABLE_VALID_KEY, "provider": "keenable" },
+                    { "api_key": KEENABLE_BAD_KEY, "provider": "keenable" },
+                    { "api_key": ZHIHU_VALID_SECRET, "provider": "zhihu" },
+                    { "api_key": ZHIHU_BAD_SECRET, "provider": "zhihu" }
                 ]
             }),
         )
@@ -623,10 +828,10 @@ async fn validate_matrix_probes_are_zero_cost_for_every_provider() {
     assert_eq!(status, 200, "validate response: {body}");
 
     // Then the summary buckets the zero-cost probe matrix
-    assert_eq!(body["summary"]["input_lines"], json!(6));
-    assert_eq!(body["summary"]["unique_in_input"], json!(6));
-    assert_eq!(body["summary"]["ok"], json!(3), "summary: {body}");
-    assert_eq!(body["summary"]["invalid"], json!(3), "summary: {body}");
+    assert_eq!(body["summary"]["input_lines"], json!(10));
+    assert_eq!(body["summary"]["unique_in_input"], json!(10));
+    assert_eq!(body["summary"]["ok"], json!(5), "summary: {body}");
+    assert_eq!(body["summary"]["invalid"], json!(5), "summary: {body}");
     assert_eq!(body["summary"]["error"], json!(0), "summary: {body}");
 
     // SerpApi: /account 200 surfaces the plan fields; 401 is invalid.
@@ -670,6 +875,30 @@ async fn validate_matrix_probes_are_zero_cost_for_every_provider() {
     assert_eq!(bad["provider"], json!("brave"));
     assert_eq!(bad["reason"], json!("SUBSCRIPTION_TOKEN_INVALID"));
 
+    // Keenable: 400 missing_parameter on the empty body proves the key
+    // authenticated; 401 invalid_api_key is a dead key.
+    let ok = find_result(&body, KEENABLE_VALID_KEY);
+    assert_eq!(ok["status"], json!("ok"));
+    assert_eq!(ok["provider"], json!("keenable"));
+    assert_eq!(ok["reason"], json!("missing_parameter"), "probe label");
+    let bad = find_result(&body, KEENABLE_BAD_KEY);
+    assert_eq!(bad["status"], json!("invalid"));
+    assert_eq!(bad["provider"], json!("keenable"));
+    assert_eq!(bad["reason"], json!("invalid_api_key"));
+
+    // Zhihu: the FREE /api/v1/quota read returns Code=0 for a live secret
+    // (with its daily capacity) and Code=20001 for a wrong one.
+    let ok = find_result(&body, ZHIHU_VALID_SECRET);
+    assert_eq!(ok["status"], json!("ok"));
+    assert_eq!(ok["provider"], json!("zhihu"));
+    assert_eq!(ok["reason"], json!("quota_api_code_0"));
+    assert_eq!(ok["quota_limit"], json!(10), "tightest daily limit");
+    assert_eq!(ok["quota_remaining"], json!(3), "tightest daily remaining");
+    let bad = find_result(&body, ZHIHU_BAD_SECRET);
+    assert_eq!(bad["status"], json!("invalid"));
+    assert_eq!(bad["provider"], json!("zhihu"));
+    assert_eq!(bad["reason"], json!("auth_failed"));
+
     // Then every billable counter is untouched (M13: validation never hits a
     // billable endpoint) and only the free probe endpoints were called.
     assert_eq!(harness.serpapi_counters.billable(), 0, "serpapi unbilled");
@@ -678,6 +907,27 @@ async fn validate_matrix_probes_are_zero_cost_for_every_provider() {
     assert_eq!(harness.exa_counters.probe_hits(), 2, "contents probes");
     assert_eq!(harness.brave_counters.billable(), 0, "brave unbilled");
     assert_eq!(harness.brave_counters.probe_hits(), 2, "brave probes");
+    // The Keenable probe is the missing-query search (unbilled by contract);
+    // the Zhihu probe is the free quota read, never a content search.
+    assert_eq!(harness.keenable_counters.billable(), 0, "keenable unbilled");
+    assert_eq!(harness.keenable_counters.probe_hits(), 2, "keenable probes");
+    assert_eq!(harness.zhihu_counters.billable(), 0, "zhihu quota free");
+    assert_eq!(harness.zhihu_counters.probe_hits(), 2, "quota probes");
+    for (label, addr) in [
+        ("keenable", harness.keenable_addr),
+        ("zhihu", harness.zhihu_addr),
+    ] {
+        let (status, metrics) = harness
+            .get_abs_json(&format!("http://{addr}/metrics"))
+            .await;
+        assert_eq!(status, 200, "{label} /metrics: {metrics}");
+        assert_eq!(metrics["billable"], json!(0), "{label} /metrics billable");
+        assert_eq!(
+            metrics["probe_hits"],
+            json!(2),
+            "{label} /metrics probe hits"
+        );
+    }
 
     // When the top-level provider form is used (plain `api_keys` list)
     let (status, body) = harness
@@ -695,14 +945,17 @@ async fn validate_matrix_probes_are_zero_cost_for_every_provider() {
 }
 
 #[tokio::test]
-async fn sync_usage_is_live_for_serpapi_passive_for_brave_and_409_for_exa() {
+async fn sync_usage_is_live_for_serpapi_and_zhihu_passive_for_brave_and_keenable_and_409_for_exa() {
     // Given one stored key per new provider
     let harness = spawn_provider_admin_harness("provider-admin-sync").await;
+
     let mut ids = HashMap::new();
     for (api_key, provider) in [
         (SERP_VALID_KEY, "serpapi"),
         (SERP_BAD_KEY, "serpapi"),
         (BRAVE_VALID_KEY, "brave"),
+        (KEENABLE_VALID_KEY, "keenable"),
+        (ZHIHU_VALID_SECRET, "zhihu"),
         (EXA_VALID_KEY, "exa"),
     ] {
         let (status, body) = harness
@@ -767,6 +1020,47 @@ async fn sync_usage_is_live_for_serpapi_passive_for_brave_and_409_for_exa() {
     assert_eq!(body["provider"], json!("brave"));
     assert_eq!(harness.brave_counters.probe_hits(), 0, "no brave call");
     assert_eq!(harness.brave_counters.billable(), 0, "brave unbilled");
+
+    // When syncing the keenable key
+    let (status, body) = harness
+        .post_json(
+            &format!("/api/keys/{}/sync-usage", ids[KEENABLE_VALID_KEY]),
+            json!({}),
+        )
+        .await;
+    // Then the passive credit snapshot is returned with zero live calls
+    assert_eq!(status, 200, "keenable sync: {body}");
+    assert_eq!(body["source"], json!("passive"));
+    assert_eq!(body["provider"], json!("keenable"));
+    assert_eq!(harness.keenable_counters.probe_hits(), 0, "no keenable call");
+    assert_eq!(harness.keenable_counters.billable(), 0, "keenable unbilled");
+
+    // When syncing the zhihu key
+    let (status, body) = harness
+        .post_json(
+            &format!("/api/keys/{}/sync-usage", ids[ZHIHU_VALID_SECRET]),
+            json!({}),
+        )
+        .await;
+    // Then the FREE daily quota read updates the snapshot
+    assert_eq!(status, 200, "zhihu sync: {body}");
+    assert_eq!(body["source"], json!("live"));
+    assert_eq!(body["provider"], json!("zhihu"));
+    assert_eq!(body["quota_limit"], json!(10));
+    assert_eq!(body["quota_remaining"], json!(3));
+    let renews_at = body["quota_renews_at"].as_i64().expect("renews_at");
+    let synced_at = body["quota_synced_at"].as_i64().expect("synced_at");
+    assert!(renews_at > synced_at, "natural day renewal: {body}");
+    let (status, detail) = harness
+        .get_json(&format!("/api/keys/{}", ids[ZHIHU_VALID_SECRET]))
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(detail["quota_limit"], json!(10));
+    assert_eq!(detail["quota_remaining"], json!(3));
+    assert_eq!(detail["quota_renews_at"], json!(renews_at));
+    assert_eq!(detail["provider"], json!("zhihu"));
+    assert_eq!(harness.zhihu_counters.billable(), 0, "zhihu quota free");
+    assert_eq!(harness.zhihu_counters.probe_hits(), 1, "one quota read");
 
     // When syncing the exa key
     let (status, body) = harness
@@ -1179,4 +1473,39 @@ async fn key_list_facets_expose_provider_counts_with_tavily_merge() {
         vec![("serpapi".to_string(), 2_i64), ("tavily".to_string(), 2_i64)],
         "providers facet survives unknown filter"
     );
+
+    // When one keenable and one zhihu key join the pool
+    for (api_key, provider) in [
+        ("k-facet-keenable", "keenable"),
+        ("k-facet-zhihu", "zhihu"),
+    ] {
+        let (status, body) = harness
+            .create_key(json!({ "api_key": api_key, "provider": provider }))
+            .await;
+        assert_eq!(status, 201, "create {api_key}: {body}");
+    }
+
+    // Then both new provider ids appear in the facets with exact counts
+    let (status, body) = harness.get_json("/api/keys?per_page=100").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        provider_facets(&body),
+        vec![
+            ("keenable".to_string(), 1_i64),
+            ("serpapi".to_string(), 2_i64),
+            ("tavily".to_string(), 2_i64),
+            ("zhihu".to_string(), 1_i64),
+        ],
+        "facets cover keenable and zhihu"
+    );
+
+    // And each filter narrows to its own provider
+    for provider in ["keenable", "zhihu"] {
+        let (status, body) = harness
+            .get_json(&format!("/api/keys?provider={provider}"))
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["total"], json!(1), "{provider} total");
+        assert_eq!(body["items"][0]["provider"], json!(provider));
+    }
 }

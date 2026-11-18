@@ -234,7 +234,7 @@ fn validate_result_provider_echo(
 }
 
 /// Provider dispatch for one validation target: tavily rides the UNCHANGED
-/// legacy usage probe; serpapi/exa/brave ride the M13 zero-cost probes.
+/// legacy usage probe; every other provider rides its M13 zero-cost probe.
 async fn validate_key_for_provider(
     proxy: TavilyProxy,
     usage_base: String,
@@ -255,16 +255,12 @@ async fn validate_key_for_provider(
             )
             .await
         }
-        ProviderId::Serpapi | ProviderId::Exa | ProviderId::Brave => {
+        ProviderId::Serpapi
+        | ProviderId::Exa
+        | ProviderId::Brave
+        | ProviderId::Keenable
+        | ProviderId::Zhihu => {
             validate_provider_probe_key(&probe_client, &proxy, pending).await
-        }
-        // Typed todo-2 boundary (keenable-integration todo 13 replaces it):
-        // the zero-cost probes (Keenable missing-`query` 400-vs-401; Zhihu
-        // free /api/v1/quota) are not wired yet. NEVER an upstream call, never
-        // a billable hit, never a key mark.
-        ProviderId::Keenable | ProviderId::Zhihu => {
-            let provider = pending.provider;
-            provider_probe_result(pending, provider_probe_pending_outcome(provider))
         }
     }
 }
@@ -342,6 +338,10 @@ fn account_field_text(value: &Value) -> String {
 /// - brave: GET {rest}/res/v1/web/search WITHOUT `q` — auth precedes routing,
 ///   so a valid token yields 422 VALIDATION (unbilled) and an invalid token
 ///   yields 422 SUBSCRIPTION_TOKEN_INVALID.
+/// - keenable: POST {rest}/v1/search with `{}` — a valid key yields 400
+///   `missing_parameter` (nothing searched, nothing billed), a dead key 401.
+/// - zhihu: GET {rest}/api/v1/quota (the free daily-quota read) with the
+///   candidate Bearer + timestamp; `Code=0` valid, `Code=20001` invalid.
 async fn validate_provider_probe_key(
     client: &Client,
     proxy: &TavilyProxy,
@@ -365,31 +365,231 @@ async fn validate_provider_probe_key(
         ProviderId::Tavily => ProviderProbeOutcome::error(
             "tavily keys use the legacy usage probe path".to_string(),
         ),
-        // Unreachable while `validate_key_for_provider` owns the typed
-        // todo-2 boundary above; kept exhaustive and typed so this seam can
-        // never silently fall through to a provider probe.
-        ProviderId::Keenable | ProviderId::Zhihu => {
-            provider_probe_pending_outcome(pending.provider)
+        ProviderId::Keenable => {
+            probe_keenable_missing_query(client, &rest_base, &pending.api_key).await
+        }
+        ProviderId::Zhihu => {
+            probe_zhihu_quota(
+                client,
+                &rest_base,
+                &pending.api_key,
+                proxy.backend_time().now_ts(),
+            )
+            .await
         }
     };
     provider_probe_result(pending, outcome)
 }
 
-/// Typed todo-2 probe-pending outcome (keenable-integration todo 13
-/// replaces it): validation never targets an upstream for Keenable/Zhihu —
-/// no live call, no billable hit, no key mark — and answers the typed
-/// `probe_pending` result so the admin UI can surface it verbatim.
-fn provider_probe_pending_outcome(
-    provider: tavily_hikari::providers::ProviderId,
+/// Keenable zero-cost probe: `POST /v1/search` with an EMPTY body. The key
+/// authenticates before request validation, so a valid key answers 400
+/// `missing_parameter` (nothing was searched, nothing was billed) while a
+/// dead key answers 401. 402 is a valid-but-exhausted key; every other arm is
+/// a typed error and never a silent "valid".
+async fn probe_keenable_missing_query(
+    client: &Client,
+    rest_base: &str,
+    api_key: &str,
 ) -> ProviderProbeOutcome {
+    let response = match client
+        .post(format!("{rest_base}/v1/search"))
+        .header("X-API-Key", api_key)
+        .json(&json!({}))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            return ProviderProbeOutcome::error(format!(
+                "Keenable missing-query probe failed: {err}"
+            ));
+        }
+    };
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    let code = parsed["code"].as_str().unwrap_or_default().to_string();
+    if status == reqwest::StatusCode::BAD_REQUEST && code == "missing_parameter" {
+        return ProviderProbeOutcome {
+            status: "ok",
+            kind: "ok",
+            reason: Some(code),
+            quota_limit: None,
+            quota_remaining: None,
+            detail: Some(truncate_detail(
+                "zero-cost probe: 400 missing_parameter proves the key authenticated; no query was billed"
+                    .to_string(),
+                1400,
+            )),
+        };
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return ProviderProbeOutcome {
+            status: "invalid",
+            kind: "invalid",
+            reason: Some(if code.is_empty() {
+                "auth_failed".to_string()
+            } else {
+                code
+            }),
+            quota_limit: None,
+            quota_remaining: None,
+            detail: Some(provider_probe_detail(status, &body)),
+        };
+    }
+    if status == reqwest::StatusCode::PAYMENT_REQUIRED {
+        return ProviderProbeOutcome {
+            status: "ok_exhausted",
+            kind: "exhausted",
+            reason: Some(if code.is_empty() {
+                "insufficient_credits".to_string()
+            } else {
+                code
+            }),
+            quota_limit: None,
+            quota_remaining: None,
+            detail: Some(provider_probe_detail(status, &body)),
+        };
+    }
     ProviderProbeOutcome {
-        status: "pending",
-        kind: "probe_pending",
-        reason: Some(format!("{provider} key validation probe is not wired yet")),
+        status: "error",
+        kind: "error",
+        reason: Some(if code.is_empty() {
+            format!("http_{}", status.as_u16())
+        } else {
+            code
+        }),
         quota_limit: None,
         quota_remaining: None,
-        detail: None,
+        detail: Some(provider_probe_detail(status, &body)),
     }
+}
+
+/// Zhihu zero-cost probe: the FREE daily `/api/v1/quota` read with the
+/// candidate's Bearer plus a server-generated timestamp. `Code=0` is a valid
+/// secret (and surfaces the daily capacity), `Code=20001` is an auth failure;
+/// every other envelope is a typed error. No content endpoint is ever hit, so
+/// no query quota is consumed.
+async fn probe_zhihu_quota(
+    client: &Client,
+    rest_base: &str,
+    api_key: &str,
+    now_ts: i64,
+) -> ProviderProbeOutcome {
+    let response = match client
+        .get(format!("{rest_base}/api/v1/quota"))
+        .query(&[("APIIDs", "zhihu_search,global_search")])
+        .bearer_auth(api_key)
+        .header("x-request-timestamp", now_ts.to_string())
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            return ProviderProbeOutcome::error(format!("Zhihu quota probe failed: {err}"));
+        }
+    };
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    let envelope_code = parsed["Code"].as_i64();
+    if !status.is_success() {
+        return ProviderProbeOutcome {
+            status: "error",
+            kind: "error",
+            reason: Some(match envelope_code {
+                Some(code) => format!("code_{code}"),
+                None => format!("http_{}", status.as_u16()),
+            }),
+            quota_limit: None,
+            quota_remaining: None,
+            detail: Some(provider_probe_detail(status, &body)),
+        };
+    }
+    match envelope_code {
+        Some(0) => {
+            let (quota_limit, quota_remaining) = zhihu_probe_quota_fields(&parsed);
+            let exhausted = quota_remaining.is_some_and(|remaining| remaining <= 0);
+            ProviderProbeOutcome {
+                status: if exhausted { "ok_exhausted" } else { "ok" },
+                kind: if exhausted { "exhausted" } else { "ok" },
+                reason: Some("quota_api_code_0".to_string()),
+                quota_limit,
+                quota_remaining,
+                detail: Some(truncate_detail(
+                    format!(
+                        "zero-cost probe: free /api/v1/quota answered Code=0 (limit={quota_limit:?}, remaining={quota_remaining:?}); no search quota was consumed"
+                    ),
+                    1400,
+                )),
+            }
+        }
+        Some(20001) => ProviderProbeOutcome {
+            status: "invalid",
+            kind: "invalid",
+            reason: Some("auth_failed".to_string()),
+            quota_limit: None,
+            quota_remaining: None,
+            detail: Some(provider_probe_detail(status, &body)),
+        },
+        Some(30001) => ProviderProbeOutcome {
+            status: "rate_limited",
+            kind: "error",
+            reason: Some("rate_limited".to_string()),
+            quota_limit: None,
+            quota_remaining: None,
+            detail: Some(provider_probe_detail(status, &body)),
+        },
+        Some(90001) => ProviderProbeOutcome {
+            status: "upstream_error",
+            kind: "error",
+            reason: Some("upstream_error".to_string()),
+            quota_limit: None,
+            quota_remaining: None,
+            detail: Some(provider_probe_detail(status, &body)),
+        },
+        other => ProviderProbeOutcome {
+            status: "error",
+            kind: "error",
+            reason: Some(match other {
+                Some(code) => format!("code_{code}"),
+                None => "missing_code".to_string(),
+            }),
+            quota_limit: None,
+            quota_remaining: None,
+            detail: Some(provider_probe_detail(status, &body)),
+        },
+    }
+}
+
+/// Mirrors the quota-sync selection: the tighter remaining of the two daily
+/// capabilities wins, and its `TotalQuota` is the reported limit.
+fn zhihu_probe_quota_fields(payload: &Value) -> (Option<i64>, Option<i64>) {
+    let Some(entries) = payload["Data"].as_array() else {
+        return (None, None);
+    };
+    let mut selected: Option<(i64, i64)> = None;
+    for api_id in ["zhihu_search", "global_search"] {
+        let Some(entry) = entries
+            .iter()
+            .find(|entry| entry["APIID"].as_str() == Some(api_id))
+        else {
+            continue;
+        };
+        let (Some(total_quota), Some(remaining_quota)) = (
+            entry["TotalQuota"].as_i64(),
+            entry["RemainingQuota"].as_i64(),
+        ) else {
+            continue;
+        };
+        match selected {
+            Some((best_remaining, _)) if remaining_quota >= best_remaining => {}
+            _ => selected = Some((remaining_quota, total_quota)),
+        }
+    }
+    selected
+        .map(|(remaining, limit)| (Some(limit), Some(remaining)))
+        .unwrap_or((None, None))
 }
 
 async fn probe_serpapi_account(
