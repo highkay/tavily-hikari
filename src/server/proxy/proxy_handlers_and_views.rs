@@ -2092,6 +2092,9 @@ impl ApiKeyView {
                     scopes: transient_backoff.scopes,
                 }
             }),
+            // Detail-only additive field; the key detail handler fills it for
+            // Keenable rows (plan todo 22). List payloads keep omitting it.
+            rate_limit: None,
         }
     }
 }

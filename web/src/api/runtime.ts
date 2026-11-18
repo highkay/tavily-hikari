@@ -8,7 +8,7 @@ import type { ClientIpHeaderValue } from './clientIp'
 import type { HaChannelHealth } from './haTypes'
 import { normalizeHaStatus, type HaStatus, type HaStatusWire } from './haStatus'
 import type { RequestLogRetentionSettings } from './requestLogRetention'
-import type { ApiKeyUsageSyncOutcome, ProviderId, ProviderQuotaSource, ProviderQuotaSyncSnapshot, SummaryProviderCount, SyncUsageErrorBody, UserProviderCount } from './providers'
+import type { ApiKeyUsageSyncOutcome, KeenableRateLimitSnapshot, ProviderId, ProviderQuotaSource, ProviderQuotaSyncSnapshot, SummaryProviderCount, SyncUsageErrorBody, UserProviderCount } from './providers'
 import type {
   AdminMcpSessionBindingsPage,
   AdminMcpSessionBindingsQuery,
@@ -432,6 +432,7 @@ export interface ApiKeyStats {
   quota_synced_at: number | null
   quota_renews_at?: number | null
   quota_source?: ProviderQuotaSource | null
+  rate_limit?: KeenableRateLimitSnapshot | null
   total_requests: number
   success_count: number
   error_count: number

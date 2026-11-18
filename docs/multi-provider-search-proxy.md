@@ -363,10 +363,11 @@ MCP 工具：`search_web_pages`、`fetch_page_content`（各 1 credit，仅 `too
 
 **用量同步（被动采集）**：每个带 key 的 REST 成功响应与 MCP 成功 `tools/call` 采样
 `usage.credits_remaining`（源 `keenable_passive`、`quota_limit` 为空；估算值可能滞后或缺位，
-仅材料变化落库，失败路径不加额外延迟）；`X-RateLimit-*` 头作为近限速信号。admin `sync-usage`
-返回最后一次被动快照，不做主动轮询。速率上限为每组织 10 rps（该组织全部 key 与
-search+fetch 共享）；供应商公布的免费档为 100,000 请求/月（合同签署时，套餐可能变化，
-以供应商当前公布为准）。
+仅材料变化落库，失败路径不加额外延迟）；`X-RateLimit-Limit/Remaining/Reset` 三头齐全时
+另存到既有 `meta` 表（`keenable_rate_limit_v1:<api_key_id>`，不写月度额度列），并在管理端
+密钥详情与额度面板展示。admin `sync-usage` 返回最后一次被动快照，不做主动轮询。速率上限为
+每组织 10 rps（该组织全部 key 与 search+fetch 共享）；供应商公布的免费档为 100,000 请求/月
+（合同签署时，套餐可能变化，以供应商当前公布为准）。
 
 **MCP 模式理由**：Keenable 托管 MCP 可用且为 JSON（无 SSE），直通保留官方工具名与 schema；
 Hikari 只做 `X-API-Key` 注入、会话翻译与计费。

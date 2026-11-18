@@ -147,6 +147,35 @@ describe('KeyQuotaPanel quotaDisplayKind variants (plan todo 22)', () => {
     expect(synced.textContent ?? '').toContain('T1700000000')
   })
 
+  it('renders the harvested Keenable rate-limit window next to credits in en and zh', () => {
+    const detail = keyStats({
+      provider: 'keenable',
+      quota_remaining: 99_999,
+      quota_synced_at: 1_700_000_000,
+      rate_limit: {
+        limit: 10,
+        remaining: 9,
+        reset: '2026-12-31T23:59:59Z',
+        reset_at: 1_798_761_599,
+        captured_at: 1_700_000_000,
+      },
+    })
+    const english = renderQuota(detail)
+    const text = english.textContent ?? ''
+    expect(text).toContain('Rate limit')
+    expect(text).toContain('9 / 10')
+    expect(text).toContain('Reset T1798761599')
+    expect(
+      Array.from(english.querySelectorAll('[data-provider="keenable"] .metric-card h3')).map(
+        (node) => node.textContent,
+      ),
+    ).toEqual(['Credits remaining', 'Rate limit', 'Synced'])
+
+    const chinese = renderQuota(detail, 'zh')
+    expect(chinese.textContent ?? '').toContain('限速窗口')
+    expect(chinese.textContent ?? '').toContain('重置 T1798761599')
+  })
+
   it('renders Zhihu daily remaining and natural-day renewal in en and zh', () => {
     const detail = keyStats({
       provider: 'zhihu',

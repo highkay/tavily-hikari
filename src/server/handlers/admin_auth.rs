@@ -339,7 +339,17 @@ async fn get_api_key_detail(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if let Some(found) = items {
-        Ok(Json(ApiKeyView::from_detail(found)))
+        let mut view = ApiKeyView::from_detail(found);
+        // Additive operator surface for the passive Keenable X-RateLimit
+        // window (plan todo 22): detail-only, omitted when no record exists.
+        if view.provider == tavily_hikari::providers::ProviderId::Keenable {
+            view.rate_limit = state
+                .proxy
+                .get_keenable_rate_limit_snapshot(&id)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        }
+        Ok(Json(view))
     } else {
         Err(StatusCode::NOT_FOUND)
     }

@@ -119,7 +119,7 @@ export function KeyQuotaPanel({
     }
     if (kind === 'harvested_remaining') {
       const missingValue = normalizedProviderId === 'keenable' ? '--' : '—'
-      return [
+      const harvestedCards: MetricCard[] = [
         {
           id: 'remaining',
           label: normalizedProviderId === 'keenable' ? shared.quotaCreditsRemaining : shared.quotaRemaining,
@@ -133,6 +133,21 @@ export function KeyQuotaPanel({
           subtitle: '',
         },
       ]
+      // Passive X-RateLimit window (plan todo 22): rendered only when the
+      // key has a harvested record, so a missing snapshot keeps the existing
+      // "--" markers and never invents a per-second balance card.
+      const rateLimit = detail.rate_limit
+      if (rateLimit) {
+        harvestedCards.splice(1, 0, {
+          id: 'rateLimit',
+          label: shared.quotaRateLimit,
+          value: `${formatNumber(rateLimit.remaining)} / ${formatNumber(rateLimit.limit)}`,
+          subtitle: rateLimit.reset_at
+            ? `${shared.quotaRateLimitReset} ${formatTimestamp(rateLimit.reset_at)}`
+            : `${shared.quotaRateLimitReset} ${rateLimit.reset}`,
+        })
+      }
+      return harvestedCards
     }
     return []
   })()

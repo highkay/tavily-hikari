@@ -3004,6 +3004,43 @@ mod keenable {
             count
         }
 
+        /// The persisted passive X-RateLimit snapshot for one keenable key
+        /// (`meta.keenable_rate_limit_v1:<key id>`), decoded (plan todo 22).
+        async fn keenable_rate_limit_meta(&self, api_key: &str) -> Option<Value> {
+            let pool = self.pool().await;
+            let key_id: Option<String> = sqlx::query_scalar(
+                "SELECT id FROM api_keys WHERE api_key = ? AND provider = 'keenable'",
+            )
+            .bind(api_key)
+            .fetch_optional(&pool)
+            .await
+            .expect("keenable key id");
+            let value = match key_id {
+                Some(key_id) => {
+                    sqlx::query_scalar::<_, String>("SELECT value FROM meta WHERE key = ? LIMIT 1")
+                        .bind(format!("keenable_rate_limit_v1:{key_id}"))
+                        .fetch_optional(&pool)
+                        .await
+                        .expect("rate limit meta row")
+                }
+                None => None,
+            };
+            pool.close().await;
+            value.map(|text| serde_json::from_str(&text).expect("rate limit snapshot json"))
+        }
+
+        async fn keenable_rate_limit_meta_count(&self) -> i64 {
+            let pool = self.pool().await;
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM meta m                  JOIN api_keys k ON m.key = 'keenable_rate_limit_v1:' || k.id                  WHERE k.provider = 'keenable'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("rate limit meta count");
+            pool.close().await;
+            count
+        }
+
         async fn charged_credits(&self, token_id: &str) -> i64 {
             let pool = self.pool().await;
             let credits: i64 = sqlx::query_scalar(
@@ -3194,6 +3231,97 @@ mod keenable {
         assert_eq!(quota_limit, None);
         assert!(quota_synced_at.is_some());
         assert_eq!(harness.keenable_passive_sample_count().await, 1);
+    }
+
+    /// Plan todo 22: a keyed Keenable REST success carrying the documented
+    /// X-RateLimit-* triple leaves a persisted window record (existing meta
+    /// KV) while the credits_remaining harvest keeps its own columns/sample.
+    #[tokio::test]
+    async fn keenable_x_ratelimit_headers_are_persisted_without_touching_credits() {
+        let harness =
+            spawn_harness("facades-keenable-ratelimit", &["ke-pool-1"], &["ke-pool-1"]).await;
+
+        let (status, headers, body) = harness.post_search(&json!({ "query": "mock rust" })).await;
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(body, mock_search_body(99_999));
+        // Client-facing passthrough is unchanged.
+        assert_eq!(
+            headers
+                .get("x-ratelimit-limit")
+                .and_then(|value| value.to_str().ok()),
+            Some("10")
+        );
+        assert_eq!(
+            headers
+                .get("x-ratelimit-remaining")
+                .and_then(|value| value.to_str().ok()),
+            Some("9")
+        );
+
+        // The monthly credit harvest is untouched: same live balance, same
+        // single keenable_passive sample, quota_limit NULL.
+        let (quota_limit, quota_remaining, quota_renews_at, _synced_at) =
+            harness.key_quota("ke-pool-1").await;
+        assert_eq!(quota_remaining, Some(99_999));
+        assert_eq!(quota_limit, None);
+        assert_eq!(quota_renews_at, None);
+        assert_eq!(harness.keenable_passive_sample_count().await, 1);
+
+        // The rate-limit window is a SEPARATE record in the existing meta KV.
+        let snapshot = harness
+            .keenable_rate_limit_meta("ke-pool-1")
+            .await
+            .expect("persisted rate-limit snapshot");
+        assert_eq!(snapshot["limit"], json!(10));
+        assert_eq!(snapshot["remaining"], json!(9));
+        assert_eq!(snapshot["reset"], json!("2026-12-31T23:59:59Z"));
+        assert_eq!(snapshot["reset_at"], json!(1_798_761_599_i64));
+        assert!(snapshot["captured_at"].as_i64().unwrap_or_default() > 0);
+
+        // A second identical response is a non-material repeat: the record is
+        // not rewritten (bounded-write proof).
+        let first_captured_at = snapshot["captured_at"].clone();
+        let (status, _headers, _body) = harness.post_search(&json!({ "query": "mock rust" })).await;
+        assert_eq!(status, reqwest::StatusCode::OK);
+        let repeated = harness
+            .keenable_rate_limit_meta("ke-pool-1")
+            .await
+            .expect("persisted rate-limit snapshot");
+        assert_eq!(repeated["captured_at"], first_captured_at);
+    }
+
+    /// Plan todo 22 failure arm: an authenticated success WITHOUT the header
+    /// triple (stub `key-no-ratelimit-headers`) writes no rate-limit record,
+    /// while the credits harvest still persists its normal sample.
+    #[tokio::test]
+    async fn keenable_success_without_x_ratelimit_headers_writes_no_rate_limit_record() {
+        let harness = spawn_harness(
+            "facades-keenable-ratelimit-stripped",
+            &["key-no-ratelimit-headers"],
+            &["key-no-ratelimit-headers"],
+        )
+        .await;
+
+        let (status, headers, body) = harness.post_search(&json!({ "query": "mock rust" })).await;
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(body, mock_search_body(99_999));
+        assert!(headers.get("x-ratelimit-limit").is_none());
+
+        let (_quota_limit, quota_remaining, _renews_at, _synced_at) =
+            harness.key_quota("key-no-ratelimit-headers").await;
+        assert_eq!(quota_remaining, Some(99_999));
+        assert_eq!(harness.keenable_passive_sample_count().await, 1);
+        assert_eq!(
+            harness.keenable_rate_limit_meta_count().await,
+            0,
+            "no X-RateLimit-* headers -> no rate-limit record"
+        );
+        assert_eq!(
+            harness
+                .keenable_rate_limit_meta("key-no-ratelimit-headers")
+                .await,
+            None
+        );
     }
 
     /// 402 insufficient_credits marks the leased key exhausted, the bounded

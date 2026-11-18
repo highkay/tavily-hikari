@@ -61,7 +61,9 @@ pub use proxy_provider_facade_brave::{BraveFacadeOutcome, brave_facade_outcome};
 // signal, never on HTTP 2xx alone. The SerpApi/Exa/Brave record paths stay
 // byte-identical behind their own gates; Tavily REST never reaches this seam.
 mod proxy_provider_facade_keenable;
-pub use proxy_provider_facade_keenable::{KeenableFacadeOutcome, keenable_facade_outcome};
+pub use proxy_provider_facade_keenable::{
+    KeenableFacadeOutcome, KeenableRateLimitSnapshot, keenable_facade_outcome,
+};
 
 // Zhihu REST execution layer (keenable-integration plan todo 9): both native
 // GET content routes through the generic executor with Bearer + server-side
@@ -408,9 +410,11 @@ impl TavilyProxy {
                         // Keenable (todo 7): books the attempt AND harvests
                         // the passive credit balance from the already-buffered
                         // response body (usage.credits_remaining, source
-                        // keenable_passive, zero extra requests).
+                        // keenable_passive, zero extra requests) plus the
+                        // documented X-RateLimit-* window from the buffered
+                        // response headers (todo 22, existing meta KV seam).
                         providers::ProviderId::Keenable => {
-                            self.record_keenable_rest_facade_attempt(&attempt_ctx)
+                            self.record_keenable_rest_facade_attempt(&attempt_ctx, &headers)
                                 .await?
                         }
                         // Zhihu (todo 9): the envelope-aware record path

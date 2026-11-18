@@ -346,6 +346,31 @@ impl KeenableMcpHarness {
             .collect()
     }
 
+    /// The persisted passive X-RateLimit snapshot for one keenable key
+    /// (`meta.keenable_rate_limit_v1:<key id>`), decoded (plan todo 22).
+    async fn keenable_rate_limit_meta(&self, api_key: &str) -> Option<Value> {
+        let pool = self.pool().await;
+        let key_id: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM api_keys WHERE api_key = ? AND provider = 'keenable'",
+        )
+        .bind(api_key)
+        .fetch_optional(&pool)
+        .await
+        .expect("keenable key id");
+        let value = match key_id {
+            Some(key_id) => sqlx::query_scalar::<_, String>(
+                "SELECT value FROM meta WHERE key = ? LIMIT 1",
+            )
+            .bind(format!("keenable_rate_limit_v1:{key_id}"))
+            .fetch_optional(&pool)
+            .await
+            .expect("rate limit meta row"),
+            None => None,
+        };
+        pool.close().await;
+        value.map(|text| serde_json::from_str(&text).expect("rate limit snapshot json"))
+    }
+
     async fn token_log_rows(&self) -> Vec<(Option<String>, Option<i64>, Option<String>)> {
         let pool = self.pool().await;
         let rows = sqlx::query(
@@ -624,6 +649,62 @@ async fn keenable_tools_call_search_bills_one_credit_and_harvests_meta() {
     assert_eq!(metrics["last_api_key"], json!("ke-pool-3"));
     assert_eq!(metrics["last_authorization"], Value::Null);
     assert_eq!(metrics["mcp_tools_call"], json!(1));
+}
+
+/// Plan todo 22: a hosted-MCP tools/call carrying the documented
+/// X-RateLimit-* response headers leaves a persisted rate-limit window in the
+/// existing meta KV while the credits_remaining harvest is unchanged.
+#[tokio::test]
+async fn keenable_mcp_tools_call_harvests_x_ratelimit_headers() {
+    let harness = spawn_keenable_harness("mcp-ke-ratelimit", &["ke-pool-5"], &["ke-pool-5"]).await;
+    let session = harness.initialize_session(1).await;
+
+    let response = harness
+        .keenable_mcp_call(
+            Some(&session),
+            &KeenableMcpHarness::tools_call_message(
+                2,
+                "search_web_pages",
+                json!({ "query": "mcp ratelimit" }),
+            ),
+        )
+        .await;
+    assert_eq!(response.status, StatusCode::OK);
+
+    // The passive X-RateLimit window is a SEPARATE record: the monthly
+    // credits harvest still owns api_keys.quota_remaining and its sample.
+    let snapshot = harness
+        .keenable_rate_limit_meta("ke-pool-5")
+        .await
+        .expect("persisted MCP rate-limit snapshot");
+    assert_eq!(snapshot["limit"], json!(10));
+    assert_eq!(snapshot["remaining"], json!(9));
+    assert_eq!(snapshot["reset"], json!("2026-12-31T23:59:59Z"));
+    assert_eq!(snapshot["reset_at"], json!(1_798_761_599_i64));
+    assert!(snapshot["captured_at"].as_i64().unwrap_or_default() > 0);
+
+    let pool = harness.pool().await;
+    let (quota_limit, quota_remaining, quota_renews_at): (Option<i64>, Option<i64>, Option<i64>) =
+        sqlx::query_as(
+            "SELECT quota_limit, quota_remaining, quota_renews_at FROM api_keys \
+             WHERE provider = 'keenable' AND deleted_at IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("keenable key row");
+    assert_eq!(quota_remaining, Some(99_999));
+    assert_eq!(quota_limit, None);
+    assert_eq!(quota_renews_at, None);
+    let samples: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM api_key_quota_sync_samples s \
+         JOIN api_keys k ON k.id = s.key_id \
+         WHERE k.provider = 'keenable' AND s.source = 'keenable_passive'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("passive sample scan");
+    assert_eq!(samples, 1);
+    pool.close().await;
 }
 
 /// Criterion: tools/call fetch_page_content bills 1 credit under kind

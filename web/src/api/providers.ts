@@ -247,6 +247,19 @@ export interface ProviderQuotaSyncSnapshot {
   quota_synced_at: number | null
 }
 
+/**
+ * Passive Keenable `X-RateLimit-*` window snapshot (plan todo 22). `reset` is
+ * the header value verbatim; `reset_at` is the parsed epoch when the value is
+ * an ISO 8601 instant. Detail-only additive field on `ApiKeyStats`.
+ */
+export interface KeenableRateLimitSnapshot {
+  limit: number
+  remaining: number
+  reset: string
+  reset_at?: number | null
+  captured_at: number
+}
+
 /** Typed sync-usage error body: Exa 409 `sync_unsupported`, SerpApi 401 `usage_http`. */
 export interface SyncUsageErrorBody {
   error: string

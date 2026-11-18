@@ -40,6 +40,10 @@ const KEY_RATE: &str = "key-rate";
 const KEY_TARGET: &str = "key-target";
 const KEY_5XX: &str = "key-5xx";
 const KEY_SLOW: &str = "key-slow";
+/// Scripted success arm that authenticates and bills normally but omits the
+/// documented `X-RateLimit-*` response headers (plan todo 22): the passive
+/// rate-limit harvest must write nothing for it.
+const KEY_NO_RATE_LIMIT_HEADERS: &str = "key-no-ratelimit-headers";
 const STARTING_CREDITS: u64 = 100_000;
 const SLOW_DELAY_DEFAULT_MS: u64 = 35_000;
 
@@ -71,6 +75,7 @@ struct Cli {
 #[derive(Debug, PartialEq, Eq)]
 enum KeyStatus {
     Valid,
+    NoRateLimitHeaders,
     Partial,
     Exhausted,
     Invalid,
@@ -128,6 +133,7 @@ impl MockState {
     fn classify(&self, key: &str) -> KeyStatus {
         match key {
             KEY_GOOD => KeyStatus::Valid,
+            KEY_NO_RATE_LIMIT_HEADERS => KeyStatus::NoRateLimitHeaders,
             KEY_PARTIAL => KeyStatus::Partial,
             KEY_EXHAUSTED => KeyStatus::Exhausted,
             KEY_AUTH => KeyStatus::Invalid,
@@ -152,7 +158,10 @@ impl MockState {
         })
     }
 
-    fn rate_limit_headers(&self) -> [(HeaderName, String); 4] {
+    /// Documented per-second window (10 rps/org). `X-RateLimit-Reset` is an
+    /// ISO 8601 instant per the vendor docs; the fixed stub instant keeps
+    /// every harness deterministic.
+    fn rate_limit_headers() -> [(HeaderName, String); 4] {
         [
             (
                 HeaderName::from_static("x-ratelimit-limit"),
@@ -160,17 +169,27 @@ impl MockState {
             ),
             (
                 HeaderName::from_static("x-ratelimit-remaining"),
-                self.credits_remaining.load(Ordering::SeqCst).to_string(),
+                "9".to_string(),
             ),
             (
                 HeaderName::from_static("x-ratelimit-reset"),
-                "1".to_string(),
+                "2026-12-31T23:59:59Z".to_string(),
             ),
             (
                 HeaderName::from_static("x-request-id"),
                 "mock-request-id".to_string(),
             ),
         ]
+    }
+}
+
+/// Build a success response with the documented `X-RateLimit-*` triple unless
+/// the scripted key suppresses it (plan todo 22 stripped-headers arm).
+fn success_response(headers: &HeaderMap, body: Value) -> Response {
+    if api_key(headers) == KEY_NO_RATE_LIMIT_HEADERS {
+        (StatusCode::OK, Json(body)).into_response()
+    } else {
+        (StatusCode::OK, MockState::rate_limit_headers(), Json(body)).into_response()
     }
 }
 
@@ -299,7 +318,7 @@ async fn authorize(state: &MockState, headers: &HeaderMap) -> Option<Response> {
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
     match state.classify(&key) {
-        KeyStatus::Valid => None,
+        KeyStatus::Valid | KeyStatus::NoRateLimitHeaders => None,
         KeyStatus::Partial => Some(
             (
                 StatusCode::OK,
@@ -399,12 +418,7 @@ async fn handle_search(
             .into_response();
     }
     let mode = parsed.get("mode").and_then(Value::as_str).unwrap_or("pro");
-    (
-        StatusCode::OK,
-        state.rate_limit_headers(),
-        Json(search_success_body(&state, query, mode)),
-    )
-        .into_response()
+    success_response(&headers, search_success_body(&state, query, mode))
 }
 
 #[derive(Deserialize)]
@@ -426,12 +440,7 @@ async fn handle_fetch(
     let Some(url) = query.url.as_deref().filter(|url| !url.trim().is_empty()) else {
         return (StatusCode::BAD_REQUEST, Json(missing_parameter_body("url"))).into_response();
     };
-    (
-        StatusCode::OK,
-        state.rate_limit_headers(),
-        Json(fetch_success_body(&state, url)),
-    )
-        .into_response()
+    success_response(&headers, fetch_success_body(&state, url))
 }
 
 fn rpc_error(id: Value, code: i64, message: &str) -> Response {
@@ -542,13 +551,21 @@ async fn handle_mcp(
                 .counters
                 .mcp_initialize
                 .fetch_add(1, Ordering::Relaxed);
+            // Vendor-faithful JSON-RPC envelope: the probe captures for the
+            // real hosted server wrap the initialize result under `result`.
+            // The mock used to answer a bare object, which the mock contract
+            // test (and the vendor shape) rejects.
             let body = json!({
-                "protocolVersion": "2025-06-18",
-                "capabilities": { "tools": {}, "resources": {}, "prompts": {} },
-                "serverInfo": {
-                    "name": "keenable-mcp-server",
-                    "version": "0.2.1",
-                    "title": "Keenable Web Search"
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": { "tools": {}, "resources": {}, "prompts": {} },
+                    "serverInfo": {
+                        "name": "keenable-mcp-server",
+                        "version": "0.2.1",
+                        "title": "Keenable Web Search"
+                    }
                 }
             });
             // Streamable-HTTP lifecycle: initialize mints the upstream protocol
@@ -600,7 +617,10 @@ async fn handle_mcp(
                 .unwrap_or_default();
             let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
             match tools_call_result(&state, name, &arguments) {
-                Ok(result) => rpc_result(id, result),
+                Ok(result) => success_response(
+                    &headers,
+                    json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                ),
                 Err(response) => *response,
             }
         }

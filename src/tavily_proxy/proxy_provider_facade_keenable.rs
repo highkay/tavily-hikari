@@ -24,6 +24,13 @@
 //!   request (best-effort, contention-skipped), leaves the live key's
 //!   `quota_limit` NULL and never touches `quota_renews_at` (a prepaid
 //!   balance has no plan limit and no calendar reset);
+//! * the PASSIVE RATE-LIMIT HARVEST (plan todo 22): every keyed response
+//!   carrying the documented `X-RateLimit-Limit`/`-Remaining`/`-Reset` triple
+//!   is snapshotted into the existing `meta` KV row
+//!   `keenable_rate_limit_v1:<api_key_id>` (no schema migration, zero extra
+//!   outbound requests). The per-second window is NEVER written to the
+//!   monthly `quota_limit`/`quota_remaining` columns or the credit-sample
+//!   table, so `usage.credits_remaining` stays the only balance signal;
 //! * a deterministic bin-side outcome projection (`keenable_facade_outcome`)
 //!   carrying `business_success` (true ONLY on `ProviderFailureSignal::Ok`):
 //!   the classifier can auth-fail on a 2xx body (`authentication_error` rides
@@ -43,6 +50,73 @@ use super::*;
 /// Tavily/SerpApi/Brave sync paths so the sample table stays auditable per
 /// source).
 const KEENABLE_PASSIVE_QUOTA_SYNC_SOURCE: &str = "keenable_passive";
+
+/// `meta` KV prefix for the passive X-RateLimit window snapshot (plan todo
+/// 22). The row's value is a serialized [`KeenableRateLimitSnapshot`]; the
+/// table is pre-existing, so the harvest needs NO schema migration and never
+/// writes the monthly quota columns.
+const KEENABLE_RATE_LIMIT_META_PREFIX: &str = "keenable_rate_limit_v1:";
+
+/// One passively harvested Keenable rate-limit window (plan todo 22).
+/// `limit`/`remaining` are the documented `X-RateLimit-*` counters. `reset` is
+/// the header value VERBATIM: the vendor documents an ISO 8601 instant while
+/// stubs may advertise a numeric hint, so the raw value is preserved and
+/// `reset_at` carries the parsed epoch only when the value really is ISO 8601.
+/// The record lives in the `meta` KV table, NOT in the monthly credit columns.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KeenableRateLimitSnapshot {
+    pub limit: i64,
+    pub remaining: i64,
+    pub reset: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_at: Option<i64>,
+    pub captured_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeenableRateLimitWindow {
+    limit: i64,
+    remaining: i64,
+    reset: String,
+    reset_at: Option<i64>,
+}
+
+fn keenable_header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name)?.to_str().ok()
+}
+
+/// Parse the documented `X-RateLimit-Limit` / `-Remaining` / `-Reset` triple.
+/// ALL THREE headers are required: a partial or unparseable triple is simply
+/// no window (no write, no louder-than-debug event), mirroring Brave's
+/// "missing window -> no harvest" rule. `X-RateLimit-Reset` is kept verbatim;
+/// its ISO 8601 form (vendor docs) is additionally parsed to an epoch.
+fn parse_keenable_rate_limit_window(headers: &HeaderMap) -> Option<KeenableRateLimitWindow> {
+    let limit = keenable_header_str(headers, "x-ratelimit-limit")?
+        .trim()
+        .parse::<i64>()
+        .ok()?;
+    let remaining = keenable_header_str(headers, "x-ratelimit-remaining")?
+        .trim()
+        .parse::<i64>()
+        .ok()?;
+    let reset = keenable_header_str(headers, "x-ratelimit-reset")?.trim();
+    if reset.is_empty() {
+        return None;
+    }
+    let reset_at = chrono::DateTime::parse_from_rfc3339(reset)
+        .ok()
+        .map(|value| value.timestamp());
+    Some(KeenableRateLimitWindow {
+        limit,
+        remaining,
+        reset: reset.to_string(),
+        reset_at,
+    })
+}
+
+fn keenable_rate_limit_meta_key(key_id: &str) -> String {
+    format!("{KEENABLE_RATE_LIMIT_META_PREFIX}{key_id}")
+}
 
 /// Deterministic projection of one Keenable facade response onto the
 /// token-log vocabulary (result status + failure kind) plus the billing gate.
@@ -201,6 +275,7 @@ impl TavilyProxy {
     pub(crate) async fn record_keenable_rest_facade_attempt(
         &self,
         ctx: &ProviderFacadeAttemptContext<'_>,
+        response_headers: &HeaderMap,
     ) -> Result<ProviderFacadeAttemptRecord, ProxyError> {
         if ctx.request.provider != providers::ProviderId::Keenable {
             return Ok(ProviderFacadeAttemptRecord::boundary_default());
@@ -335,6 +410,12 @@ impl TavilyProxy {
         // the failure-path latency and adds zero outbound requests.
         self.harvest_keenable_passive_quota(&ctx.lease.id, ctx.body_bytes)
             .await;
+        // Passive rate-limit window harvest (plan todo 22): the documented
+        // X-RateLimit-* triple is snapshotted into the existing meta KV row,
+        // never into the monthly credit columns/samples. Best-effort and
+        // zero extra requests (the headers are already buffered).
+        self.harvest_keenable_rate_limit(&ctx.lease.id, response_headers)
+            .await;
 
         tracing::debug!(
             component = "provider_facade",
@@ -390,6 +471,104 @@ impl TavilyProxy {
         };
         self.persist_keenable_passive_credits(key_id, credits_remaining)
             .await;
+    }
+
+    /// Passive rate-limit harvest for the hosted-MCP passthrough (plan todo
+    /// 22): the documented `X-RateLimit-*` triple rides the buffered upstream
+    /// response headers, so the harvest adds zero outbound requests. Shares
+    /// the REST harvest's material-change persistence (the existing `meta` KV
+    /// row, monthly credit columns untouched, best-effort).
+    pub async fn harvest_keenable_mcp_rate_limit(
+        &self,
+        key_id: &str,
+        response_headers: &HeaderMap,
+    ) {
+        self.harvest_keenable_rate_limit(key_id, response_headers)
+            .await;
+    }
+
+    /// Best-effort passive rate-limit window harvest (plan todo 22). Reads
+    /// the already-buffered response headers; a missing/invalid triple returns
+    /// before any DB read, and every store error is logged at debug and
+    /// swallowed so the harvest never fails the request. Only a material
+    /// change (limit/remaining/reset) rewrites the `meta` row.
+    async fn harvest_keenable_rate_limit(&self, key_id: &str, response_headers: &HeaderMap) {
+        let Some(window) = parse_keenable_rate_limit_window(response_headers) else {
+            return;
+        };
+        let meta_key = keenable_rate_limit_meta_key(key_id);
+        let stored = self
+            .key_store
+            .get_meta_string(&meta_key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|text| serde_json::from_str::<KeenableRateLimitSnapshot>(&text).ok());
+        if stored.is_some_and(|previous| {
+            previous.limit == window.limit
+                && previous.remaining == window.remaining
+                && previous.reset == window.reset
+        }) {
+            // Non-material repeat: no meta write, no churn.
+            return;
+        }
+        let snapshot = KeenableRateLimitSnapshot {
+            limit: window.limit,
+            remaining: window.remaining,
+            reset: window.reset,
+            reset_at: window.reset_at,
+            captured_at: self.backend_time.now_ts(),
+        };
+        let Ok(encoded) = serde_json::to_string(&snapshot) else {
+            return;
+        };
+        if let Err(err) = self.key_store.set_meta_string(&meta_key, &encoded).await {
+            tracing::debug!(
+                component = "provider_facade",
+                event = "keenable_rate_limit_harvest_deferred",
+                api_key_id = %key_id,
+                err = %err,
+                "keenable rate-limit harvest skipped (best-effort, contention-safe)"
+            );
+            return;
+        }
+        tracing::debug!(
+            component = "provider_facade",
+            event = "keenable_rate_limit_harvest",
+            api_key_id = %key_id,
+            limit = snapshot.limit,
+            remaining = snapshot.remaining,
+            reset_at = ?snapshot.reset_at,
+            "keenable rate-limit window persisted"
+        );
+    }
+
+    /// Admin read side of the passive X-RateLimit snapshot (plan todo 22):
+    /// returns the last harvested window for a key, or `None` when the key has
+    /// no record (every other provider, a Keenable key whose upstream never
+    /// sent the headers, or a malformed legacy row). The key detail DTO
+    /// surfaces it next to `quota_remaining`.
+    pub async fn get_keenable_rate_limit_snapshot(
+        &self,
+        key_id: &str,
+    ) -> Result<Option<KeenableRateLimitSnapshot>, ProxyError> {
+        let meta_key = keenable_rate_limit_meta_key(key_id);
+        let Some(text) = self.key_store.get_meta_string(&meta_key).await? else {
+            return Ok(None);
+        };
+        match serde_json::from_str::<KeenableRateLimitSnapshot>(&text) {
+            Ok(snapshot) => Ok(Some(snapshot)),
+            Err(err) => {
+                tracing::debug!(
+                    component = "provider_facade",
+                    event = "keenable_rate_limit_snapshot_unreadable",
+                    api_key_id = %key_id,
+                    err = %err,
+                    "keenable rate-limit snapshot ignored (malformed)"
+                );
+                Ok(None)
+            }
+        }
     }
 
     /// Material-change persistence shared by the REST and hosted-MCP passive
@@ -705,6 +884,79 @@ mod keenable_facade_translation_tests {
                 parse_keenable_mcp_credits_remaining(body),
                 None,
                 "no sample from {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn keenable_rate_limit_parser_reads_the_documented_triple_and_rejects_partials() {
+        fn headers(entries: &[(&'static str, &'static str)]) -> HeaderMap {
+            let mut map = HeaderMap::new();
+            for (name, value) in entries {
+                map.insert(
+                    reqwest::header::HeaderName::from_static(name),
+                    reqwest::header::HeaderValue::from_static(value),
+                );
+            }
+            map
+        }
+
+        let iso = "2026-12-31T23:59:59Z";
+        let window = parse_keenable_rate_limit_window(&headers(&[
+            ("x-ratelimit-limit", "10"),
+            ("x-ratelimit-remaining", "9"),
+            ("x-ratelimit-reset", iso),
+        ]))
+        .expect("documented triple");
+        assert_eq!(window.limit, 10);
+        assert_eq!(window.remaining, 9);
+        assert_eq!(window.reset, iso);
+        assert_eq!(window.reset_at, Some(1_798_761_599));
+
+        // The committed stub may advertise a numeric hint: keep it verbatim
+        // and never invent an epoch.
+        let numeric = parse_keenable_rate_limit_window(&headers(&[
+            ("x-ratelimit-limit", "10"),
+            ("x-ratelimit-remaining", "9"),
+            ("x-ratelimit-reset", "1"),
+        ]))
+        .expect("numeric reset hint");
+        assert_eq!(numeric.reset, "1");
+        assert_eq!(numeric.reset_at, None);
+
+        // Every partial or unparseable triple is NO window (no write).
+        for entries in [
+            vec![
+                ("x-ratelimit-limit", "10"),
+                ("x-ratelimit-remaining", "9"),
+            ],
+            vec![
+                ("x-ratelimit-limit", "10"),
+                ("x-ratelimit-reset", iso),
+            ],
+            vec![
+                ("x-ratelimit-remaining", "9"),
+                ("x-ratelimit-reset", iso),
+            ],
+            vec![
+                ("x-ratelimit-limit", "ten"),
+                ("x-ratelimit-remaining", "9"),
+                ("x-ratelimit-reset", iso),
+            ],
+            vec![
+                ("x-ratelimit-limit", "10"),
+                ("x-ratelimit-remaining", "nine"),
+                ("x-ratelimit-reset", iso),
+            ],
+            vec![
+                ("x-ratelimit-limit", "10"),
+                ("x-ratelimit-remaining", "9"),
+                ("x-ratelimit-reset", " "),
+            ],
+        ] {
+            assert!(
+                parse_keenable_rate_limit_window(&headers(&entries)).is_none(),
+                "no window from {entries:?}"
             );
         }
     }

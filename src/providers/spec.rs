@@ -251,7 +251,8 @@ pub const KEENABLE: ProviderSpec = ProviderSpec {
     client_auth_header_slot: Some("X-API-Key"),
     credits: keenable_credits,
     // Passive harvest of `usage.credits_remaining` from every keyed
-    // response (REST and MCP `_meta`).
+    // response (REST and MCP `_meta`) plus the documented `X-RateLimit-*`
+    // window (existing meta KV; never the monthly balance).
     supports_quota_sync: true,
     recovery: RecoveryPolicy::UtcMonth,
     egress: EgressPolicy::DirectAllowed,

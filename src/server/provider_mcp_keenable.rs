@@ -909,6 +909,17 @@ pub(super) async fn provider_mcp_keenable_passthrough(
                         .await;
                 }
             }
+            // ---- Passive X-RateLimit harvest (plan todo 22) ----------------
+            // Every keyed response carrying the documented triple is
+            // snapshotted into the existing meta KV row; the monthly credit
+            // columns/samples are never touched by this signal (zero extra
+            // requests: the headers are already buffered).
+            if let Some(key_id) = resp.api_key_id.as_deref() {
+                state
+                    .proxy
+                    .harvest_keenable_mcp_rate_limit(key_id, &resp.headers)
+                    .await;
+            }
             // ---- Passive credit harvest (todo-8 contract) ------------------
             // A successful tools/call advertises the balance at
             // _meta["keenable/usage"].credits_remaining; the harvest reads the

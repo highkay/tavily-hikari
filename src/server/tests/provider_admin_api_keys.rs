@@ -789,11 +789,49 @@ async fn list_filter_and_detail_expose_provider_and_quota_renews_at() {
         .await;
     assert_eq!(status, 200);
     assert_eq!(body["provider"], json!("keenable"), "detail provider");
+    assert!(
+        body.get("rate_limit").is_none() || body["rate_limit"].is_null(),
+        "no harvested window yet: {body}"
+    );
+
+    // Seed the passive X-RateLimit snapshot (existing meta KV, plan todo 22)
+    // and assert the detail surfaces it operator-visibly.
+    let pool = connect_sqlite_test_pool(&harness.db_path.to_string_lossy()).await;
+    sqlx::query("INSERT INTO meta (key, value) VALUES (?, ?)")
+        .bind(format!("keenable_rate_limit_v1:{}", ids["k-keenable"]))
+        .bind(
+            json!({
+                "limit": 10,
+                "remaining": 9,
+                "reset": "2026-12-31T23:59:59Z",
+                "reset_at": 1_798_761_599_i64,
+                "captured_at": 1_700_000_000_i64
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .expect("seed rate-limit snapshot");
+    pool.close().await;
+
+    let (status, body) = harness
+        .get_json(&format!("/api/keys/{}", ids["k-keenable"]))
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["rate_limit"]["limit"], json!(10));
+    assert_eq!(body["rate_limit"]["remaining"], json!(9));
+    assert_eq!(body["rate_limit"]["reset"], json!("2026-12-31T23:59:59Z"));
+    assert_eq!(body["rate_limit"]["reset_at"], json!(1_798_761_599_i64));
+
     let (status, body) = harness
         .get_json(&format!("/api/keys/{}", ids["k-zhihu"]))
         .await;
     assert_eq!(status, 200);
     assert_eq!(body["provider"], json!("zhihu"), "detail provider");
+    assert!(
+        body.get("rate_limit").is_none() || body["rate_limit"].is_null(),
+        "only Keenable keys carry the additive window: {body}"
+    );
     assert!(
         body.get("quota_renews_at").is_none() || body["quota_renews_at"].is_null(),
         "detail quota_renews_at absent while NULL: {body}"

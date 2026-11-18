@@ -53,6 +53,8 @@ export interface AdminProviderSharedCopy {
   quotaCreditsRemaining: string
   quotaDailyRemaining: string
   quotaRenewalDate: string
+  quotaRateLimit: string
+  quotaRateLimitReset: string
   quotaSynced: string
   probeMethodLabel: string
   reasonLabel: string

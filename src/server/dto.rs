@@ -33,6 +33,11 @@ struct ApiKeyView {
     quota_exhausted_count: i64,
     quarantine: Option<ApiKeyQuarantineView>,
     transient_backoff: Option<ApiKeyTransientBackoffView>,
+    /// Additive passive Keenable `X-RateLimit-*` window (plan todo 22):
+    /// detail-only, omitted when the key has no harvested record, so every
+    /// legacy/provider payload keeps its exact shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rate_limit: Option<tavily_hikari::KeenableRateLimitSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize)]

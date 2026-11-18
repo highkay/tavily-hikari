@@ -96,8 +96,8 @@ const EXCEPTIONS: &[(&str, usize, &str)] = &[
     ),
     (
         "tests/provider_facades_contract.rs",
-        3810,
-        "The provider REST facade contract suite keeps growing one section per provider on the shared real-binary harness; the Keenable (keenable-integration todo 7) and Zhihu (todo 9) sections extend the same file instead of adding unregistered test targets while manifest registration stays with todo 20.",
+        3960,
+        "The provider REST facade contract suite keeps growing one section per provider on the shared real-binary harness; the Keenable (keenable-integration todo 7) and Zhihu (todo 9) sections plus the plan-todo-22 X-RateLimit harvest pair extend the same file instead of adding unregistered test targets while manifest registration stays with todo 20.",
     ),
 ];
 

@@ -157,6 +157,15 @@ the health mapping.
 - Passive harvest: `usage.credits_remaining` (unused monthly allowance plus purchased credits;
   estimate, may lag seconds, may be absent) is sampled from every keyed REST success and every MCP
   `tools/call` `_meta`, persisted only on a material change. `paid` says which balance paid.
+- Passive rate-limit harvest (plan todo 22): when a keyed response carries all three of
+  `X-RateLimit-Limit`/`-Remaining`/`-Reset`, Hikari snapshots the window in the existing `meta` KV
+  row `keenable_rate_limit_v1:<api_key_id>` (no schema migration). `X-RateLimit-Reset` is stored
+  verbatim (the vendor documents an ISO 8601 instant) and additionally parsed to epoch seconds in
+  `reset_at`; a numeric stub hint stays raw. This per-second throughput signal is NEVER written to
+  the monthly balance columns (`api_keys.quota_limit`/`quota_remaining`) or to
+  `api_key_quota_sync_samples`, and a response without the triple writes nothing. The admin key
+  detail exposes the last snapshot as `rate_limit`, rendered next to `credits_remaining` in the
+  quota panel.
 
 ## Keenable hosted MCP passthrough
 

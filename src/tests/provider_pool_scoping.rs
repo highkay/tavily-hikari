@@ -732,7 +732,7 @@ async fn keenable_402_exhausts_until_utc_month_and_target_errors_do_not_mark() {
         retry_marker: ProviderFacadeRetryMarker::NotInChain,
     };
     let effect = proxy
-        .record_keenable_rest_facade_attempt(&ctx)
+        .record_keenable_rest_facade_attempt(&ctx, &HeaderMap::new())
         .await
         .expect("keenable 402 record path");
     assert_eq!(effect.key_effect.code, KEY_EFFECT_MARKED_EXHAUSTED);
@@ -765,7 +765,7 @@ async fn keenable_402_exhausts_until_utc_month_and_target_errors_do_not_mark() {
         retry_marker: ProviderFacadeRetryMarker::NotInChain,
     };
     let effect = proxy
-        .record_keenable_rest_facade_attempt(&target_ctx)
+        .record_keenable_rest_facade_attempt(&target_ctx, &HeaderMap::new())
         .await
         .expect("keenable target_error record path");
     assert_eq!(effect.key_effect.code, KEY_EFFECT_NONE);
@@ -808,7 +808,7 @@ async fn keenable_402_exhausts_until_utc_month_and_target_errors_do_not_mark() {
         retry_marker: ProviderFacadeRetryMarker::NotInChain,
     };
     proxy
-        .record_keenable_rest_facade_attempt(&fresh_ctx)
+        .record_keenable_rest_facade_attempt(&fresh_ctx, &HeaderMap::new())
         .await
         .expect("new-month 402");
     proxy
