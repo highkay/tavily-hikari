@@ -753,12 +753,12 @@ fn token_log_provider_from_request_kind(request_kind_key: &str) -> &'static str 
     if !is_known_protocol {
         return "tavily";
     }
-    match body.split('/').next().unwrap_or_default() {
-        "serpapi" => "serpapi",
-        "exa" => "exa",
-        "brave" => "brave",
-        _ => "tavily",
-    }
+    // The provider segment is authoritative only when it names a provider
+    // this proxy fronts; the typed enum is the single source of truth, so a
+    // new provider kind cannot fall back to `tavily` silently.
+    tavily_hikari::providers::ProviderId::from_sql_text(body.split('/').next().unwrap_or_default())
+        .map(tavily_hikari::providers::ProviderId::as_str)
+        .unwrap_or("tavily")
 }
 
 impl From<TokenLogRecord> for PublicTokenLogView {

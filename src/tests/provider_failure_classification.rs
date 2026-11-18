@@ -1237,6 +1237,85 @@ fn provider_kinds_cover_full_static_whitelist_surface() {
 }
 
 #[test]
+fn keenable_and_zhihu_kinds_bucket_valuable_and_bill_billable() {
+    // Given the eight keenable-integration kinds, Then each is labeled,
+    // billable, Valuable-bucketed (never `Unknown`), protocol-grouped, and
+    // filter-stable.
+    for (key, label, protocol_group) in [
+        ("api:keenable/search", "API | keenable/search", "api"),
+        ("api:keenable/fetch", "API | keenable/fetch", "api"),
+        (
+            "mcp:keenable/search_web_pages",
+            "MCP | keenable/search_web_pages",
+            "mcp",
+        ),
+        (
+            "mcp:keenable/fetch_page_content",
+            "MCP | keenable/fetch_page_content",
+            "mcp",
+        ),
+        ("api:zhihu/zhihu_search", "API | zhihu/zhihu_search", "api"),
+        (
+            "api:zhihu/global_search",
+            "API | zhihu/global_search",
+            "api",
+        ),
+        ("mcp:zhihu/zhihu_search", "MCP | zhihu/zhihu_search", "mcp"),
+        (
+            "mcp:zhihu/global_search",
+            "MCP | zhihu/global_search",
+            "mcp",
+        ),
+    ] {
+        assert_eq!(
+            canonical_request_kind_label(key),
+            Some(label),
+            "label {key}"
+        );
+        assert_eq!(
+            token_request_kind_billing_group(key),
+            "billable",
+            "billing group {key}"
+        );
+        assert_eq!(
+            request_value_bucket_for_request_log(key, None),
+            RequestValueBucket::Valuable,
+            "value bucket {key}"
+        );
+        assert_eq!(
+            token_request_kind_protocol_group(key),
+            protocol_group,
+            "protocol group {key}"
+        );
+        assert_eq!(canonical_request_kind_key_for_filter(key), *key);
+    }
+
+    // And the shared control plane on both new MCP ingresses stays
+    // non-billable/Other: free control frames, but never an Unknown bucket.
+    for (provider, ingress) in [
+        (ProviderId::Keenable, "/keenable/mcp"),
+        (ProviderId::Zhihu, "/zhihu/mcp"),
+    ] {
+        let initialize = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}
+        }))
+        .expect("initialize body");
+        let kind = classify_provider_mcp_request_kind(provider, ingress, Some(&initialize));
+        assert_eq!(kind.key, "mcp:initialize", "{ingress}");
+        assert_eq!(
+            token_request_kind_billing_group(&kind.key),
+            "non_billable",
+            "{ingress}"
+        );
+        assert_eq!(
+            request_value_bucket_for_request_log(&kind.key, None),
+            RequestValueBucket::Other,
+            "{ingress}"
+        );
+    }
+}
+
+#[test]
 fn sql_literal_surfaces_carry_provider_kinds() {
     // Given the stored-predicate surface, Then every provider key is whitelisted
     let predicate_sql = canonical_request_kind_stored_predicate_sql("k");

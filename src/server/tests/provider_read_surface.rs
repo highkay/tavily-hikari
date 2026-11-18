@@ -35,6 +35,14 @@ const PROVIDER_KIND_FIXTURES: &[(&str, &str)] = &[
     ("mcp:exa/web_search", "exa"),
     ("mcp:exa/web_fetch", "exa"),
     ("mcp:exa/answer", "exa"),
+    ("api:keenable/search", "keenable"),
+    ("api:keenable/fetch", "keenable"),
+    ("mcp:keenable/search_web_pages", "keenable"),
+    ("mcp:keenable/fetch_page_content", "keenable"),
+    ("api:zhihu/zhihu_search", "zhihu"),
+    ("api:zhihu/global_search", "zhihu"),
+    ("mcp:zhihu/zhihu_search", "zhihu"),
+    ("mcp:zhihu/global_search", "zhihu"),
 ];
 
 fn cleanup_db_dir(db_path: &std::path::Path) {
@@ -104,6 +112,8 @@ async fn seed_mixed_provider_request_logs(pool: &sqlx::SqlitePool, key_id: &str,
         (Some("brave"), "api:brave/news", "success"),
         (Some("exa"), "api:exa/search", "success"),
         (Some("serpapi"), "api:serpapi/search", "error"),
+        (Some("keenable"), "api:keenable/search", "success"),
+        (Some("zhihu"), "api:zhihu/zhihu_search", "success"),
         (None, "api:search", "success"),
         (Some("tavily"), "api:search", "success"),
     ]
@@ -356,6 +366,21 @@ fn token_log_provider_derivation_covers_static_provider_kinds() {
         UiLanguage::En,
     );
     assert_eq!(user_view.provider, "brave");
+
+    // The two new providers derive from the same static kinds in the
+    // user-console view.
+    for (kind, provider) in [
+        ("api:keenable/search", "keenable"),
+        ("mcp:keenable/fetch_page_content", "keenable"),
+        ("api:zhihu/global_search", "zhihu"),
+        ("mcp:zhihu/zhihu_search", "zhihu"),
+    ] {
+        let user_view = UserTokenLogView::from_record(
+            token_log_record_fixture(kind, "seeded kind", 1_700_000_062),
+            UiLanguage::En,
+        );
+        assert_eq!(user_view.provider, provider, "user provider for {kind}");
+    }
 }
 
 // ---------- gates (b)+(f): /api/logs items, facets, filtered pagination ----------
@@ -399,10 +424,10 @@ async fn admin_logs_gain_provider_items_facets_and_filtered_pagination() {
     // When reading the unfiltered page
     let body = admin_get_json(&client, admin_addr, &cookie, "/api/logs?page=1&per_page=20").await;
     // Then every item carries provider and the NULL-legacy row coalesces to
-    // tavily, while all six rows paginate as before
-    assert_eq!(body["total"], json!(6), "unfiltered total: {body}");
+    // tavily, while all eight rows paginate as before
+    assert_eq!(body["total"], json!(8), "unfiltered total: {body}");
     let items = body["items"].as_array().expect("items");
-    assert_eq!(items.len(), 6);
+    assert_eq!(items.len(), 8);
     let provider_of = |query: &str| -> String {
         items
             .iter()
@@ -416,8 +441,10 @@ async fn admin_logs_gain_provider_items_facets_and_filtered_pagination() {
     assert_eq!(provider_of("q=read-surface-1"), "brave");
     assert_eq!(provider_of("q=read-surface-2"), "exa");
     assert_eq!(provider_of("q=read-surface-3"), "serpapi");
-    assert_eq!(provider_of("q=read-surface-4"), "tavily", "NULL coalesce");
-    assert_eq!(provider_of("q=read-surface-5"), "tavily");
+    assert_eq!(provider_of("q=read-surface-4"), "keenable");
+    assert_eq!(provider_of("q=read-surface-5"), "zhihu");
+    assert_eq!(provider_of("q=read-surface-6"), "tavily", "NULL coalesce");
+    assert_eq!(provider_of("q=read-surface-7"), "tavily");
 
     // And the facets gain the provider list with request_logs counts
     let providers = body.pointer("/facets/providers").and_then(|v| v.as_array());
@@ -447,6 +474,16 @@ async fn admin_logs_gain_provider_items_facets_and_filtered_pagination() {
         "{facet_counts:?}"
     );
     assert_eq!(
+        facet_counts.get("keenable").copied(),
+        Some(1),
+        "{facet_counts:?}"
+    );
+    assert_eq!(
+        facet_counts.get("zhihu").copied(),
+        Some(1),
+        "{facet_counts:?}"
+    );
+    assert_eq!(
         facet_counts.get("tavily").copied(),
         Some(2),
         "{facet_counts:?}"
@@ -466,6 +503,22 @@ async fn admin_logs_gain_provider_items_facets_and_filtered_pagination() {
     // When filtering by provider=tavily, the NULL-legacy row is included
     let body = admin_get_json(&client, admin_addr, &cookie, "/api/logs?provider=tavily").await;
     assert_eq!(body["total"], json!(2), "tavily total incl NULL: {body}");
+
+    // And the two new providers narrow items and total through the same
+    // coalesced predicate
+    for provider in ["keenable", "zhihu"] {
+        let body = admin_get_json(
+            &client,
+            admin_addr,
+            &cookie,
+            &format!("/api/logs?provider={provider}"),
+        )
+        .await;
+        assert_eq!(body["total"], json!(1), "{provider} total: {body}");
+        let items = body["items"].as_array().expect("items");
+        assert_eq!(items.len(), 1, "{provider} items: {body}");
+        assert_eq!(items[0]["provider"], json!(provider), "{provider} item");
+    }
 
     // When paginating a filtered result set one row at a time
     let page_one = admin_get_json(
@@ -560,7 +613,7 @@ async fn provider_filter_on_tavily_only_db_returns_empty_page_shape() {
 
 #[tokio::test]
 async fn summary_and_windows_carry_provider_breakdowns_alongside_legacy_totals() {
-    // Given keys for all four providers, per-key daily usage buckets (the
+    // Given keys for all six providers, per-key daily usage buckets (the
     // source of the legacy summary totals), mixed-provider request logs from
     // today, and one rollup minute bucket pinning the legacy window path
     let db_path = temp_db_path("read-surface-summary");
@@ -588,6 +641,8 @@ async fn summary_and_windows_carry_provider_breakdowns_alongside_legacy_totals()
         ("read-surface-brave-key", "k-read-brave", "brave"),
         ("read-surface-exa-key", "k-read-exa", "exa"),
         ("read-surface-serp-key", "k-read-serpapi", "serpapi"),
+        ("read-surface-keenable-key", "k-read-keenable", "keenable"),
+        ("read-surface-zhihu-key", "k-read-zhihu", "zhihu"),
     ] {
         sqlx::query(
             r#"
@@ -609,6 +664,8 @@ async fn summary_and_windows_carry_provider_breakdowns_alongside_legacy_totals()
         ("read-surface-brave-key".to_string(), 10, 10, 0, 0),
         ("read-surface-exa-key".to_string(), 3, 2, 1, 0),
         ("read-surface-serp-key".to_string(), 1, 0, 1, 0),
+        ("read-surface-keenable-key".to_string(), 4, 4, 0, 0),
+        ("read-surface-zhihu-key".to_string(), 2, 1, 1, 0),
     ] {
         sqlx::query(
             r#"
@@ -657,9 +714,9 @@ async fn summary_and_windows_carry_provider_breakdowns_alongside_legacy_totals()
     // When reading /api/summary
     let body = admin_get_json(&client, admin_addr, &cookie, "/api/summary").await;
     // Then the legacy totals keep reflecting the pre-aggregated buckets ...
-    assert_eq!(body["total_requests"], json!(16), "legacy total: {body}");
-    assert_eq!(body["success_count"], json!(14), "legacy success: {body}");
-    assert_eq!(body["error_count"], json!(2), "legacy error: {body}");
+    assert_eq!(body["total_requests"], json!(22), "legacy total: {body}");
+    assert_eq!(body["success_count"], json!(19), "legacy success: {body}");
+    assert_eq!(body["error_count"], json!(3), "legacy error: {body}");
     // ... and the additive breakdown segments the SAME source by key-join
     // (M18), ordered by provider with NULL-free values.
     let providers = body["providers"].as_array();
@@ -681,14 +738,16 @@ async fn summary_and_windows_carry_provider_breakdowns_alongside_legacy_totals()
         vec![
             ("brave".to_string(), 10, 10, 0, 0),
             ("exa".to_string(), 3, 2, 1, 0),
+            ("keenable".to_string(), 4, 4, 0, 0),
             ("serpapi".to_string(), 1, 0, 1, 0),
             ("tavily".to_string(), 2, 2, 0, 0),
+            ("zhihu".to_string(), 2, 1, 1, 0),
         ],
         "provider breakdown rows"
     );
     assert_eq!(
         rows.iter().map(|row| row.1).sum::<i64>(),
-        16,
+        22,
         "breakdown sums to the legacy total"
     );
 
@@ -727,6 +786,16 @@ async fn summary_and_windows_carry_provider_breakdowns_alongside_legacy_totals()
         "{today_counts:?}"
     );
     assert_eq!(
+        today_counts.get("keenable").copied(),
+        Some((1, 1, 0)),
+        "{today_counts:?}"
+    );
+    assert_eq!(
+        today_counts.get("zhihu").copied(),
+        Some((1, 1, 0)),
+        "{today_counts:?}"
+    );
+    assert_eq!(
         today_counts.get("tavily").copied(),
         Some((2, 2, 0)),
         "{today_counts:?}"
@@ -748,7 +817,7 @@ async fn summary_and_windows_carry_provider_breakdowns_alongside_legacy_totals()
     // ... and the month window exposes the same additive breakdown.
     let month_providers = body.pointer("/month/providers").and_then(|v| v.as_array());
     assert!(
-        month_providers.is_some_and(|list| list.len() == 4),
+        month_providers.is_some_and(|list| list.len() == 6),
         "month providers: {body}"
     );
 
@@ -782,6 +851,18 @@ async fn public_token_logs_carry_provider_dimension() {
             "API | brave/web",
             "/api/brave/res/v1/web/search",
             now - 2,
+        ),
+        (
+            "api:keenable/search",
+            "API | keenable/search",
+            "/api/keenable/v1/search",
+            now - 3,
+        ),
+        (
+            "mcp:zhihu/zhihu_search",
+            "MCP | zhihu/zhihu_search",
+            "/zhihu/mcp",
+            now - 4,
         ),
         ("api:search", "API | search", "/api/tavily/search", now - 1),
     ] {
@@ -828,9 +909,15 @@ async fn public_token_logs_carry_provider_dimension() {
     let items = body
         .as_array()
         .unwrap_or_else(|| panic!("items array: {body}"));
-    assert_eq!(items.len(), 2);
+    assert_eq!(items.len(), 4);
     assert_eq!(items[0]["provider"], json!("tavily"), "legacy kind: {body}");
     assert_eq!(items[1]["provider"], json!("brave"), "brave kind: {body}");
+    assert_eq!(
+        items[2]["provider"],
+        json!("keenable"),
+        "keenable kind: {body}"
+    );
+    assert_eq!(items[3]["provider"], json!("zhihu"), "zhihu kind: {body}");
 
     cleanup_db_dir(&db_path);
 }
@@ -1193,6 +1280,20 @@ async fn analysis_providers_carries_three_windows_with_credits_and_null_merge() 
                 request_user_id: None,
                 created_at: now - 3_600,
             },
+            ProviderLogRow {
+                provider: Some("keenable"),
+                result_status: "success",
+                business_credits: Some(4),
+                request_user_id: None,
+                created_at: now - 3_600,
+            },
+            ProviderLogRow {
+                provider: Some("zhihu"),
+                result_status: "error",
+                business_credits: Some(2),
+                request_user_id: None,
+                created_at: now - 3_600,
+            },
             // last7d only
             ProviderLogRow {
                 provider: Some("brave"),
@@ -1263,7 +1364,9 @@ async fn analysis_providers_carries_three_windows_with_credits_and_null_merge() 
         analysis_provider_rows(&windows["last24h"]),
         expected_analysis_rows(&[
             ("tavily", 2, 2, 0, 0, 5),
+            ("keenable", 1, 1, 0, 0, 4),
             ("serpapi", 1, 1, 0, 0, 7),
+            ("zhihu", 1, 0, 1, 0, 2),
         ]),
         "last24h: {body}"
     );
@@ -1274,7 +1377,9 @@ async fn analysis_providers_carries_three_windows_with_credits_and_null_merge() 
         expected_analysis_rows(&[
             ("tavily", 2, 2, 0, 0, 5),
             ("brave", 1, 0, 1, 0, 3),
+            ("keenable", 1, 1, 0, 0, 4),
             ("serpapi", 1, 1, 0, 0, 7),
+            ("zhihu", 1, 0, 1, 0, 2),
         ]),
         "last7d: {body}"
     );
@@ -1286,7 +1391,9 @@ async fn analysis_providers_carries_three_windows_with_credits_and_null_merge() 
             ("tavily", 2, 2, 0, 0, 5),
             ("brave", 1, 0, 1, 0, 3),
             ("exa", 1, 0, 0, 1, 11),
+            ("keenable", 1, 1, 0, 0, 4),
             ("serpapi", 1, 1, 0, 0, 7),
+            ("zhihu", 1, 0, 1, 0, 2),
         ]),
         "last30d: {body}"
     );
@@ -1345,6 +1452,12 @@ async fn dashboard_overview_carries_summary_and_window_provider_breakdowns() {
     for (id, api_key, provider) in [
         ("read-surface-overview-brave", "k-overview-brave", "brave"),
         ("read-surface-overview-serp", "k-overview-serpapi", "serpapi"),
+        (
+            "read-surface-overview-keenable",
+            "k-overview-keenable",
+            "keenable",
+        ),
+        ("read-surface-overview-zhihu", "k-overview-zhihu", "zhihu"),
     ] {
         sqlx::query(
             r#"
@@ -1364,6 +1477,8 @@ async fn dashboard_overview_carries_summary_and_window_provider_breakdowns() {
         (key_id.clone(), 4_i64, 3_i64, 1_i64),
         ("read-surface-overview-brave".to_string(), 2, 2, 0),
         ("read-surface-overview-serp".to_string(), 1, 0, 1),
+        ("read-surface-overview-keenable".to_string(), 1, 1, 0),
+        ("read-surface-overview-zhihu".to_string(), 1, 0, 1),
     ] {
         sqlx::query(
             r#"
@@ -1401,6 +1516,20 @@ async fn dashboard_overview_carries_summary_and_window_provider_breakdowns() {
                 request_user_id: None,
                 created_at: created_at - 1,
             },
+            ProviderLogRow {
+                provider: Some("keenable"),
+                result_status: "success",
+                business_credits: Some(1),
+                request_user_id: None,
+                created_at: created_at - 2,
+            },
+            ProviderLogRow {
+                provider: Some("zhihu"),
+                result_status: "success",
+                business_credits: Some(1),
+                request_user_id: None,
+                created_at: created_at - 3,
+            },
         ],
     )
     .await;
@@ -1420,8 +1549,10 @@ async fn dashboard_overview_carries_summary_and_window_provider_breakdowns() {
         summary_shaped_provider_rows(&body["summary"]["providers"]),
         vec![
             ("brave".to_string(), 2, 2, 0, 0),
+            ("keenable".to_string(), 1, 1, 0, 0),
             ("serpapi".to_string(), 1, 0, 1, 0),
             ("tavily".to_string(), 4, 3, 1, 0),
+            ("zhihu".to_string(), 1, 0, 1, 0),
         ],
         "overview summary providers: {body}"
     );
@@ -1443,7 +1574,9 @@ async fn dashboard_overview_carries_summary_and_window_provider_breakdowns() {
         summary_shaped_provider_rows(&body["summaryWindows"]["today"]["providers"]),
         vec![
             ("brave".to_string(), 1, 0, 1, 0),
+            ("keenable".to_string(), 1, 1, 0, 0),
             ("tavily".to_string(), 1, 1, 0, 0),
+            ("zhihu".to_string(), 1, 1, 0, 0),
         ],
         "overview today window providers: {body}"
     );
@@ -1552,13 +1685,27 @@ async fn user_dashboard_overview_carries_provider_counts_scoped_to_the_session_u
                 request_user_id: Some(alice.user_id.as_str()),
                 created_at: inside + 2,
             },
+            ProviderLogRow {
+                provider: Some("keenable"),
+                result_status: "success",
+                business_credits: Some(2),
+                request_user_id: Some(alice.user_id.as_str()),
+                created_at: inside + 3,
+            },
+            ProviderLogRow {
+                provider: Some("zhihu"),
+                result_status: "error",
+                business_credits: Some(1),
+                request_user_id: Some(alice.user_id.as_str()),
+                created_at: inside + 4,
+            },
             // bob: never visible to alice's card
             ProviderLogRow {
                 provider: Some("brave"),
                 result_status: "success",
                 business_credits: Some(8),
                 request_user_id: Some(bob.user_id.as_str()),
-                created_at: inside + 3,
+                created_at: inside + 5,
             },
             // unattributed: never visible to either card
             ProviderLogRow {
@@ -1566,7 +1713,7 @@ async fn user_dashboard_overview_carries_provider_counts_scoped_to_the_session_u
                 result_status: "success",
                 business_credits: Some(9),
                 request_user_id: None,
-                created_at: inside + 4,
+                created_at: inside + 6,
             },
             // alice, but outside the requested window
             ProviderLogRow {
@@ -1624,7 +1771,9 @@ async fn user_dashboard_overview_carries_provider_counts_scoped_to_the_session_u
             .collect::<Vec<_>>(),
         vec![
             ("tavily".to_string(), 2, 1, 1),
+            ("keenable".to_string(), 1, 1, 0),
             ("serpapi".to_string(), 1, 1, 0),
+            ("zhihu".to_string(), 1, 0, 1),
         ],
         "user provider rows: {body}"
     );
