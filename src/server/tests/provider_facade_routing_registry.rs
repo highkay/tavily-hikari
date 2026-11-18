@@ -2,14 +2,16 @@ use super::*;
     use super::core_support_and_parsing::*;
     use tavily_hikari::providers::ProviderId;
 
-    /// Typed todo-2 boundary (keenable-integration plan, QA failure scenario):
-    /// before todo 8 (Keenable hosted passthrough) and todo 10 (Zhihu local
-    /// facade) land, an authenticated MCP dispatch for either provider
-    /// returns the TYPED `provider_mcp_pending` response — never a 200, never
-    /// an upstream call, never a key mark. The dispatch is called directly
-    /// with the provider id because todo 6 owns the route registration.
+    /// Keenable hosted passthrough (keenable-integration todo 8) + the typed
+    /// todo-2 Zhihu boundary (todo 10 pending): an authenticated MCP dispatch
+    /// on `/keenable/mcp` EXECUTES (upstream dial, typed 502 proxy-error
+    /// boundary when the configured dead-port upstream refuses the connection
+    /// — never a 200, never a key mark) while `/zhihu/mcp` keeps the typed
+    /// `provider_mcp_pending` response — never a 200, never an upstream call,
+    /// never a key mark. The dispatch is called directly with the provider id
+    /// because todo 6 owns the route registration.
     #[tokio::test]
-    async fn keenable_and_zhihu_mcp_dispatch_return_typed_pending_boundary() {
+    async fn keenable_mcp_executes_while_zhihu_dispatch_keeps_typed_pending_boundary() {
         let db_path = temp_db_path("provider-mcp-pending-boundary");
         let db_str = db_path.to_string_lossy().to_string();
         let providers = tavily_hikari::ProviderBootstrap {
@@ -77,9 +79,15 @@ use super::*;
             remote_attempt_admission: new_remote_attempt_admission(),
         });
 
-        for (provider, ingress) in [
-            (ProviderId::Keenable, "/keenable/mcp"),
-            (ProviderId::Zhihu, "/zhihu/mcp"),
+        for (provider, ingress, expect_keenable_proxy_error) in [
+            // Keenable EXECUTES: the initialize reaches the executor and the
+            // configured dead local port refuses the connection, which the
+            // passthrough surfaces as its typed proxy-error boundary
+            // (Err(502)) - never a 200, never a silent success.
+            (ProviderId::Keenable, "/keenable/mcp", true),
+            // Zhihu keeps the typed todo-2 provider_mcp_pending boundary
+            // until todo 10 lands (501 + typed body, zero upstream calls).
+            (ProviderId::Zhihu, "/zhihu/mcp", false),
         ] {
             let request = Request::builder()
                 .method(Method::POST)
@@ -100,39 +108,43 @@ use super::*;
                     .to_string(),
                 ))
                 .expect("build mcp request");
-            let response = provider_facade::provider_mcp_facade(state.clone(), request, provider)
-                .await
-                .expect("typed boundary response");
-            assert_ne!(
-                response.status(),
-                StatusCode::OK,
-                "{ingress} must never answer 200 before its execution todo"
-            );
-            assert_eq!(
-                response.status(),
-                StatusCode::NOT_IMPLEMENTED,
-                "{ingress} boundary status"
-            );
-            let body = axum::body::to_bytes(response.into_body(), BODY_LIMIT)
-                .await
-                .expect("boundary body");
-            let payload: serde_json::Value =
-                serde_json::from_slice(&body).expect("boundary json");
-            assert_eq!(
-                payload.get("error").and_then(|value| value.as_str()),
-                Some("provider_mcp_pending"),
-                "{ingress} boundary body: {payload}"
-            );
-            assert!(payload
-                .get("message")
-                .and_then(|value| value.as_str())
-                .is_some_and(|message| message.contains(provider.as_str())));
+            let dispatched =
+                provider_facade::provider_mcp_facade(state.clone(), request, provider).await;
+            if expect_keenable_proxy_error {
+                let status = dispatched.expect_err("typed proxy-error boundary");
+                assert_eq!(
+                    status, StatusCode::BAD_GATEWAY,
+                    "{ingress} typed proxy-error boundary status"
+                );
+            } else {
+                let response = dispatched.expect("boundary response");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::NOT_IMPLEMENTED,
+                    "{ingress} boundary status"
+                );
+                let body = axum::body::to_bytes(response.into_body(), BODY_LIMIT)
+                    .await
+                    .expect("boundary body");
+                let payload: serde_json::Value =
+                    serde_json::from_slice(&body).expect("boundary json");
+                assert_eq!(
+                    payload.get("error").and_then(|value| value.as_str()),
+                    Some("provider_mcp_pending"),
+                    "{ingress} boundary body: {payload}"
+                );
+                assert!(payload
+                    .get("message")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|message| message.contains(provider.as_str())));
+            }
         }
 
-        // Never a key mark: both seeded provider rows stay byte-identical.
-        // `last_used_at` is NOT NULL DEFAULT 0, so the baseline snapshot is
-        // captured BEFORE the dispatch and compared after it (the boundary
-        // must not touch a single column).
+        // Never a key mark: the Zhihu seed row stays byte-identical (its
+        // boundary touches nothing) and the Keenable row keeps its `active`
+        // status after the dead-port transport failure (a transport error
+        // never marks the key; `last_used_at` legitimately advances because
+        // the executor logs the attempt).
         async fn key_row_snapshot(
             pool: &sqlx::SqlitePool,
             key_row: &str,
@@ -145,24 +157,18 @@ use super::*;
             .await
             .expect("provider key snapshot")
         }
-        let baseline = [
-            (
-                "ken-mcp-pending-key",
-                key_row_snapshot(&pool, "ken-mcp-pending-key").await,
-            ),
-            (
-                "zh-mcp-pending-key",
-                key_row_snapshot(&pool, "zh-mcp-pending-key").await,
-            ),
-        ];
-        for (key_row, (status, status_changed_at, last_used_at)) in baseline {
-            assert_eq!(status, "active", "{key_row} starts active");
-            let after = key_row_snapshot(&pool, key_row).await;
-            assert_eq!(
-                after, (status, status_changed_at, last_used_at),
-                "{key_row} must stay byte-identical after the typed boundary"
-            );
-        }
+        let zhihu_baseline = key_row_snapshot(&pool, "zh-mcp-pending-key").await;
+        assert_eq!(zhihu_baseline.0, "active", "zhihu key starts active");
+        let zhihu_after = key_row_snapshot(&pool, "zh-mcp-pending-key").await;
+        assert_eq!(
+            zhihu_after, zhihu_baseline,
+            "zh-mcp-pending-key must stay byte-identical after the typed boundary"
+        );
+        let keenable_status = key_row_snapshot(&pool, "ken-mcp-pending-key").await;
+        assert_eq!(
+            keenable_status.0, "active",
+            "ken-mcp-pending-key must stay active after the dead-port transport failure"
+        );
         pool.close().await;
 
         let _ = std::fs::remove_file(db_path);

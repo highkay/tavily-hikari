@@ -1,12 +1,12 @@
 //! Plan keenable-integration todo 6 bin coverage: the Keenable/Zhihu REST
 //! route table, MCP ingress registration, request-kind catalog wiring, and
 //! the config surface. Since todo 7 the Keenable REST routes EXECUTE through
-//! the facade record path, so the full-server case pins their live
-//! stub-upstream behavior (verbatim passthrough + 1 settled credit); the
-//! Keenable MCP ingress and both Zhihu surfaces keep the typed todo-2
-//! boundaries until todos 8-10 land (typed 500/501, ZERO upstream calls) —
-//! never a silent success and never an accidental dial of a production
-//! endpoint.
+//! the facade record path and since todo 8 the Keenable MCP ingress EXECUTES
+//! through the hosted passthrough, so the full-server cases pin their live
+//! stub-upstream behavior (verbatim passthrough + settled credits);
+//! both Zhihu surfaces keep the typed todo-2 boundaries until todos 9-10
+//! land (typed 500/501, ZERO upstream calls) — never a silent success and
+//! never an accidental dial of a production endpoint.
 
 use super::core_support_and_parsing::{connect_sqlite_test_pool, temp_db_path};
 use super::*;
@@ -473,51 +473,96 @@ async fn zhihu_and_keenable_mcp_subpaths_404_text_plain_never_spa_redirect() {
     pool.close().await;
 }
 
-/// Through the REAL router, both new MCP ingresses answer the typed todo-2
-/// `provider_mcp_pending` boundary until todos 8/10 land — never a 200,
-/// never an upstream call, never a silent success.
+/// Through the REAL router, the Keenable MCP ingress EXECUTES (keenable-
+/// integration todo 8 wired the hosted passthrough): the request dials the
+/// configured `KEENABLE_MCP_UPSTREAM` stub at its `/gw/mcp` target and the
+/// stub body returns verbatim with provider/gateway/operation-stamped request
+/// logs — never a silent success. The Zhihu ingress keeps the typed todo-2
+/// `provider_mcp_pending` boundary until todo 10 lands — never a 200, never
+/// an upstream call.
 #[tokio::test]
-async fn keenable_and_zhihu_mcp_ingresses_answer_the_typed_pending_boundary() {
-    let harness = spawn_keenable_zhihu_harness("keenable-zhihu-mcp-pending").await;
+async fn keenable_mcp_executes_while_zhihu_keeps_the_typed_pending_boundary() {
+    let harness = spawn_keenable_zhihu_harness("keenable-zhihu-mcp-execute").await;
     let client = Client::new();
 
-    for path in ["/keenable/mcp", "/zhihu/mcp"] {
-        let resp = client
-            .post(format!("http://{}{path}", harness.addr))
-            .header("authorization", format!("Bearer {}", harness.token))
-            .header(CONTENT_TYPE, "application/json")
-            .body(
-                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
-            )
-            .send()
-            .await
-            .expect("mcp ingress request");
-        assert_eq!(
-            resp.status(),
-            StatusCode::NOT_IMPLEMENTED,
-            "{path} typed pending boundary"
-        );
-        let body: Value = resp.json().await.expect("json body");
-        assert_eq!(
-            body.get("error").and_then(Value::as_str),
-            Some("provider_mcp_pending"),
-            "{path} boundary body: {body}"
-        );
+    // Keenable tools/list: executed end-to-end against the stub upstream.
+    let keenable = client
+        .post(format!("http://{}/keenable/mcp", harness.addr))
+        .header("authorization", format!("Bearer {}", harness.token))
+        .header(CONTENT_TYPE, "application/json")
+        .body(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+        )
+        .send()
+        .await
+        .expect("keenable mcp request");
+    assert_eq!(keenable.status(), StatusCode::OK);
+    let body: Value = keenable.json().await.expect("json body");
+    assert_eq!(
+        body,
+        serde_json::json!({"stub": "ok"}),
+        "the stub body passes through verbatim (no transformation)"
+    );
+
+    // Zhihu: still the typed todo-2 boundary (todo 10 replaces it).
+    let zhihu = client
+        .post(format!("http://{}/zhihu/mcp", harness.addr))
+        .header("authorization", format!("Bearer {}", harness.token))
+        .header(CONTENT_TYPE, "application/json")
+        .body(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+        )
+        .send()
+        .await
+        .expect("zhihu mcp request");
+    assert_eq!(zhihu.status(), StatusCode::NOT_IMPLEMENTED);
+    let body: Value = zhihu.json().await.expect("json body");
+    assert_eq!(body.get("error").and_then(Value::as_str), Some("provider_mcp_pending"));
+
+    // Exactly ONE upstream call: the executing Keenable tools/list dialed the
+    // stub at its /gw/mcp target; the Zhihu boundary never dials anything.
+    {
+        let attempts = harness.upstream_attempts.lock().expect("attempts lock");
+        assert_eq!(&*attempts, &["/gw/mcp".to_string()], "upstream attempts");
     }
 
-    // Zero upstream calls: the boundary never dials the configured upstreams.
-    assert_eq!(upstream_attempt_count(&harness), 0);
+    // Provider-scoped request-log stamping: the Keenable passthrough row
+    // carries the additive gateway mode + upstream operation vocabulary.
+    let pool = connect_sqlite_test_pool(&harness.db_str).await;
+    let rows = sqlx::query(
+        "SELECT provider, gateway_mode, upstream_operation, request_kind_key, path \
+         FROM request_logs WHERE path = '/keenable/mcp' ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("request logs");
+    assert_eq!(rows.len(), 1, "one keenable passthrough row");
+    let row = &rows[0];
+    assert_eq!(row.get::<Option<String>, _>("provider").as_deref(), Some("keenable"));
+    assert_eq!(
+        row.get::<Option<String>, _>("gateway_mode").as_deref(),
+        Some("upstream_mcp")
+    );
+    assert_eq!(
+        row.get::<Option<String>, _>("upstream_operation").as_deref(),
+        Some("keenable_mcp")
+    );
+    assert_eq!(
+        row.get::<Option<String>, _>("request_kind_key").as_deref(),
+        Some("mcp:tools/list")
+    );
+    pool.close().await;
 }
 
-/// Through the REAL router, the Keenable REST routes EXECUTE (keenable-integration
-/// todo 7 wired the facade record path): the search request dials the stub
-/// upstream at its native `/v1/search` path and returns the stub body
-/// verbatim with 1 settled credit on the classifier-Ok outcome. The Zhihu
-/// routes keep the typed todo-2 boundary until todo 9 wires their
-/// envelope-aware record path: a typed 500 `proxy_error`, ZERO upstream calls,
-/// an error token-log row carrying the new kind, and never a billed credit.
+/// Through the REAL router, the Keenable and Zhihu REST routes both EXECUTE
+/// (Keenable since keenable-integration todo 7, Zhihu since todo 9's
+/// envelope-aware record path): each request dials the stub upstream at its
+/// native upstream path and returns the stub body verbatim. The Keenable
+/// success settles 1 credit; the Zhihu call settles ZERO credits because the
+/// stub body carries no `Code == 0` envelope (todo 9 bills only on Code == 0)
+/// even though the HTTP status is 200 - the misleading-success guard.
 #[tokio::test]
-async fn keenable_rest_routes_execute_while_zhihu_keeps_the_typed_boundary() {
+async fn keenable_and_zhihu_rest_routes_execute_with_verbatim_passthrough() {
     let harness = spawn_keenable_zhihu_harness("keenable-zhihu-rest-boundary").await;
     let client = Client::new();
 
@@ -538,7 +583,8 @@ async fn keenable_rest_routes_execute_while_zhihu_keeps_the_typed_boundary() {
         "the stub body passes through verbatim (no transformation)"
     );
 
-    // Zhihu: still the typed todo-2 boundary (todo 9 replaces it).
+    // Zhihu: executed too (todo 9) - verbatim stub body through the
+    // envelope-aware record path.
     let zhihu = client
         .get(format!(
             "http://{}/api/zhihu/api/v1/content/zhihu_search?Query=AI&Count=3",
@@ -548,20 +594,33 @@ async fn keenable_rest_routes_execute_while_zhihu_keeps_the_typed_boundary() {
         .send()
         .await
         .expect("zhihu search request");
-    assert_eq!(zhihu.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(zhihu.status(), StatusCode::OK);
     let body: Value = zhihu.json().await.expect("json body");
-    assert_eq!(body.get("error").and_then(Value::as_str), Some("proxy_error"));
+    assert_eq!(
+        body,
+        serde_json::json!({"stub": "ok"}),
+        "the zhihu stub body passes through verbatim (no transformation)"
+    );
 
-    // Exactly ONE upstream call: the executing Keenable search dialed the
-    // stub at its native path; the Zhihu boundary never dials anything.
+    // Exactly TWO upstream calls, each at its provider's native upstream path:
+    // the executing Keenable search and the executing Zhihu search.
     {
         let attempts = harness.upstream_attempts.lock().expect("attempts lock");
-        assert_eq!(&*attempts, &["/v1/search".to_string()], "upstream attempts");
+        assert_eq!(
+            &*attempts,
+            &[
+                "/v1/search".to_string(),
+                "/api/v1/content/zhihu_search".to_string(),
+            ],
+            "upstream attempts"
+        );
     }
 
     // Token-log rows (misleading-success guard: the kind surface and the
     // billing outcome are asserted, not just the status codes): the Keenable
-    // success settles 1 credit, the Zhihu boundary stays an unbilled error.
+    // success settles 1 credit; the Zhihu call records a success attempt but
+    // settles ZERO credits (the stub body has no Code envelope, so todo 9's
+    // business_success gate stays closed).
     let pool = connect_sqlite_test_pool(&harness.db_str).await;
     let rows = sqlx::query(
         "SELECT request_kind_key, result_status, business_credits \
@@ -572,7 +631,7 @@ async fn keenable_rest_routes_execute_while_zhihu_keeps_the_typed_boundary() {
     .expect("token logs");
     let expected = [
         ("api:keenable/search", "success", Some(1)),
-        ("api:zhihu/zhihu_search", "error", None),
+        ("api:zhihu/zhihu_search", "success", None),
     ];
     assert_eq!(rows.len(), expected.len(), "one row per request");
     for (row, (kind, status, credits)) in rows.iter().zip(expected) {

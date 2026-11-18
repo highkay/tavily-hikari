@@ -6,10 +6,11 @@
 //! * upstream URL via [`build_provider_mcp_upstream_url`] so a path-prefixed
 //!   `SERPAPI_MCP_UPSTREAM` (e.g. `http://host/gw/mcp`) is targeted exactly
 //!   (M1 acceptance vector);
-//! * `Authorization: Bearer <pooled key secret>` injection per the ProviderSpec
-//!   registry — NEVER the Tavily-only `tavilyApiKey` query slot or
-//!   `Tavily-Api-Key` header (high-anonymity contract; absence asserted at the
-//!   mock in tests/provider_mcp_e2e.rs);
+//! * pooled-key injection per the ProviderSpec registry — hosted SerpApi
+//!   `Authorization: Bearer <pooled key secret>`, Keenable `X-API-Key`
+//!   (keenable-integration todo 8) — NEVER the Tavily-only `tavilyApiKey`
+//!   query slot or `Tavily-Api-Key` header (high-anonymity contract; absence
+//!   asserted at the mocks in tests/provider_mcp_e2e.rs);
 //! * header allowlist + UA policy IDENTICAL to Tavily Control mode
 //!   ([`sanitize_mcp_headers_inner`] reused unchanged, per the T4 note);
 //! * x-project-id is never emitted (M2 gate, shared provider-gated stripper);
@@ -42,13 +43,13 @@ use super::*;
 pub fn provider_mcp_upstream_operation(provider: providers::ProviderId) -> Option<&'static str> {
     match provider {
         providers::ProviderId::Serpapi => Some("serpapi_mcp"),
-        // Keenable is a hosted passthrough whose "keenable_mcp" label lands
-        // with todo 8; Zhihu is a local facade (todo 10) with no hosted
-        // passthrough operation. Until then: no operation, no upstream call.
+        // Keenable hosted passthrough (keenable-integration todo 8) carries
+        // its own provider-scoped operation label. Zhihu is a local facade
+        // (todo 10) with no hosted passthrough operation.
+        providers::ProviderId::Keenable => Some("keenable_mcp"),
         providers::ProviderId::Tavily
         | providers::ProviderId::Exa
         | providers::ProviderId::Brave
-        | providers::ProviderId::Keenable
         | providers::ProviderId::Zhihu => None,
     }
 }
@@ -130,15 +131,20 @@ fn provider_mcp_attempt_analysis(
 }
 
 impl TavilyProxy {
-    /// Hosted MCP passthrough executor (plan todo 15). Byte-passthrough with
-    /// pooled-key Bearer injection, provider-scoped session affinity via the
-    /// pinned key, T3 classification feeding the existing key-health
+    /// Hosted MCP passthrough executor (plan todo 15; keenable-integration
+    /// todo 8 added the Keenable arm). Byte-passthrough with pooled-key
+    /// injection per the provider spec (hosted SerpApi `Authorization:
+    /// Bearer`, Keenable `X-API-Key`), provider-scoped session affinity via
+    /// the pinned key, T3 classification feeding the existing key-health
     /// reconcile, and provider/gateway-stamped request_logs rows.
     pub async fn proxy_provider_mcp_passthrough(
         &self,
         request: ProviderMcpPassthroughRequest,
     ) -> Result<ProxyResponse, ProxyError> {
-        if request.provider != providers::ProviderId::Serpapi {
+        if !matches!(
+            request.provider,
+            providers::ProviderId::Serpapi | providers::ProviderId::Keenable
+        ) {
             return Err(ProxyError::Other(format!(
                 "{} hosted MCP passthrough is not wired yet",
                 request.provider
@@ -175,10 +181,23 @@ impl TavilyProxy {
                 .await?
         };
 
-        // M1: ingress-aware upstream URL — SERPAPI_MCP_UPSTREAM is honored
+        // M1: ingress-aware upstream URL — SERPAPI_MCP_UPSTREAM (Keenable:
+        // KEENABLE_MCP_UPSTREAM, keenable-integration todo 8) is honored
         // including path-prefixed values; the client query (already stripped
         // of every client auth slot) is appended verbatim.
-        let base = self.provider_upstreams.serpapi_mcp.clone();
+        let base = match request.provider {
+            providers::ProviderId::Serpapi => self.provider_upstreams.serpapi_mcp.clone(),
+            providers::ProviderId::Keenable => self.provider_upstreams.keenable_mcp.clone(),
+            providers::ProviderId::Tavily
+            | providers::ProviderId::Exa
+            | providers::ProviderId::Brave
+            | providers::ProviderId::Zhihu => {
+                return Err(ProxyError::Other(format!(
+                    "{} has no hosted MCP upstream base",
+                    request.provider
+                )));
+            }
+        };
         let mut url = build_provider_mcp_upstream_url(request.provider, &base, &request.path);
         if let Some(query) = request.query.as_deref() {
             let mut pairs = url.query_pairs_mut();
@@ -218,17 +237,40 @@ impl TavilyProxy {
                 .forwarded
                 .push("mcp-session-id".to_string());
         }
-        // Pooled upstream key into the Bearer slot (ProviderSpec
-        // upstream_key_injection; client Authorization was stripped at the
-        // server boundary — M17 never relayed, never persisted).
-        let bearer_value = HeaderValue::from_str(&format!("Bearer {}", lease.secret.as_str()))
-            .map_err(|_| ProxyError::Other("invalid provider bearer value".to_string()))?;
-        sanitized_headers
-            .headers
-            .insert(AUTHORIZATION, bearer_value);
-        sanitized_headers
-            .forwarded
-            .push("authorization".to_string());
+        // Pooled upstream key into the provider's NATIVE injection slot
+        // (ProviderSpec upstream_key_injection: hosted SerpApi Bearer,
+        // Keenable X-API-Key — keenable-integration todo 8). The client's
+        // Authorization and native key slots were stripped at the server
+        // boundary — M17 never relayed, never persisted.
+        let (key_header_name, key_header_value) =
+            match providers::spec_for(request.provider).upstream_key_injection {
+                providers::KeyAuthInjection::Bearer => (
+                    AUTHORIZATION,
+                    format!("Bearer {}", lease.secret.as_str()),
+                ),
+                providers::KeyAuthInjection::Header { name } => {
+                    // `from_bytes` normalizes the spec's mixed-case header name
+                    // ("X-API-Key") to the lowercase wire form.
+                    let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                        ProxyError::Other("invalid provider key header name".to_string())
+                    })?;
+                    (header_name, lease.secret.as_str().to_string())
+                }
+                // No hosted passthrough provider uses query-slot injection
+                // (the MCP body is byte-passthrough); typed refusal, never a
+                // guessed query slot.
+                providers::KeyAuthInjection::QueryParam { .. } => {
+                    return Err(ProxyError::Other(format!(
+                        "{} hosted MCP passthrough has no header key slot",
+                        request.provider
+                    )));
+                }
+            };
+        let key_header_value = HeaderValue::from_str(&key_header_value)
+            .map_err(|_| ProxyError::Other("invalid provider key header value".to_string()))?;
+        let forwarded_key_header_name = key_header_name.as_str().to_string();
+        sanitized_headers.headers.insert(key_header_name, key_header_value);
+        sanitized_headers.forwarded.push(forwarded_key_header_name);
 
         let request_method = request.method.clone();
         let request_body = request.body.clone();
@@ -595,6 +637,12 @@ mod serpapi_mcp_passthrough_tests {
         assert_eq!(
             provider_mcp_upstream_operation(providers::ProviderId::Brave),
             None
+        );
+        assert_eq!(
+            provider_mcp_upstream_operation(providers::ProviderId::Keenable),
+            Some("keenable_mcp"),
+            "keenable-integration todo 8: the Keenable hosted passthrough has
+            its own provider-scoped operation label"
         );
     }
 

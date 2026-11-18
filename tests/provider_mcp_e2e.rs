@@ -9,6 +9,13 @@
 //! error passthrough, and the M6 provider-scoped session gating that keeps a
 //! Tavily control session from suppressing or entangling serpapi sessions.
 //!
+//! Keenable `/keenable/mcp` hosted passthrough (keenable-integration todo 8)
+//! against mock_keenable: X-API-Key injection (never Authorization), buffered
+//! JSON-RPC passthrough, free initialize/notifications/ping/tools-list,
+//! 1 credit per successful search_web_pages/fetch_page_content call, the
+//! same session-id translation + key-migration ladder, and the passive
+//! `_meta["keenable/usage"].credits_remaining` harvest.
+//!
 //! Real server binary + real mock_serpapi binary + direct sqlite assertions
 //! (pattern proven by tests/provider_facades_contract.rs and
 //! tests/mcp_billing_regression.rs). Every upstream is a stub — production
@@ -288,6 +295,13 @@ async fn spawn_tavily_mock_upstream() -> (String, TavilyMockCounters) {
 // zero semantic or visibility changes (key_store include-family precedent).
 // ---------------------------------------------------------------------------
 include!("common/provider_mcp_e2e_serpapi_harness.rs");
+
+// ---------------------------------------------------------------------------
+// Keenable hosted MCP passthrough (keenable-integration todo 8) — harness +
+// acceptance tests, extracted into tests/common/ for the 3050-line source
+// budget (serpapi-harness include precedent): same crate-root module scope.
+// ---------------------------------------------------------------------------
+include!("common/provider_mcp_e2e_keenable_harness.rs");
 // ---------------------------------------------------------------------------
 // Acceptance tests (plan L210, each named criterion).
 // ---------------------------------------------------------------------------

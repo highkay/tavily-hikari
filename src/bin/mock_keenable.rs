@@ -29,6 +29,11 @@ const KEY_GOOD: &str = "key-good";
 /// business success (the SPEC allows `usage` to be absent) while the
 /// passive credit harvest skips it cleanly.
 const KEY_PARTIAL: &str = "key-partial";
+/// Scripted session-migration arm (keenable-integration todo 8): a key
+/// revoked mid-session authorizes the initialize but rejects the PINNED
+/// follow-up `tools/call` with 401, proving the passthrough's key-migration
+/// ladder moves the session onto another pooled key.
+const KEY_TURNCOAT: &str = "key-auth-after-init";
 const KEY_EXHAUSTED: &str = "key-exhausted";
 const KEY_AUTH: &str = "key-auth";
 const KEY_RATE: &str = "key-rate";
@@ -101,6 +106,10 @@ struct MockState {
     counters: MockCounters,
     last_bodies: LastBodies,
     last_api_key: Mutex<Option<String>>,
+    /// Raw `Authorization` header value observed on the last keyed request
+    /// (None when absent). The hosted-MCP passthrough injects `X-API-Key`, so
+    /// the e2e suite asserts this stays absent upstream.
+    last_authorization: Mutex<Option<String>>,
 }
 
 impl MockState {
@@ -112,6 +121,7 @@ impl MockState {
             counters: MockCounters::default(),
             last_bodies: LastBodies::default(),
             last_api_key: Mutex::new(None),
+            last_authorization: Mutex::new(None),
         }
     }
 
@@ -284,6 +294,10 @@ async fn authorize(state: &MockState, headers: &HeaderMap) -> Option<Response> {
     if !key.is_empty() {
         *state.last_api_key.lock().expect("api key lock") = Some(key.clone());
     }
+    *state.last_authorization.lock().expect("authorization lock") = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     match state.classify(&key) {
         KeyStatus::Valid => None,
         KeyStatus::Partial => Some(
@@ -509,6 +523,7 @@ async fn handle_mcp(
 ) -> Response {
     state.counters.mcp.fetch_add(1, Ordering::Relaxed);
     remember(&state.last_bodies.mcp, body.as_deref());
+    let key = api_key(&headers);
     if let Some(response) = authorize(&state, &headers).await {
         return response;
     }
@@ -527,18 +542,24 @@ async fn handle_mcp(
                 .counters
                 .mcp_initialize
                 .fetch_add(1, Ordering::Relaxed);
-            rpc_result(
-                id,
-                json!({
-                    "protocolVersion": "2025-06-18",
-                    "capabilities": { "tools": {}, "resources": {}, "prompts": {} },
-                    "serverInfo": {
-                        "name": "keenable-mcp-server",
-                        "version": "0.2.1",
-                        "title": "Keenable Web Search"
-                    }
-                }),
+            let body = json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": { "tools": {}, "resources": {}, "prompts": {} },
+                "serverInfo": {
+                    "name": "keenable-mcp-server",
+                    "version": "0.2.1",
+                    "title": "Keenable Web Search"
+                }
+            });
+            // Streamable-HTTP lifecycle: initialize mints the upstream protocol
+            // session id the passthrough translates into a proxy session id
+            // (mirrors the vendor's hosted MCP session behavior).
+            (
+                StatusCode::OK,
+                [("mcp-session-id", "mock-keenable-mcp-session")],
+                Json(body),
             )
+                .into_response()
         }
         "tools/list" => {
             state
@@ -568,6 +589,10 @@ async fn handle_mcp(
                 .counters
                 .mcp_tools_call
                 .fetch_add(1, Ordering::Relaxed);
+            if key == KEY_TURNCOAT {
+                state.counters.auth_failures.fetch_add(1, Ordering::Relaxed);
+                return (StatusCode::UNAUTHORIZED, Json(invalid_key_body())).into_response();
+            }
             let params = request.get("params").cloned().unwrap_or(Value::Null);
             let name = params
                 .get("name")
@@ -598,7 +623,12 @@ async fn handle_metrics(State(state): State<Arc<MockState>>) -> Json<Value> {
         "auth_failures": state.counters.auth_failures.load(Ordering::Relaxed),
         "slow_requests": state.counters.slow_requests.load(Ordering::Relaxed),
         "credits_remaining": state.credits_remaining.load(Ordering::Relaxed),
-        "last_api_key": state.last_api_key.lock().expect("api key lock").clone()
+        "last_api_key": state.last_api_key.lock().expect("api key lock").clone(),
+        "last_authorization": state
+            .last_authorization
+            .lock()
+            .expect("authorization lock")
+            .clone()
     }))
 }
 

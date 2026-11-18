@@ -149,11 +149,42 @@ fn keenable_attempt_analysis(
 fn parse_keenable_credits_remaining(body: &[u8]) -> Option<i64> {
     let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
     let credits = parsed.get("usage")?.get("credits_remaining")?;
+    keenable_credits_value(credits)
+}
+
+/// Numeric coercion shared by the REST (`usage.credits_remaining`) and hosted
+/// MCP (`_meta["keenable/usage"].credits_remaining`) passive parsers:
+/// numbers, and numeric strings because envelopes in this family have been
+/// observed stringifying counters.
+fn keenable_credits_value(credits: &serde_json::Value) -> Option<i64> {
     match credits {
         serde_json::Value::Number(number) => number
             .as_i64()
             .or_else(|| number.as_u64().and_then(|value| i64::try_from(value).ok())),
         serde_json::Value::String(text) => text.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+/// Parse the passive credit balance out of a buffered hosted-MCP JSON-RPC
+/// response body (keenable-integration todo 8): a single response exposes it
+/// at `result._meta["keenable/usage"].credits_remaining`; a batch exposes it
+/// per result and the LAST observed value wins (each tool result carries the
+/// balance as of that call). Absent `_meta` (every free method, every error
+/// envelope) is simply no sample, never an error.
+fn parse_keenable_mcp_credits_remaining(body: &[u8]) -> Option<i64> {
+    let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let credits_of = |message: &serde_json::Value| {
+        message
+            .get("result")?
+            .get("_meta")?
+            .get("keenable/usage")?
+            .get("credits_remaining")
+            .and_then(keenable_credits_value)
+    };
+    match parsed {
+        serde_json::Value::Object(_) => credits_of(&parsed),
+        serde_json::Value::Array(items) => items.iter().filter_map(credits_of).next_back(),
         _ => None,
     }
 }
@@ -341,7 +372,29 @@ impl TavilyProxy {
             // and honors the SPEC's "may be absent".
             return;
         };
+        self.persist_keenable_passive_credits(key_id, credits_remaining)
+            .await;
+    }
 
+    /// Passive credit harvest for the hosted-MCP passthrough (keenable-integration
+    /// todo 8): reads `_meta["keenable/usage"].credits_remaining` from the
+    /// ALREADY-BUFFERED JSON-RPC response body (zero extra requests) and shares
+    /// the REST harvest's material-change persistence seam (source
+    /// `keenable_passive`, quota_limit NULL, quota_renews_at untouched,
+    /// best-effort). The caller is the server-side passthrough pipeline.
+    pub async fn harvest_keenable_mcp_passive_quota(&self, key_id: &str, mcp_body: &[u8]) {
+        let Some(credits_remaining) = parse_keenable_mcp_credits_remaining(mcp_body) else {
+            // No balance advertised (every free method and every error
+            // envelope): no DB read, no write.
+            return;
+        };
+        self.persist_keenable_passive_credits(key_id, credits_remaining)
+            .await;
+    }
+
+    /// Material-change persistence shared by the REST and hosted-MCP passive
+    /// harvests (todo-7 contract, unchanged semantics).
+    async fn persist_keenable_passive_credits(&self, key_id: &str, credits_remaining: i64) {
         // Bounded foreground read of the stored balance to gate the material
         // change. On error treat as absent (best-effort) - a redundant write
         // is idempotent-valued and harmless; contention never blocks the
@@ -606,6 +659,40 @@ mod keenable_facade_translation_tests {
         ] {
             assert_eq!(
                 parse_keenable_credits_remaining(body),
+                None,
+                "no sample from {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn keenable_mcp_meta_harvest_parser_reads_single_and_batch_results() {
+        // A successful tools/call carries the balance at
+        // result._meta["keenable/usage"].credits_remaining (todo-8 contract).
+        let single = br#"{"jsonrpc":"2.0","id":3,"result":{"content":[],"structuredContent":{},"_meta":{"keenable/usage":{"credits":1,"credits_remaining":99999}}}}"#;
+        assert_eq!(parse_keenable_mcp_credits_remaining(single), Some(99_999));
+
+        // A numeric string balance coerces like the REST parser.
+        let stringified = br#"{"jsonrpc":"2.0","id":3,"result":{"_meta":{"keenable/usage":{"credits_remaining":"99998"}}}}"#;
+        assert_eq!(parse_keenable_mcp_credits_remaining(stringified), Some(99_998));
+
+        // A batch exposes it per result; the LAST observed value wins.
+        let batch = br#"[{"jsonrpc":"2.0","id":1,"result":{"_meta":{"keenable/usage":{"credits_remaining":99999}}}},{"jsonrpc":"2.0","id":2,"result":{"_meta":{"keenable/usage":{"credits_remaining":99998}}}}]"#;
+        assert_eq!(parse_keenable_mcp_credits_remaining(batch), Some(99_998));
+
+        // Todo-8 adversarial: free methods (no _meta), error envelopes
+        // (error at the top level), a null _meta, and non-JSON bodies are
+        // simply NO sample.
+        for body in [
+            br#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method not found"}}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","id":3,"result":{"_meta":null}}"#.as_slice(),
+            br#"[{"jsonrpc":"2.0","id":1,"result":{"_meta":{"keenable/usage":{}}}}]"#.as_slice(),
+            br#"not json-rpc at all"#.as_slice(),
+            b"".as_slice(),
+        ] {
+            assert_eq!(
+                parse_keenable_mcp_credits_remaining(body),
                 None,
                 "no sample from {body:?}"
             );

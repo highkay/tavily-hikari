@@ -26,10 +26,22 @@ use tavily_hikari::{
 // SerpApi hosted MCP passthrough pipeline (plan todo 15): session-provider
 // tagging + translation, tool billing matrix, retry-ladder follow-ups, and
 // provider-scoped session gating (M6). Replaces the typed todo-11
-// `provider_mcp_pending` boundary for the serpapi surface only; Exa/Brave
-// MCP facades keep that boundary until todos 16-17.
+// `provider_mcp_pending` boundary for the serpapi surface only; the Keenable
+// mirror (keenable-integration todo 8) lives in `provider_mcp_keenable.rs`;
+// Exa/Brave MCP facades keep that boundary until todos 16-17.
 #[path = "provider_mcp_serpapi.rs"]
 mod provider_mcp_serpapi;
+
+// Keenable hosted MCP passthrough pipeline (keenable-integration todo 8):
+// the SerpApi mirror with X-API-Key injection, no Bearer assumptions, the
+// SPEC billing matrix (free initialize/notifications/ping/tools-list;
+// 1 credit per successful search_web_pages/fetch_page_content call), the
+// same session-id translation + key-migration ladder, and the passive
+// `_meta["keenable/usage"].credits_remaining` harvest. Replaces the typed
+// todo-2 `provider_mcp_pending` boundary for the keenable surface only; the
+// Zhihu local facade keeps that boundary until todo 10.
+#[path = "provider_mcp_keenable.rs"]
+mod provider_mcp_keenable;
 
 // Provider-parameterized LOCAL MCP facade framework (plan todo 16; M19) + the
 // Brave and Exa facades built on it. The framework generalizes the rebalance
@@ -209,9 +221,10 @@ const PROVIDER_MCP_INGRESS_ROUTES: &[(ProviderId, &str)] = &[
     (ProviderId::Serpapi, "/serpapi/mcp"),
     (ProviderId::Exa, "/exa/mcp"),
     (ProviderId::Brave, "/brave/mcp"),
-    // keenable-integration todo 6: both ingresses keep the typed todo-2
-    // `provider_mcp_pending` dispatch until todo 8 (Keenable hosted
-    // passthrough) and todo 10 (Zhihu local facade) land.
+    // keenable-integration todo 6: the ingress registrations. The Keenable
+    // ingress dispatches through the hosted passthrough (todo 8) and the
+    // Zhihu ingress keeps the typed todo-2 `provider_mcp_pending` dispatch
+    // until todo 10 lands.
     (ProviderId::Keenable, "/keenable/mcp"),
     (ProviderId::Zhihu, "/zhihu/mcp"),
 ];
@@ -933,11 +946,11 @@ pub(super) async fn provider_mcp_facade(
         }
     }
 
-    // Typed todo-2 boundaries: the Keenable hosted passthrough (todo 8) and
-    // the Zhihu local facade (todo 10) replace their arms behind the same
-    // seam. Until then both surfaces answer with the typed pending boundary
-    // below — never a 200, never an upstream call, never a key mark.
-    if provider == ProviderId::Keenable || provider == ProviderId::Zhihu {
+    // Typed todo-2 boundary: the Zhihu local facade (todo 10) replaces its
+    // arm behind the same seam. Until then the surface answers with the
+    // typed pending boundary below — never a 200, never an upstream call,
+    // never a key mark.
+    if provider == ProviderId::Zhihu {
         eprintln!(
             "provider MCP dispatch pending for {provider} ({path})",
             provider = provider
@@ -945,10 +958,27 @@ pub(super) async fn provider_mcp_facade(
         return provider_mcp_execution_pending_response(provider);
     }
 
-    // SerpApi hosted passthrough (todo 15), the Brave LOCAL facade (todo 16),
-    // and the Exa LOCAL facade (todo 17) each replaced the typed boundary
-    // behind the same seam. All three build the SHARED facade context (the
-    // serpapi module owns it as the first consumer of the seam).
+    // SerpApi hosted passthrough (todo 15), the Keenable hosted passthrough
+    // (keenable-integration todo 8), the Brave LOCAL facade (todo 16), and
+    // the Exa LOCAL facade (todo 17) each replaced the typed boundary behind
+    // the same seam. All four build the SHARED facade context (the serpapi
+    // module owns it as the first consumer of the seam).
+    if provider == ProviderId::Keenable {
+        return provider_mcp_keenable::provider_mcp_keenable_passthrough(
+            state,
+            provider_mcp_serpapi::ProviderMcpFacadeContext {
+                provider,
+                method: &method,
+                path: &path,
+                request_kind: &request_kind,
+                body: &body_bytes,
+                auth: &auth,
+                original_headers: &parts.headers,
+                remote_addr,
+            },
+        )
+        .await;
+    }
     if provider == ProviderId::Serpapi {
         return provider_mcp_serpapi::provider_mcp_passthrough(
             state,
@@ -1002,11 +1032,12 @@ pub(super) async fn provider_mcp_facade(
 }
 
 /// Typed Hikari boundary response for provider MCP surfaces without a wired
-/// execution body. All three registered ingresses (SerpApi todo 15, Brave
-/// todo 16, Exa todo 17) dispatch above; Tavily keeps its pinned `/mcp`
-/// handler and never routes here — this fallback stays as the typed shape for
-/// any unexpected provider id (never a provider-shaped error, never an
-/// upstream call).
+/// execution body. The registered hosted passthrough ingresses (SerpApi todo
+/// 15, Keenable keenable-integration todo 8) and the local facades (Brave
+/// todo 16, Exa todo 17) dispatch above; Zhihu's local facade (todo 10) keeps
+/// this boundary; Tavily keeps its pinned `/mcp` handler and never routes
+/// here — this fallback stays as the typed shape for any unexpected provider
+/// id (never a provider-shaped error, never an upstream call).
 fn provider_mcp_execution_pending_response(
     provider: ProviderId,
 ) -> Result<Response<Body>, StatusCode> {
