@@ -43,6 +43,8 @@ const publicGuideTabs = [
   { id: 'serpapi', label: 'SerpApi' },
   { id: 'exa', label: 'Exa' },
   { id: 'brave', label: 'Brave' },
+  { id: 'keenable', label: 'Keenable' },
+  { id: 'zhihu', label: 'Zhihu' },
   { id: 'tavily', label: 'Tavily' },
   { id: 'other', label: 'HTTP API' },
 ] as const
@@ -296,7 +298,7 @@ function PublicHomeGuideTokenRevealedProof(): JSX.Element {
   )
 }
 
-const providerGuideProofKeys = ['serpapi', 'exa', 'brave', 'tavily'] as const
+const providerGuideProofKeys = ['serpapi', 'exa', 'brave', 'keenable', 'zhihu', 'tavily'] as const
 
 /**
  * Mixed-provider recent-requests fixture mirroring the live instance's two rows

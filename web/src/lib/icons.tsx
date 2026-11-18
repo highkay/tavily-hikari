@@ -14,6 +14,8 @@ type GuideClientIconId =
   | 'serpapi'
   | 'exa'
   | 'brave'
+  | 'keenable'
+  | 'zhihu'
   | 'tavily'
   | 'other'
 
@@ -29,6 +31,8 @@ export const GUIDE_CLIENT_ICON_NAMES: Record<GuideClientIconId, string> = {
   serpapi: 'mdi:search-web',
   exa: 'mdi:lightning-bolt',
   brave: 'simple-icons:brave',
+  keenable: 'mdi:file-document-outline',
+  zhihu: 'mdi:help-circle-outline',
   tavily: 'mdi:telescope',
   other: 'mdi:dots-horizontal',
 }

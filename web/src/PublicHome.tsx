@@ -50,7 +50,7 @@ import { buildProviderGuideContent } from './user-console/providerGuides'
 
 type GuideLanguage = 'toml' | 'json' | 'bash'
 
-type GuideKey = 'codex' | 'hikariCli' | 'claude' | 'vscode' | 'claudeDesktop' | 'cursor' | 'windsurf' | 'cherryStudio' | 'serpapi' | 'exa' | 'brave' | 'tavily' | 'other'
+type GuideKey = 'codex' | 'hikariCli' | 'claude' | 'vscode' | 'claudeDesktop' | 'cursor' | 'windsurf' | 'cherryStudio' | 'serpapi' | 'exa' | 'brave' | 'keenable' | 'zhihu' | 'tavily' | 'other'
 
 interface GuideReference {
   label: string
@@ -100,10 +100,12 @@ const GUIDE_KEY_ORDER: GuideKey[] = [
   'serpapi',
   'exa',
   'brave',
+  'keenable',
+  'zhihu',
   'tavily',
   'other',
 ]
-const PRIMARY_GUIDE_KEYS = new Set<GuideKey>(['codex', 'hikariCli', 'claude', 'vscode', 'serpapi', 'exa', 'brave', 'tavily'])
+const PRIMARY_GUIDE_KEYS = new Set<GuideKey>(['codex', 'hikariCli', 'claude', 'vscode', 'serpapi', 'exa', 'brave', 'keenable', 'zhihu', 'tavily'])
 
 const numberFormatter = new Intl.NumberFormat('en-US', {
   maximumFractionDigits: 0,

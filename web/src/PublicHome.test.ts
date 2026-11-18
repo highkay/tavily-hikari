@@ -73,6 +73,17 @@ describe('PublicHome guide token visibility', () => {
   })
 })
 
+describe('PublicHome guide tab locale parity', () => {
+  it('keeps English and Chinese guide tab keys aligned', () => {
+    const englishKeys = Object.keys(translations.en.public.guide.tabs).sort()
+    const chineseKeys = Object.keys(translations.zh.public.guide.tabs).sort()
+
+    expect(chineseKeys).toEqual(englishKeys)
+    expect(englishKeys).toContain('keenable')
+    expect(englishKeys).toContain('zhihu')
+  })
+})
+
 describe('PublicHome provider column (plan todo 7 / M2)', () => {
   const renderLogsPanels = (logs: PublicTokenLog[], language: 'en' | 'zh' = 'en') =>
     renderToStaticMarkup(

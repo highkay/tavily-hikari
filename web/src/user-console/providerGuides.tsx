@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react'
 
-export type ProviderGuideKey = 'serpapi' | 'exa' | 'brave' | 'tavily'
+export type ProviderGuideKey = 'serpapi' | 'exa' | 'brave' | 'keenable' | 'zhihu' | 'tavily'
 
 type ProviderGuideLanguage = 'toml' | 'json' | 'bash'
 
@@ -28,6 +28,8 @@ export interface ProviderGuideContent {
  *   `X-Subscription-Token`); slot names pinned by `src/providers/spec.rs`.
  * - Tool catalogs: `src/server/provider_mcp_serpapi.rs:30`,
  *   `provider_mcp_exa.rs:211-233`, `provider_mcp_brave.rs:178-205`.
+ * - Keenable and Zhihu routes, authentication slots, tool catalogs, and limits are
+ *   pinned by `docs/specs/keenable-zhihu-providers/SPEC.md`.
  * - Tavily itself: `src/server/serve.rs:566` MCP ingress `/mcp` (passthrough;
  *   tool names normalized as `tavily-{search,extract,crawl,map,research}` in
  *   `src/analysis.rs:879-883`) plus `src/server/serve.rs:353-362` REST routes
@@ -160,6 +162,96 @@ export function buildProviderGuideContent(
         },
       ],
     },
+    keenable: {
+      title: 'Keenable',
+      steps: isEnglish
+        ? [
+            <>Point any HTTP MCP client at <code>{baseUrl}/keenable/mcp</code> with <code>Authorization: Bearer {prettyToken}</code>; Hikari passes through to Keenable&apos;s hosted MCP.</>,
+            <>The façade advertises <code>search_web_pages</code> and <code>fetch_page_content</code>.</>,
+            <>The REST base is <code>{baseUrl}/api/keenable</code>. Call <code>POST /v1/search</code> or <code>GET /v1/fetch?url=...</code> with the Hikari token in <code>X-API-Key</code>; <code>Authorization: Bearer {prettyToken}</code> is also accepted.</>,
+            <>Limits: 10 requests per second per organization, shared across keys and search/fetch. The free allowance is 100,000 requests per month and resets monthly.</>,
+          ]
+        : [
+            <>将任意 HTTP MCP 客户端指向 <code>{baseUrl}/keenable/mcp</code>，并携带 <code>Authorization: Bearer {prettyToken}</code>；Hikari 会透传到 Keenable 托管 MCP。</>,
+            <>该入口会通告 <code>search_web_pages</code> 与 <code>fetch_page_content</code> 两个工具。</>,
+            <>REST 基础地址是 <code>{baseUrl}/api/keenable</code>。调用 <code>POST /v1/search</code> 或 <code>GET /v1/fetch?url=...</code> 时，把 Hikari token 放进 <code>X-API-Key</code>；也接受 <code>Authorization: Bearer {prettyToken}</code>。</>,
+            <>限制：每个组织每秒 10 个请求，所有 key 以及 search/fetch 共享该额度。免费额度为每月 100,000 个请求，按月重置。</>,
+          ],
+      samples: [
+        {
+          title: isEnglish ? 'Example: ~/.codex/config.toml' : '示例：~/.codex/config.toml',
+          language: 'toml',
+          snippet: buildProviderCodexSnippet('keenable_hikari', baseUrl, '/keenable/mcp', 'KEENABLE_HIKARI_TOKEN'),
+        },
+        {
+          title: isEnglish ? 'Example: claude mcp add-json' : '示例：claude mcp add-json',
+          language: 'bash',
+          snippet: buildProviderClaudeSnippet('keenable-hikari', baseUrl, '/keenable/mcp', prettyToken),
+        },
+        {
+          title: isEnglish ? 'Example: VS Code / generic mcp.json' : '示例：VS Code / 通用 mcp.json',
+          language: 'json',
+          snippet: buildProviderVscodeSnippet('keenable-hikari', baseUrl, '/keenable/mcp', prettyToken),
+        },
+        {
+          title: isEnglish ? 'Example: POST /api/keenable/v1/search' : '示例：POST /api/keenable/v1/search',
+          language: 'bash',
+          snippet: buildKeenableSearchHttpSnippet(baseUrl, prettyToken),
+        },
+        {
+          title: isEnglish ? 'Example: GET /api/keenable/v1/fetch' : '示例：GET /api/keenable/v1/fetch',
+          language: 'bash',
+          snippet: buildKeenableFetchHttpSnippet(baseUrl, prettyToken),
+        },
+      ],
+    },
+    zhihu: {
+      title: 'Zhihu',
+      steps: isEnglish
+        ? [
+            <>Point any HTTP MCP client at <code>{baseUrl}/zhihu/mcp</code> with <code>Authorization: Bearer {prettyToken}</code>; Hikari runs this facade locally.</>,
+            <>The façade advertises exactly <code>zhihu_search</code> and <code>zhihu_global_search</code>; no other Zhihu tools are exposed.</>,
+            <>The REST base is <code>{baseUrl}/api/zhihu</code>. Call <code>GET /api/v1/content/zhihu_search</code> or <code>GET /api/v1/content/global_search</code> with <code>Authorization: Bearer {prettyToken}</code>. Hikari adds the account Access Secret and <code>X-Request-Timestamp</code> only to the upstream request.</>,
+            <><code>Query</code> is required. <code>Count</code> is capped at 10 for <code>zhihu_search</code> and 20 for <code>global_search</code>; larger values are rejected locally. <code>SortBy</code>, <code>SearchDB</code>, and <code>Filter</code> pass through unchanged.</>,
+            <>Quota is tracked per natural day. Hikari reads <code>RemainingQuota</code> from <code>/api/v1/quota</code> and restores an exhausted key at the next Asia/Shanghai midnight.</>,
+            <>Operator terms: the Access Secret is account-level. Do not rotate or farm multiple accounts, and verify Zhihu&apos;s resale terms before offering this publicly.</>,
+          ]
+        : [
+            <>将任意 HTTP MCP 客户端指向 <code>{baseUrl}/zhihu/mcp</code>，并携带 <code>Authorization: Bearer {prettyToken}</code>；该入口由 Hikari 本地提供。</>,
+            <>该入口只通告 <code>zhihu_search</code> 与 <code>zhihu_global_search</code> 两个工具，不提供其他知乎工具。</>,
+            <>REST 基础地址是 <code>{baseUrl}/api/zhihu</code>。调用 <code>GET /api/v1/content/zhihu_search</code> 或 <code>GET /api/v1/content/global_search</code> 时，携带 <code>Authorization: Bearer {prettyToken}</code>。Hikari 只在发往上游时添加账号级 Access Secret 和 <code>X-Request-Timestamp</code>。</>,
+            <><code>Query</code> 为必填项。<code>zhihu_search</code> 的 <code>Count</code> 上限为 10，<code>global_search</code> 为 20；超过上限会在本地拒绝。<code>SortBy</code>、<code>SearchDB</code> 与 <code>Filter</code> 原样透传。</>,
+            <>额度按自然日统计。Hikari 从 <code>/api/v1/quota</code> 读取 <code>RemainingQuota</code>，并在下一个 Asia/Shanghai 午夜恢复耗尽的 key。</>,
+            <>运营条款：Access Secret 属于账号级凭证。不要轮换或批量经营多个账号；公开提供此服务前，请核实知乎的转售条款。</>,
+          ],
+      samples: [
+        {
+          title: isEnglish ? 'Example: ~/.codex/config.toml' : '示例：~/.codex/config.toml',
+          language: 'toml',
+          snippet: buildProviderCodexSnippet('zhihu_hikari', baseUrl, '/zhihu/mcp', 'ZHIHU_HIKARI_TOKEN'),
+        },
+        {
+          title: isEnglish ? 'Example: claude mcp add-json' : '示例：claude mcp add-json',
+          language: 'bash',
+          snippet: buildProviderClaudeSnippet('zhihu-hikari', baseUrl, '/zhihu/mcp', prettyToken),
+        },
+        {
+          title: isEnglish ? 'Example: VS Code / generic mcp.json' : '示例：VS Code / 通用 mcp.json',
+          language: 'json',
+          snippet: buildProviderVscodeSnippet('zhihu-hikari', baseUrl, '/zhihu/mcp', prettyToken),
+        },
+        {
+          title: isEnglish ? 'Example: GET /api/zhihu/api/v1/content/zhihu_search' : '示例：GET /api/zhihu/api/v1/content/zhihu_search',
+          language: 'bash',
+          snippet: buildZhihuSearchHttpSnippet(baseUrl, prettyToken),
+        },
+        {
+          title: isEnglish ? 'Example: GET /api/zhihu/api/v1/content/global_search' : '示例：GET /api/zhihu/api/v1/content/global_search',
+          language: 'bash',
+          snippet: buildZhihuGlobalSearchHttpSnippet(baseUrl, prettyToken),
+        },
+      ],
+    },
     tavily: {
       title: 'Tavily',
       steps: isEnglish
@@ -275,6 +367,37 @@ export function buildExaHttpSnippet(baseUrl: string, prettyToken: string): strin
 export function buildBraveHttpSnippet(baseUrl: string, prettyToken: string): string {
   return `curl "${baseUrl}/api/brave/res/v1/web/search?q=coffee&count=5" \\
   -H "X-Subscription-Token: ${prettyToken}"`
+}
+
+export function buildKeenableSearchHttpSnippet(baseUrl: string, prettyToken: string): string {
+  return `curl -X POST "${baseUrl}/api/keenable/v1/search" \\
+  -H "Content-Type: application/json" \\
+  -H "X-API-Key: ${prettyToken}" \\
+  -d '{
+    "query": "latest AI agent news",
+    "max_results": 5
+  }'`
+}
+
+export function buildKeenableFetchHttpSnippet(baseUrl: string, prettyToken: string): string {
+  return `curl -G "${baseUrl}/api/keenable/v1/fetch" \\
+  -H "X-API-Key: ${prettyToken}" \\
+  --data-urlencode "url=https://example.com"`
+}
+
+export function buildZhihuSearchHttpSnippet(baseUrl: string, prettyToken: string): string {
+  return `curl -G "${baseUrl}/api/zhihu/api/v1/content/zhihu_search" \\
+  -H "Authorization: Bearer ${prettyToken}" \\
+  --data-urlencode "Query=AI agents" \\
+  --data-urlencode "Count=10"`
+}
+
+export function buildZhihuGlobalSearchHttpSnippet(baseUrl: string, prettyToken: string): string {
+  return `curl -G "${baseUrl}/api/zhihu/api/v1/content/global_search" \\
+  -H "Authorization: Bearer ${prettyToken}" \\
+  --data-urlencode "Query=AI agents" \\
+  --data-urlencode "Count=20" \\
+  --data-urlencode "SearchDB=all"`
 }
 
 export function buildTavilyHttpSnippet(baseUrl: string, prettyToken: string): string {

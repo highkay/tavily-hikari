@@ -40,7 +40,7 @@ const PROVIDER_BASE_URL = 'https://hikari.example.com'
 const PROVIDER_TOKEN = 'th-a1b2-secretsecret'
 
 interface ProviderExpectation {
-  key: 'serpapi' | 'exa' | 'brave' | 'tavily'
+  key: 'serpapi' | 'exa' | 'brave' | 'keenable' | 'zhihu' | 'tavily'
   mcpPath: string
   httpPath: string
   httpAuthMarker: string
@@ -68,6 +68,20 @@ const PROVIDER_EXPECTATIONS: ProviderExpectation[] = [
     httpPath: '/api/brave/res/v1/web/search',
     httpAuthMarker: `X-Subscription-Token: ${PROVIDER_TOKEN}`,
     boundary: { en: 'no URL extraction', zh: 'URL 抽取' },
+  },
+  {
+    key: 'keenable',
+    mcpPath: '/keenable/mcp',
+    httpPath: '/api/keenable/v1/search',
+    httpAuthMarker: `X-API-Key: ${PROVIDER_TOKEN}`,
+    boundary: { en: '100,000 requests per month', zh: '100,000 个请求' },
+  },
+  {
+    key: 'zhihu',
+    mcpPath: '/zhihu/mcp',
+    httpPath: '/api/zhihu/api/v1/content/zhihu_search',
+    httpAuthMarker: `Authorization: Bearer ${PROVIDER_TOKEN}`,
+    boundary: { en: 'Operator terms', zh: '运营条款' },
   },
   {
     key: 'tavily',
@@ -145,6 +159,49 @@ describe('provider setup guides', () => {
     }
   })
 
+  it('documents the Keenable and Zhihu contract surfaces without production upstream snippets', () => {
+    for (const language of ['en', 'zh'] as const) {
+      const guides = buildGuideContent(language, PROVIDER_BASE_URL, PROVIDER_TOKEN)
+      const keenable = readProviderGuide(guides, 'keenable')
+      const zhihu = readProviderGuide(guides, 'zhihu')
+      expect(keenable).toBeDefined()
+      expect(zhihu).toBeDefined()
+      if (!keenable || !zhihu) continue
+
+      const keenableSteps = renderSteps(keenable.steps)
+      const keenableSamples = resolveGuideSamples(keenable)
+        .map((sample) => guideSnippetToPlainText(sample.snippet))
+        .join('\n')
+      expect(keenableSteps).toContain(`${PROVIDER_BASE_URL}/api/keenable`)
+      expect(keenableSteps).toContain('search_web_pages')
+      expect(keenableSteps).toContain('fetch_page_content')
+      expect(keenableSteps).toContain(language === 'en' ? '10 requests per second' : '每秒 10 个请求')
+      expect(keenableSamples).toContain(`${PROVIDER_BASE_URL}/api/keenable/v1/fetch`)
+      expect(keenableSamples).toContain(`X-API-Key: ${PROVIDER_TOKEN}`)
+      expect(keenableSamples).not.toContain('api.keenable.ai')
+
+      const zhihuSteps = renderSteps(zhihu.steps)
+      const zhihuSamples = resolveGuideSamples(zhihu)
+        .map((sample) => guideSnippetToPlainText(sample.snippet))
+        .join('\n')
+      expect(zhihuSteps).toContain(`${PROVIDER_BASE_URL}/api/zhihu`)
+      expect(zhihuSteps).toContain('zhihu_search')
+      expect(zhihuSteps).toContain('zhihu_global_search')
+      expect(zhihuSteps).toContain('Count')
+      expect(zhihuSteps).toContain('10')
+      expect(zhihuSteps).toContain('20')
+      expect(zhihuSteps).toContain('RemainingQuota')
+      expect(zhihuSteps).toContain('Asia/Shanghai')
+      expect(zhihuSamples).toContain(`${PROVIDER_BASE_URL}/api/zhihu/api/v1/content/global_search`)
+      expect(zhihuSamples).toContain('Count=10')
+      expect(zhihuSamples).toContain('Count=20')
+      expect(zhihuSamples).not.toContain('developer.zhihu.com')
+      expect(zhihuSteps).not.toContain('hot_list')
+      expect(zhihuSteps).not.toContain('question_discovery')
+      expect(zhihuSteps).not.toContain('zhida_openai')
+    }
+  })
+
   it('keeps the Tavily sections byte-stable', () => {
     const guides = buildGuideContent('en', PROVIDER_BASE_URL, PROVIDER_TOKEN)
 
@@ -172,7 +229,9 @@ describe('provider setup guides', () => {
 })
 
 describe('provider guide deep links', () => {
-  it('resolves the tavily guide key from the setup-guide query param', () => {
+  it('resolves provider guide keys from the setup-guide query param', () => {
+    expect(resolveSetupGuide('?guide=keenable')).toBe('keenable')
+    expect(resolveSetupGuide('?guide=zhihu')).toBe('zhihu')
     expect(resolveSetupGuide('?guide=tavily')).toBe('tavily')
     expect(resolveSetupGuide('?guide=unknown')).toBe('codex')
   })
