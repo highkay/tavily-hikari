@@ -131,6 +131,40 @@ describe('KeyQuotaPanel quotaDisplayKind variants (plan todo 22)', () => {
     expect(container.textContent ?? '').toContain('harvested from upstream response headers')
   })
 
+  it('renders Keenable credits and a literal missing-snapshot marker instead of zero', () => {
+    const missing = renderQuota(keyStats({ provider: 'keenable' }))
+    expect(missing.textContent ?? '').toContain('Credits remaining')
+    expect(
+      Array.from(missing.querySelectorAll('[data-provider="keenable"] .metric-value')).map(
+        (node) => node.textContent,
+      ),
+    ).toEqual(['--', '--'])
+
+    const synced = renderQuota(
+      keyStats({ provider: 'keenable', quota_remaining: 99_999, quota_synced_at: 1_700_000_000 }),
+    )
+    expect(synced.textContent ?? '').toContain('99999')
+    expect(synced.textContent ?? '').toContain('T1700000000')
+  })
+
+  it('renders Zhihu daily remaining and natural-day renewal in en and zh', () => {
+    const detail = keyStats({
+      provider: 'zhihu',
+      quota_limit: 10,
+      quota_remaining: 3,
+      quota_renews_at: 1_800_000_000,
+      quota_synced_at: 1_700_000_000,
+    })
+    const english = renderQuota(detail)
+    expect(english.textContent ?? '').toContain('Daily remaining')
+    expect(english.textContent ?? '').toContain('Renews')
+    expect(english.textContent ?? '').toContain('T1800000000')
+
+    const chinese = renderQuota(detail, 'zh')
+    expect(chinese.textContent ?? '').toContain('每日剩余')
+    expect(chinese.textContent ?? '').toContain('续费')
+  })
+
   it('renders the Exa no-balance-API note without metric cards', () => {
     const container = renderQuota(keyStats({ provider: 'exa' }))
     expect(container.textContent ?? '').toContain('no upstream balance API')
@@ -151,6 +185,15 @@ describe('KeyUsageSyncButton gating (plan todo 22)', () => {
     const button = container.querySelector('button')!
     expect(button.disabled).toBe(false)
     expect(button.getAttribute('title')).toBeNull()
+  })
+
+  it('enables sync actions for Keenable passive snapshots and Zhihu live quota', () => {
+    for (const provider of ['keenable', 'zhihu'] as const) {
+      const container = render(
+        <KeyUsageSyncButton provider={provider} syncState="idle" onSync={() => undefined} />,
+      )
+      expect(container.querySelector('button')?.disabled).toBe(false)
+    }
   })
 })
 

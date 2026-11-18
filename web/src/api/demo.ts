@@ -7,7 +7,7 @@ import {
 import { demoUserEntitlements } from './demoAccountEntitlements'
 import { createDemoRechargeOrders, demoAdminUserRechargeAudit, handleDemoAdminRechargeAction, handleDemoAdminRecharges, type DemoRechargeOrder } from './demoAdminRecharge'
 import { createDemoHaStatus, handleDemoHaRoute } from './demoHa'
-import { createDemoAnalysisProvidersSnapshot, createDemoProviderBreakdown, createDemoProviderKeys, createDemoProviderLogs, createDemoProviderRequestKindOptions, createDemoUserProviderCounts, handleProviderDemoRoute, isProviderMcpPath, withProviderBreakdown } from './demoProviders'
+import { createDemoAnalysisProvidersSnapshot, createDemoProviderBreakdown, createDemoProviderKeys, createDemoProviderLogs, createDemoProviderRequestKindOptions, createDemoUserProviderCounts, filterDemoProviderKeys, handleProviderDemoRoute, isProviderMcpPath, withProviderBreakdown } from './demoProviders'
 import { createDemoUpstreamPrivacyStatus } from './upstreamPrivacyStatusFixtures'
 import { rankingsStorySnapshot } from '../admin/rankingsStoryData'
 import { buildDemoAnalysisPressureSnapshot } from './demoAnalysisPressure'
@@ -2112,7 +2112,7 @@ async function handleDemoRoute(url: URL, method: string, init?: RequestInit): Pr
     summary: { input_lines: 2, valid_lines: 2, unique_in_input: 2, created: 1, undeleted: 0, existed: 1, duplicate_in_input: 0, failed: 0 },
     results: [{ api_key: 'tvly-dev-demo-one', status: 'created', id: 'key-new-demo' }],
   })
-  if (path === '/api/keys' && method === 'GET') return jsonResponse({ ...buildListPage(demoState.keys, url), facets: {
+  if (path === '/api/keys' && method === 'GET') return jsonResponse({ ...buildListPage(filterDemoProviderKeys(demoState.keys, url.searchParams.get('provider')), url), facets: {
     groups: [{ value: 'primary', count: 2 }, { value: 'backup', count: 1 }, { value: 'eu', count: 1 }],
     statuses: [{ value: 'active', count: 2 }, { value: 'quarantined', count: 1 }, { value: 'exhausted', count: 1 }],
     regions: [{ value: 'HK', count: 2 }, { value: 'US', count: 1 }, { value: 'DE', count: 1 }],

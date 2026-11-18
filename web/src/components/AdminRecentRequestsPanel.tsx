@@ -1253,7 +1253,7 @@ export default function AdminRecentRequestsPanel({
                       </TableCell>
                     ) : null}
                     <TableCell className="recent-requests-col recent-requests-col--request-type">
-                      <div className="recent-requests-request-kind-stack">
+                      <div className="recent-requests-request-kind-stack flex flex-wrap items-center gap-1">
                         <RequestKindBadge requestKindKey={log.request_kind_key ?? null} requestKindLabel={requestKindLabel} size="sm" />
                         <StatusBadge
                           tone="neutral"

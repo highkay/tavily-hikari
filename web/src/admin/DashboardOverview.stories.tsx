@@ -839,6 +839,8 @@ const providerActivityCounts: SummaryProviderCount[] = [
   { provider: 'serpapi', total_requests: 413, success_count: 398, error_count: 12, quota_exhausted_count: 3 },
   { provider: 'exa', total_requests: 128, success_count: 121, error_count: 7, quota_exhausted_count: 0 },
   { provider: 'brave', total_requests: 96, success_count: 88, error_count: 6, quota_exhausted_count: 2 },
+  { provider: 'keenable', total_requests: 256, success_count: 249, error_count: 7, quota_exhausted_count: 0 },
+  { provider: 'zhihu', total_requests: 64, success_count: 60, error_count: 3, quota_exhausted_count: 1 },
 ]
 
 export const ProviderActivity: Story = {
@@ -853,6 +855,17 @@ export const ProviderActivity: Story = {
           'Provider activity card with a mixed-provider summary breakdown (todo 6, matrix M3): one row per provider with requests/success/errors/exhausted counts. The card stays hidden when the backend omits the breakdown.',
       },
     },
+  },
+  play: ({ canvasElement }) => {
+    const providers = Array.from(
+      canvasElement.querySelectorAll('.dashboard-provider-panel tbody tr[data-provider]'),
+      (row) => row.getAttribute('data-provider'),
+    )
+    for (const expected of ['keenable', 'zhihu']) {
+      if (!providers.includes(expected)) {
+        throw new Error(`Expected provider activity row: ${expected}`)
+      }
+    }
   },
 }
 

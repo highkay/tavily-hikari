@@ -17,6 +17,8 @@ export interface ProviderCopy {
   validateProbe: string
   /** Localized quota-panel note for this provider. */
   quotaNote: string
+  /** Native credential field expected by provider-specific key intake. */
+  nativeSlotHint?: string
 }
 
 /** SerpApi additionally exposes the `/account` plan fields in the dialog. */
@@ -48,6 +50,8 @@ export interface AdminProviderSharedCopy {
   selectBatchHint: string
   quotaUsed: string
   quotaRemaining: string
+  quotaCreditsRemaining: string
+  quotaDailyRemaining: string
   quotaRenewalDate: string
   quotaSynced: string
   probeMethodLabel: string

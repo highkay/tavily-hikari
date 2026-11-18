@@ -86,6 +86,7 @@ export function KeyProviderFilter({
       value={value}
       disabled={disabled}
       aria-label={providers.filterLabel}
+      data-provider-filter
       onChange={(event) => onChange(event.target.value as ProviderFilterValue)}
     >
       <option value={PROVIDER_FILTER_ALL}>{providers.filterAll}</option>
@@ -111,7 +112,9 @@ export function KeyProviderSelect({
   onChange: (value: ProviderId) => void
   disabled?: boolean
 }): JSX.Element {
-  const providers = useTranslate().admin.providers.shared
+  const providerStrings = useTranslate().admin.providers
+  const providers = providerStrings.shared
+  const nativeSlotHint = providerStrings[value].nativeSlotHint
   return (
     <span className="key-provider-select inline-flex flex-col gap-1" style={{ minWidth: 160 }}>
       <select
@@ -127,6 +130,11 @@ export function KeyProviderSelect({
           </option>
         ))}
       </select>
+      {nativeSlotHint ? (
+        <span className="text-xs opacity-70" data-native-slot={value}>
+          {nativeSlotHint}
+        </span>
+      ) : null}
       <span className="text-xs opacity-70">{providers.selectBatchHint}</span>
     </span>
   )

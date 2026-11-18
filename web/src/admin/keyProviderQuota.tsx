@@ -79,8 +79,9 @@ export function KeyQuotaPanel({
   const admin = useTranslate().admin
   const keyDetailsStrings = admin.keyDetails
   const providerId = detail?.provider
+  const normalizedProviderId = parseProviderId(providerId)
   const kind = quotaDisplayKind(providerId)
-  const providerCopy = admin.providers[parseProviderId(detail?.provider)]
+  const providerCopy = admin.providers[normalizedProviderId]
   const shared = admin.providers.shared
 
   const cards = ((): MetricCard[] => {
@@ -98,7 +99,7 @@ export function KeyQuotaPanel({
         },
         {
           id: 'remaining',
-          label: shared.quotaRemaining,
+          label: normalizedProviderId === 'zhihu' ? shared.quotaDailyRemaining : shared.quotaRemaining,
           value: remaining != null ? formatNumber(remaining) : '—',
           subtitle: limit && remaining != null && limit > 0 ? formatPercent(remaining, limit) : '—',
         },
@@ -117,17 +118,18 @@ export function KeyQuotaPanel({
       ]
     }
     if (kind === 'harvested_remaining') {
+      const missingValue = normalizedProviderId === 'keenable' ? '--' : '—'
       return [
         {
           id: 'remaining',
-          label: shared.quotaRemaining,
-          value: detail.quota_remaining != null ? formatNumber(detail.quota_remaining) : '—',
-          subtitle: detail.quota_limit != null ? `/ ${formatNumber(detail.quota_limit)}` : '—',
+          label: normalizedProviderId === 'keenable' ? shared.quotaCreditsRemaining : shared.quotaRemaining,
+          value: detail.quota_remaining != null ? formatNumber(detail.quota_remaining) : missingValue,
+          subtitle: detail.quota_limit != null ? `/ ${formatNumber(detail.quota_limit)}` : missingValue,
         },
         {
           id: 'synced',
           label: shared.quotaSynced,
-          value: detail.quota_synced_at ? formatTimestamp(detail.quota_synced_at) : '—',
+          value: detail.quota_synced_at ? formatTimestamp(detail.quota_synced_at) : missingValue,
           subtitle: '',
         },
       ]
@@ -138,7 +140,7 @@ export function KeyQuotaPanel({
   const isTavily = kind === 'credits'
 
   return (
-    <section className="surface panel">
+    <section className="surface panel" data-provider={normalizedProviderId}>
       <div className="panel-header">
         <div>
           <h2>Quota</h2>

@@ -47,6 +47,8 @@ const KEY_ROWS = [
   { id: 'serp1', provider: 'serpapi' },
   { id: 'exa1', provider: 'exa' },
   { id: 'brave1', provider: 'brave' },
+  { id: 'keenable1', provider: 'keenable' },
+  { id: 'zhihu1', provider: 'zhihu' },
 ]
 
 let keysUrls: string[] = []
@@ -328,18 +330,22 @@ afterEach(async () => {
 describe('AdminDashboard key provider table + filter (plan todo 22)', () => {
   it('renders a provider column with text badges including legacy NULL -> Tavily', async () => {
     await mountKeysRoute()
-    await waitFor(() => badges().length >= 4)
+    await waitFor(() => badges().length >= 6)
 
     const found = badges().map((badge) => badge.dataset.provider)
-    expect(found).toEqual(expect.arrayContaining(['tavily', 'serpapi', 'exa', 'brave']))
+    expect(found).toEqual(
+      expect.arrayContaining(['tavily', 'serpapi', 'exa', 'brave', 'keenable', 'zhihu']),
+    )
     const labels = badges().map((badge) => badge.textContent)
-    expect(labels).toEqual(expect.arrayContaining(['Tavily', 'SerpApi', 'Exa', 'Brave']))
+    expect(labels).toEqual(
+      expect.arrayContaining(['Tavily', 'SerpApi', 'Exa', 'Brave', 'Keenable', 'Zhihu']),
+    )
     expect(document.body.textContent).toContain('Provider')
   }, 20_000)
 
   it("narrows the table to Brave rows when the provider filter selects 'Brave'", async () => {
     await mountKeysRoute()
-    await waitFor(() => badges().length >= 4)
+    await waitFor(() => badges().length >= 6)
 
     const select = document.querySelector<HTMLSelectElement>('select[aria-label="Provider"]')
     expect(select).not.toBeNull()
@@ -355,10 +361,47 @@ describe('AdminDashboard key provider table + filter (plan todo 22)', () => {
     expect(new Set(badges().map((badge) => badge.dataset.provider))).toEqual(new Set(['brave']))
     expect(badges().every((badge) => badge.textContent === 'Brave')).toBe(true)
   }, 20_000)
+
+  it("narrows the table to Zhihu rows when the provider filter selects 'Zhihu'", async () => {
+    await mountKeysRoute()
+    await waitFor(() => badges().length >= 6)
+
+    const select = document.querySelector<HTMLSelectElement>('select[aria-label="Provider"]')
+    expect(select).not.toBeNull()
+    await act(async () => {
+      select!.value = 'zhihu'
+      select!.dispatchEvent(new Event('change', { bubbles: true }))
+    })
+
+    await waitFor(() => keysUrls.some((url) => url.includes('provider=zhihu')))
+    await waitFor(() => badges().length > 0 && badges().every((badge) => badge.dataset.provider === 'zhihu'))
+    expect(new Set(badges().map((badge) => badge.dataset.provider))).toEqual(new Set(['zhihu']))
+    expect(badges().every((badge) => badge.textContent === 'Zhihu')).toBe(true)
+  }, 20_000)
 })
 
 describe('AdminDashboard batch key import provider wiring (plan todo 10 / matrix H1)', () => {
   const SERPAPI_NATIVE_KEY = 'deadbeef'.repeat(8)
+
+  it('shows native credential hints for Keenable and Zhihu in the add-key overlay', async () => {
+    await mountKeysRoute()
+    const overlay = await openBatchOverlay()
+
+    await act(async () => {
+      fireReactChange(batchProviderSelect(overlay), 'keenable')
+    })
+    await waitFor(() => overlay.querySelector('[data-native-slot="keenable"]') !== null)
+    expect(overlay.querySelector('[data-native-slot="keenable"]')?.textContent).toContain('X-API-Key')
+
+    await act(async () => {
+      fireReactChange(batchProviderSelect(overlay), 'zhihu')
+    })
+    await waitFor(() => overlay.querySelector('[data-native-slot="zhihu"]') !== null)
+    const hint = overlay.querySelector('[data-native-slot="zhihu"]')?.textContent ?? ''
+    expect(hint).toContain('Access Secret')
+    expect(hint).toContain('Authorization: Bearer')
+    expect(overlay.querySelector('[data-tip]')).toBeNull()
+  }, 20_000)
 
   it('parses a native SerpApi key once the batch provider select is serpapi', async () => {
     await mountKeysRoute()
@@ -455,6 +498,8 @@ describe('AdminDashboard key provider facet counts (plan todo 10 / matrix M12)',
       providers: [
         { value: 'tavily', count: 2038 },
         { value: 'serpapi', count: 413 },
+        { value: 'keenable', count: 256 },
+        { value: 'zhihu', count: 64 },
       ],
     })
     await waitFor(() => providerFilterSelect() !== null)
@@ -470,6 +515,8 @@ describe('AdminDashboard key provider facet counts (plan todo 10 / matrix M12)',
     // ... while providers absent from the facet keep the bare label.
     expect(providerOptionText(select, 'exa')).toBe('Exa')
     expect(providerOptionText(select, 'brave')).toBe('Brave')
+    expect(providerOptionText(select, 'keenable')).toBe('Keenable (256)')
+    expect(providerOptionText(select, 'zhihu')).toBe('Zhihu (64)')
     expect(providerOptionText(select, 'all')).toBe('All providers')
   }, 20_000)
 

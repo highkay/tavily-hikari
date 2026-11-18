@@ -57,6 +57,22 @@ const mixedProviderLogs: RequestLog[] = [
   }),
   requestLog({
     id: 9003,
+    key_id: 'keenable-row',
+    provider: 'keenable',
+    path: '/api/keenable/v1/search',
+    request_kind_key: 'api:keenable/search',
+    request_kind_label: 'API | keenable/search',
+  }),
+  requestLog({
+    id: 9004,
+    key_id: 'zhihu-row',
+    provider: 'zhihu',
+    path: '/api/zhihu/api/v1/content/zhihu_search',
+    request_kind_key: 'api:zhihu/zhihu_search',
+    request_kind_label: 'API | zhihu/zhihu_search',
+  }),
+  requestLog({
+    id: 9005,
     key_id: 'legacy-row',
     path: '/api/tavily/search',
     request_kind_key: 'api:search',
@@ -69,6 +85,8 @@ const providerFacets = [
   { value: 'tavily', count: 1 },
   { value: 'exa', count: 1 },
   { value: 'brave', count: 1 },
+  { value: 'keenable', count: 1 },
+  { value: 'zhihu', count: 1 },
 ]
 
 let root: Root | null = null
@@ -149,6 +167,19 @@ describe('AdminRecentRequestsPanel provider dimension (plan todo 23 QA)', () => 
     expect(text).toContain('Tavily')
     expect(text).toContain('Exa')
     expect(text).toContain('Brave')
+    expect(text).toContain('Keenable')
+    expect(text).toContain('Zhihu')
+  })
+
+  it('provider Zhihu selection yields only Zhihu rows', () => {
+    const container = renderPanel('zhihu')
+    const text = container.textContent ?? ''
+
+    expect(container.querySelector('.searchable-facet-select__summary')?.textContent).toBe('Zhihu')
+    expect(text).toContain('zhihu-row')
+    expect(text).not.toContain('keenable-row')
+    expect(text).not.toContain('exa-row')
+    expect(text).not.toContain('legacy-row')
   })
 
   it('provider Exa selection yields only exa rows (QA happy path)', () => {

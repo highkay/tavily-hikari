@@ -875,6 +875,24 @@ const providerStoryLogs: RequestLog[] = [
   {
     ...storyLogs[0],
     id: 9103,
+    key_id: 'KeeK',
+    provider: 'keenable',
+    path: '/api/keenable/v1/search',
+    request_kind_key: 'api:keenable/search',
+    request_kind_label: 'API | keenable/search',
+  },
+  {
+    ...storyLogs[0],
+    id: 9104,
+    key_id: 'ZhiK',
+    provider: 'zhihu',
+    path: '/api/zhihu/api/v1/content/zhihu_search',
+    request_kind_key: 'api:zhihu/zhihu_search',
+    request_kind_label: 'API | zhihu/zhihu_search',
+  },
+  {
+    ...storyLogs[0],
+    id: 9105,
     key_id: 'LegacyK',
     path: '/api/tavily/search',
     request_kind_key: 'api:search',
@@ -899,6 +917,8 @@ function ProviderDimensionShowcase(): JSX.Element {
         { value: 'tavily', count: 1 },
         { value: 'exa', count: 1 },
         { value: 'brave', count: 1 },
+        { value: 'keenable', count: 1 },
+        { value: 'zhihu', count: 1 },
       ],
     }),
     [],
@@ -919,6 +939,8 @@ function ProviderDimensionShowcase(): JSX.Element {
         requestKindOptions={[
           { key: 'api:exa/search', label: 'API | exa/search', protocol_group: 'api', billing_group: 'billable', count: 1 },
           { key: 'api:brave/web', label: 'API | brave/web', protocol_group: 'api', billing_group: 'billable', count: 1 },
+          { key: 'api:keenable/search', label: 'API | keenable/search', protocol_group: 'api', billing_group: 'billable', count: 1 },
+          { key: 'api:zhihu/zhihu_search', label: 'API | zhihu/zhihu_search', protocol_group: 'api', billing_group: 'billable', count: 1 },
           { key: 'api:search', label: 'API | search', protocol_group: 'api', billing_group: 'billable', count: 1 },
         ]}
         requestKindQuickBilling="all"
@@ -1191,8 +1213,38 @@ export const ProviderDimension: Story = {
     option.click()
     await new Promise((resolve) => window.setTimeout(resolve, 80))
     const text = ownerDocument.body.textContent ?? ''
-    if (!text.includes('ExaK') || text.includes('BrvK') || text.includes('LegacyK')) {
+    if (
+      !text.includes('ExaK') ||
+      text.includes('BrvK') ||
+      text.includes('KeeK') ||
+      text.includes('ZhiK') ||
+      text.includes('LegacyK')
+    ) {
       throw new Error('Expected selecting Exa to leave only Exa rows visible.')
+    }
+  },
+}
+
+export const NewProviderDimension: Story = {
+  render: () => <ProviderDimensionShowcase />,
+  globals: {
+    language: 'en',
+    themeMode: 'light',
+  },
+  parameters: {
+    viewport: { defaultViewport: '1440-device-desktop' },
+    docs: {
+      description: {
+        story: 'Keenable and Zhihu request rows with their provider facet options and canonical request-kind labels.',
+      },
+    },
+  },
+  play: ({ canvasElement }) => {
+    const text = canvasElement.ownerDocument.body.textContent ?? ''
+    for (const expected of ['KeeK', 'ZhiK', 'Keenable', 'Zhihu', 'API | keenable/search', 'API | zhihu/zhihu_search']) {
+      if (!text.includes(expected)) {
+        throw new Error(`Expected new provider log proof to contain: ${expected}`)
+      }
     }
   },
 }

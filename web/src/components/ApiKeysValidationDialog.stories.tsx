@@ -88,7 +88,7 @@ const meta = {
     docs: {
       description: {
         component: [
-          'Validation and import dialog for bulk Tavily key intake, including quota and retry states.',
+          'Validation and import dialog for bulk provider key intake, including quota and retry states.',
           '',
           'Public docs: [Configuration & Access](../configuration-access.html) · [Deployment & Anonymity](../deployment-anonymity.html) · [Storybook Guide](../storybook-guide.html)',
         ].join('\n'),
@@ -134,6 +134,70 @@ export const MixedResults: Story = {
   },
   parameters: {
     viewport: { defaultViewport: "1440-device-desktop" },
+  },
+};
+
+export const KeenableValidation: Story = {
+  args: {
+    initial: {
+      group: "search",
+      provider: "keenable",
+      input_lines: 1,
+      valid_lines: 1,
+      unique_in_input: 1,
+      duplicate_in_input: 0,
+      checking: false,
+      importing: false,
+      rows: [
+        {
+          api_key: "keenable-demo-key",
+          provider: "keenable",
+          status: "ok",
+          reason: "VALIDATION",
+          quota_remaining: 99999,
+          attempts: 1,
+        },
+      ],
+    },
+  },
+  play: ({ canvasElement }) => {
+    const text = canvasElement.ownerDocument.body.textContent ?? "";
+    const probe = canvasElement.ownerDocument.querySelector('[data-provider="keenable"]');
+    if (!text.includes("POST /v1/search without query") || !probe) {
+      throw new Error("Expected the Keenable zero-cost validation proof.");
+    }
+  },
+};
+
+export const ZhihuValidation: Story = {
+  args: {
+    initial: {
+      group: "search",
+      provider: "zhihu",
+      input_lines: 1,
+      valid_lines: 1,
+      unique_in_input: 1,
+      duplicate_in_input: 0,
+      checking: false,
+      importing: false,
+      rows: [
+        {
+          api_key: "zhihu-demo-secret",
+          provider: "zhihu",
+          status: "ok",
+          quota_limit: 10,
+          quota_remaining: 3,
+          attempts: 1,
+        },
+      ],
+    },
+  },
+  play: ({ canvasElement }) => {
+    const text = canvasElement.ownerDocument.body.textContent ?? "";
+    const probe = canvasElement.ownerDocument.querySelector('[data-provider="zhihu"]');
+    if (!text.includes("GET /api/v1/quota") || !probe) {
+      throw new Error("Expected the Zhihu zero-cost validation proof.");
+    }
   },
 };
 

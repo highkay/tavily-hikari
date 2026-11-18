@@ -121,6 +121,17 @@ describe('KeyProviderSelect (plan todo 22)', () => {
       'zhihu',
     ])
     expect(container.textContent).toContain('One provider applies to the whole batch.')
+    expect(container.querySelector('[data-native-slot]')).toBeNull()
+  })
+
+  it('shows the localized native credential slot for Keenable and Zhihu', () => {
+    const keenable = render(<KeyProviderSelect value="keenable" onChange={() => undefined} />)
+    expect(keenable.querySelector('[data-native-slot="keenable"]')?.textContent).toContain('X-API-Key')
+
+    const zhihu = render(<KeyProviderSelect value="zhihu" onChange={() => undefined} />, 'zh')
+    expect(zhihu.querySelector('[data-native-slot="zhihu"]')?.textContent).toContain('Access Secret')
+    expect(zhihu.querySelector('[data-native-slot="zhihu"]')?.textContent).toContain('Authorization: Bearer')
+    expect(zhihu.querySelector('[data-tip]')).toBeNull()
   })
 })
 

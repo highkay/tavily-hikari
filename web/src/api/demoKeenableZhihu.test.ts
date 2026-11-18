@@ -21,6 +21,7 @@ import {
   createDemoProviderKeys,
   createDemoProviderLogs,
   createDemoProviderRequestKindOptions,
+  filterDemoProviderKeys,
 } from './demoProviders'
 
 describe('keenable demo fixtures (plan todo 15, no network)', () => {
@@ -109,6 +110,14 @@ describe('mixed-provider demo factories (plan todo 15)', () => {
     expect(keenable).toMatchObject({ quota_limit: null, quota_source: 'passive' })
     expect(zhihu).toMatchObject({ quota_limit: 5000, quota_source: 'live' })
     expect(Number(zhihu?.quota_renews_at)).toBeGreaterThan(Date.now() / 1000)
+  })
+
+  it('filters demo keys by provider and coalesces legacy rows to Tavily', () => {
+    const keys = [...createDemoProviderKeys(), { id: 'legacy', status: 'active' }]
+    expect(filterDemoProviderKeys(keys, 'zhihu').map((key) => key.id)).toEqual(['Zh10'])
+    expect(filterDemoProviderKeys(keys, 'keenable').map((key) => key.id)).toEqual(['Kn09'])
+    expect(filterDemoProviderKeys(keys, 'tavily').map((key) => key.id)).toEqual(['legacy'])
+    expect(filterDemoProviderKeys(keys, null)).toHaveLength(keys.length)
   })
 
   it('adds one demo log per new kind and keeps the catalog at 24 kinds', () => {

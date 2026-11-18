@@ -70,6 +70,21 @@ describe('log provider dimension helpers (plan todo 23)', () => {
     expect(filterLogsByProvider(mixedProviderLogs, 'tavily').map((row) => row.id)).toEqual([5, 6])
   })
 
+  it('orders, labels, and filters the Keenable and Zhihu provider dimensions', () => {
+    const rows = [
+      { id: 7, provider: 'zhihu' },
+      { id: 8, provider: 'keenable' },
+    ]
+    expect(logProviderDisplayLabel('keenable')).toBe('Keenable')
+    expect(logProviderDisplayLabel('zhihu')).toBe('Zhihu')
+    expect(providerFacetOptionsFromLogs(rows)).toEqual([
+      { value: 'keenable', count: 1 },
+      { value: 'zhihu', count: 1 },
+    ])
+    expect(filterLogsByProvider(rows, 'zhihu').map((row) => row.id)).toEqual([7])
+    expect(filterLogsByProvider(rows, 'keenable').map((row) => row.id)).toEqual([8])
+  })
+
   it('emits the ?provider= value for server-side filters and omits the all sentinel', () => {
     expect(providerFilterQueryValue('exa')).toBe('exa')
     expect(providerFilterQueryValue(' tavily ')).toBe('tavily')

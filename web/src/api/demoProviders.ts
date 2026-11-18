@@ -468,6 +468,15 @@ export function createDemoProviderKeys(): Array<Record<string, unknown>> {
   ]
 }
 
+/** Provider-scoped `/api/keys` demo filtering; legacy rows remain Tavily. */
+export function filterDemoProviderKeys(
+  keys: ReadonlyArray<Record<string, unknown>>,
+  provider: string | null,
+): Array<Record<string, unknown>> {
+  if (!provider) return [...keys]
+  return keys.filter((key) => normalizePayloadProvider(key) === provider)
+}
+
 /**
  * Demo parity for the todo-20 per-provider summary breakdown (plan todo 6,
  * matrix M3/L8). Groups the demo keys (lifetime counters) and request logs by

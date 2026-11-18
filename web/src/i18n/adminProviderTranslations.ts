@@ -48,12 +48,15 @@ export const adminProviderTranslations: Record<Language, AdminProvidersTranslati
       validateProbe:
         'Probe method: POST /v1/search without query (400 missing_parameter = valid; 401 = invalid; never billable).',
       quotaNote: 'Keenable credits remaining are harvested from upstream responses (passive snapshot).',
+      nativeSlotHint: 'Enter only the native API key; Hikari sends it as X-API-Key.',
     },
     zhihu: {
       label: 'Zhihu',
       validateProbe: 'Probe method: GET /api/v1/quota (free, uncounted) — reads the daily search quota.',
       quotaNote:
         'Zhihu daily search quota is synced from /api/v1/quota and renews at the next Asia/Shanghai midnight.',
+      nativeSlotHint:
+        'Enter only the Access Secret; Hikari sends it as Authorization: Bearer and adds X-Request-Timestamp.',
     },
     shared: {
       tableHeader: 'Provider',
@@ -63,6 +66,8 @@ export const adminProviderTranslations: Record<Language, AdminProvidersTranslati
       selectBatchHint: 'One provider applies to the whole batch.',
       quotaUsed: 'Used',
       quotaRemaining: 'Remaining',
+      quotaCreditsRemaining: 'Credits remaining',
+      quotaDailyRemaining: 'Daily remaining',
       quotaRenewalDate: 'Renews',
       quotaSynced: 'Synced',
       probeMethodLabel: 'Probe method',
@@ -116,11 +121,14 @@ export const adminProviderTranslations: Record<Language, AdminProvidersTranslati
       validateProbe:
         '探针方式：向 /v1/search 发送不带 query 的请求（400 missing_parameter 表示有效；401 表示无效；绝不产生费用）。',
       quotaNote: 'Keenable 剩余额度来自上游响应采集（被动快照）。',
+      nativeSlotHint: '只需填写原生 API Key；Hikari 会将其放入 X-API-Key 请求头。',
     },
     zhihu: {
       label: 'Zhihu',
       validateProbe: '探针方式：GET /api/v1/quota（免费、不计费）——读取每日搜索额度。',
       quotaNote: '知乎每日搜索额度由 /api/v1/quota 同步，在下一个 Asia/Shanghai 零点重置。',
+      nativeSlotHint:
+        '只需填写 Access Secret；Hikari 会将其作为 Authorization: Bearer 凭据，并添加 X-Request-Timestamp。',
     },
     shared: {
       tableHeader: '提供商',
@@ -130,6 +138,8 @@ export const adminProviderTranslations: Record<Language, AdminProvidersTranslati
       selectBatchHint: '同一批次只会应用同一个提供商。',
       quotaUsed: '已用',
       quotaRemaining: '剩余',
+      quotaCreditsRemaining: '剩余额度',
+      quotaDailyRemaining: '每日剩余',
       quotaRenewalDate: '续费',
       quotaSynced: '同步时间',
       probeMethodLabel: '探针方式',

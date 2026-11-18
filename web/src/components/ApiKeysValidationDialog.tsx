@@ -345,7 +345,7 @@ export function ProviderResultExtras({ row }: { row: KeyValidationRow }): JSX.El
   if (row.reason) {
     return (
       <span
-        className="key-validation-reason-chip"
+        className="key-validation-reason-chip inline-flex flex-wrap items-center gap-1"
         data-reason={String(row.reason)}
         title={reasonLabel ?? undefined}
       >
@@ -496,7 +496,6 @@ export function ApiKeysValidationDialog(props: ApiKeysValidationDialogProps): JS
                 className="mt-1 text-xs opacity-70 key-validation-probe-method"
                 data-provider={props.state.provider}
               >
-                {adminStrings.providers.shared.probeMethodLabel}:{" "}
                 {providerProbeCopy(adminStrings.providers, props.state.provider)}
               </div>
             ) : null}
