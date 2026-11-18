@@ -40,6 +40,12 @@ Available skills:
 - `brave-hikari-search`
 - `brave-hikari-news`
 - `brave-hikari-llm-context`
+- `keenable-hikari-search`
+- `keenable-hikari-fetch`
+- `keenable-hikari-mcp`
+- `zhihu-hikari-search`
+- `zhihu-hikari-global-search`
+- `zhihu-hikari-mcp`
 
 ## Provider Endpoints and Auth Slots
 
@@ -47,16 +53,22 @@ Every facade also accepts `Authorization: Bearer th-...` as the universal slot, 
 the provider-native slot below. Replace `<origin>` with your Hikari origin, for example
 `https://<your-hikari-host>`.
 
-| Provider | REST base              | REST auth slot                 | MCP endpoint           | MCP native slot                           |
-| -------- | ---------------------- | ------------------------------ | ---------------------- | ----------------------------------------- |
-| Tavily   | `<origin>/api/tavily`  | `Authorization: Bearer th-...` | `<origin>/mcp`         | `Bearer th-...`                           |
-| SerpApi  | `<origin>/api/serpapi` | `api_key=th-...` (query)       | `<origin>/serpapi/mcp` | `Bearer th-...`                           |
-| Exa      | `<origin>/api/exa`     | `x-api-key: th-...`            | `<origin>/exa/mcp`     | `x-api-key: th-...` or `exaApiKey=th-...` |
-| Brave    | `<origin>/api/brave`   | `X-Subscription-Token: th-...` | `<origin>/brave/mcp`   | `X-Subscription-Token: th-...`            |
+| Provider | REST base               | REST auth slot                        | MCP endpoint            | MCP native slot                           |
+| -------- | ----------------------- | ------------------------------------- | ----------------------- | ----------------------------------------- |
+| Tavily   | `<origin>/api/tavily`   | `Authorization: Bearer th-...`        | `<origin>/mcp`          | `Bearer th-...`                           |
+| SerpApi  | `<origin>/api/serpapi`  | `api_key=th-...` (query)              | `<origin>/serpapi/mcp`  | `Bearer th-...`                           |
+| Exa      | `<origin>/api/exa`      | `x-api-key: th-...`                   | `<origin>/exa/mcp`      | `x-api-key: th-...` or `exaApiKey=th-...` |
+| Brave    | `<origin>/api/brave`    | `X-Subscription-Token: th-...`        | `<origin>/brave/mcp`    | `X-Subscription-Token: th-...`            |
+| Keenable | `<origin>/api/keenable` | `X-API-Key: th-...`                   | `<origin>/keenable/mcp` | `X-API-Key: th-...`                       |
+| Zhihu    | `<origin>/api/zhihu`    | `Authorization: Bearer th-...` (only) | `<origin>/zhihu/mcp`    | `Bearer th-...`                           |
 
 - Tavily MCP clients use the existing `/mcp` endpoint; `TAVILY_API_BASE_URL` and `TAVILY_API_KEY`
   stay owned by the `tvly-hikari` wrapper.
 - SerpApi, Exa, and Brave MCP endpoints are dedicated Hikari ingresses; Exa has no hosted
   passthrough, so `/exa/mcp` is served entirely by the local facade.
+- `/keenable/mcp` is a hosted passthrough that injects the pooled key in `X-API-Key`.
+  `/zhihu/mcp` is a local facade; Zhihu's official MCP is SSE-only and is not used.
+- Zhihu exposes no client-native auth slot beyond the universal Bearer token; the upstream
+  Access Secret never reaches clients.
 - See `tavily-hikari-best-practices` for provider selection, credit costs, and exhaustion
   semantics.

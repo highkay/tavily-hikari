@@ -114,6 +114,30 @@ Brave 把无效 key 报为 `422`（不是 `401`）：
 与 `Limit`/`Remaining`/`Reset` 按位置配对，只有材料发生变化时才落库。`402 QUOTA_LIMITED`（或裸
 `402`）会让 key 在公告的窗口内耗尽；`429` 是秒级短限速（默认 2 秒退避，钳制 1..=30 秒）。
 
+### Keenable 为什么返回 402，怎么读余额
+
+Keenable 用 `402 billing_error` 报告账单耗尽（错误码 `insufficient_credits`）；`451` 是客户端错误，不算耗尽。Hikari 会把 `402` 映射为 `Exhausted`：该 key 离开活跃池，直到下一个 UTC 月边界或管理员手动恢复。
+
+余额是被动采集的：带 key 的成功响应都会携带 `usage.credits_remaining`，Hikari 只在材料变化时落库，
+`X-RateLimit-*` 响应头作为额外信号。Keenable 没有主动轮询，所以管理端 `sync-usage` 返回最后一次被动快照。
+管理端校验是零计费的：探针发送不带 `query` 的搜索请求，400 `missing_parameter` 表示 key 有效，401 表示无效。
+
+### 为什么 Zhihu 的错误也是 HTTP 200，只写在 Code 里
+
+Zhihu 开放平台把成功和失败放在同一个 HTTP-200 envelope 里：`{Code, Message, Data}`。`Code = 0` 是成功，
+计 1 credit；`10001` 是参数错误，`20001` 是鉴权失败（Access Secret 或时间戳缺失/无效），`30001` 是限速，
+`90001` 是供应商内部错误，未知的非零 code 按客户端错误处理。只有 `Code = 0` 才结算 credit，客户端始终
+收到 envelope。当日 `RemainingQuota` 为 0 时，key 会耗尽到下一个自然日（Asia/Shanghai 零点），而不是
+日历月。
+
+### 启用 Keenable 或 Zhihu 之前要检查什么
+
+1. 出口连通性：从目标网络确认上游主机在传输层可达（`api.keenable.ai` 与
+   `developer.zhihu.com`）。这是部署期由运营者执行的 runbook 步骤，永远不进 CI。
+2. 条款：Zhihu Access Secret 是账号级凭据，不要跨个人账号轮换来刷免费额度；任何公开出售前必须
+   核对 Zhihu 开放平台的转售条款。Hikari 不自动执行多账号轮换。
+3. key 校验：两家供应商都支持零计费的管理端校验，录入 key 不会消耗计费探针。
+
 ## 排障
 
 ### `/admin` 打不开，或 `/api/keys` 返回 401

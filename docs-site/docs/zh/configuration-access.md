@@ -24,24 +24,29 @@ Tavily Hikari 至少有两层访问要分清：
 
 无论你采用哪种访问模型，下面这组参数都是最核心的：
 
-| Flag / Env                                        | 是否通常要关心 | 作用                            |
-| ------------------------------------------------- | -------------- | ------------------------------- |
-| `--upstream` / `TAVILY_UPSTREAM`                  | 是             | Tavily MCP 上游地址             |
-| `TAVILY_USAGE_BASE`                               | 是             | Tavily HTTP / usage 上游基地址  |
-| `--serpapi-upstream` / `SERPAPI_UPSTREAM`         | 可选           | SerpApi REST 上游基地址         |
-| `--serpapi-mcp-upstream` / `SERPAPI_MCP_UPSTREAM` | 可选           | SerpApi 托管 MCP 上游地址       |
-| `--exa-upstream` / `EXA_UPSTREAM`                 | 可选           | Exa REST 上游基地址             |
-| `--brave-upstream` / `BRAVE_UPSTREAM`             | 可选           | Brave REST 上游基地址           |
-| `--bind` / `PROXY_BIND`                           | 是             | 监听地址                        |
-| `--port` / `PROXY_PORT`                           | 是             | 监听端口                        |
-| `--db-path` / `PROXY_DB_PATH`                     | 是             | SQLite 数据库路径               |
-| `LOW_QUOTA_DEPLETION_THRESHOLD`                   | 可选           | 低余额 432 key 阈值             |
-| `PUBLIC_METRICS_CORS_ORIGINS`                     | 可选           | 公开指标 API 的浏览器来源白名单 |
-| `--static-dir` / `WEB_STATIC_DIR`                 | 视情况         | 静态前端目录                    |
-| `--keys` / `TAVILY_API_KEYS`                      | 可选           | 启动时一次性导入 Tavily key     |
-| `--serpapi-keys` / `SERPAPI_API_KEYS`             | 可选           | 启动时一次性导入 SerpApi key    |
-| `--exa-keys` / `EXA_API_KEYS`                     | 可选           | 启动时一次性导入 Exa key        |
-| `--brave-keys` / `BRAVE_API_KEYS`                 | 可选           | 启动时一次性导入 Brave key      |
+| Flag / Env                                          | 是否通常要关心 | 作用                                 |
+| --------------------------------------------------- | -------------- | ------------------------------------ |
+| `--upstream` / `TAVILY_UPSTREAM`                    | 是             | Tavily MCP 上游地址                  |
+| `TAVILY_USAGE_BASE`                                 | 是             | Tavily HTTP / usage 上游基地址       |
+| `--serpapi-upstream` / `SERPAPI_UPSTREAM`           | 可选           | SerpApi REST 上游基地址              |
+| `--serpapi-mcp-upstream` / `SERPAPI_MCP_UPSTREAM`   | 可选           | SerpApi 托管 MCP 上游地址            |
+| `--exa-upstream` / `EXA_UPSTREAM`                   | 可选           | Exa REST 上游基地址                  |
+| `--keenable-upstream` / `KEENABLE_UPSTREAM`         | 可选           | Keenable REST 上游基地址             |
+| `--keenable-mcp-upstream` / `KEENABLE_MCP_UPSTREAM` | 可选           | Keenable 托管 MCP 上游地址           |
+| `--zhihu-upstream` / `ZHIHU_UPSTREAM`               | 可选           | Zhihu REST 上游基地址                |
+| `--brave-upstream` / `BRAVE_UPSTREAM`               | 可选           | Brave REST 上游基地址                |
+| `--bind` / `PROXY_BIND`                             | 是             | 监听地址                             |
+| `--port` / `PROXY_PORT`                             | 是             | 监听端口                             |
+| `--db-path` / `PROXY_DB_PATH`                       | 是             | SQLite 数据库路径                    |
+| `LOW_QUOTA_DEPLETION_THRESHOLD`                     | 可选           | 低余额 432 key 阈值                  |
+| `PUBLIC_METRICS_CORS_ORIGINS`                       | 可选           | 公开指标 API 的浏览器来源白名单      |
+| `--static-dir` / `WEB_STATIC_DIR`                   | 视情况         | 静态前端目录                         |
+| `--keys` / `TAVILY_API_KEYS`                        | 可选           | 启动时一次性导入 Tavily key          |
+| `--serpapi-keys` / `SERPAPI_API_KEYS`               | 可选           | 启动时一次性导入 SerpApi key         |
+| `--exa-keys` / `EXA_API_KEYS`                       | 可选           | 启动时一次性导入 Exa key             |
+| `--keenable-keys` / `KEENABLE_API_KEYS`             | 可选           | 启动时一次性导入 Keenable key        |
+| `--zhihu-keys` / `ZHIHU_API_KEYS`                   | 可选           | 启动时一次性导入 Zhihu Access Secret |
+| `--brave-keys` / `BRAVE_API_KEYS`                   | 可选           | 启动时一次性导入 Brave key           |
 
 补充说明：
 
@@ -62,6 +67,14 @@ Tavily Hikari 至少有两层访问要分清：
 - `SERPAPI_API_KEYS`、`EXA_API_KEYS`、`BRAVE_API_KEYS` 是以逗号分隔的引导导入列表，且只作用于各自
   供应商：未设置时完全不动该供应商已有 key 行；设置后列表内 key 会被新增或恢复，该供应商不在列表中的
   key 会被软删除。生产环境的长期 key 管理仍应交给管理员后台或管理员 API。
+- `KEENABLE_UPSTREAM`（默认 `https://api.keenable.ai`）与 `ZHIHU_UPSTREAM`（默认
+  `https://developer.zhihu.com`）都支持带 path prefix 的反代地址；Hikari 会在该 prefix 后继续拼接
+  两家供应商的原生路径（`/v1/search`、`/v1/fetch`、`/api/v1/content/...`）。
+- `KEENABLE_MCP_UPSTREAM` 默认是 `https://api.keenable.ai/mcp`，按完整托管 MCP 端点解释；反代保留
+  path prefix 时，配置值里要包含最终的 `/mcp` 路径。
+- `KEENABLE_API_KEYS` 与 `ZHIHU_API_KEYS` 沿用同样的供应商专属引导语义；`ZHIHU_API_KEYS` 里放的是
+  Zhihu Access Secret，不是终端用户 token。两家供应商还支持零计费的管理端 key 校验，见
+  [Keenable 供应商](/zh/providers-keenable)与 [Zhihu 供应商](/zh/providers-zhihu)页面。
 
 ## 不同部署形态的最小配置
 
@@ -310,6 +323,8 @@ th-<id>-<secret>
 
 - [快速开始](/zh/quick-start)
 - [HTTP API 指南](/zh/http-api-guide)
+- [Keenable 供应商](/zh/providers-keenable)
+- [Zhihu 供应商](/zh/providers-zhihu)
 - [部署与高匿名](/zh/deployment-anonymity)
 - [FAQ 与排障](/zh/faq)
 - [Storybook](/zh/storybook.html)

@@ -39,14 +39,16 @@ Tavily Hikari 是一个面向 MCP (Model Context Protocol) 的 Tavily 代理层�
 
 ## 搜索供应商
 
-Tavily Hikari 从 Tavily 代理起步，现在是四家搜索供应商的统一入口：一枚 token、一套密钥池、一个共享 credit 钱包。每家供应商保留自己的原生请求形态、独立的上游密钥池与耗尽语义，配额判断、审计日志与密钥轮换都留在 Hikari 内部。
+Tavily Hikari 从 Tavily 代理起步，现在是六家搜索供应商的统一入口：一枚 token、一套密钥池、一个共享 credit 钱包。每家供应商保留自己的原生请求形态、独立的上游密钥池与耗尽语义，配额判断、审计日志与密钥轮换都留在 Hikari 内部。
 
 - **Tavily** —— `/mcp` 与 `/api/tavily/*`（search、extract、crawl、map、research、usage）
 - **SerpApi** —— `/serpapi/mcp` 与 `/api/serpapi/search`（同步搜索族）
 - **Exa** —— `/exa/mcp`、`/api/exa/search`、`/api/exa/contents`、`/api/exa/answer`
 - **Brave** —— `/brave/mcp`、`/api/brave/res/v1/web/search`、`/api/brave/res/v1/news/search` 与 `/api/brave/res/v1/llm/context`
+- **Keenable**：`/keenable/mcp` 与 `/api/keenable/v1/search`、`/api/keenable/v1/fetch`（网页搜索与页面抓取）
+- **Zhihu**：`/zhihu/mcp` 与 `/api/zhihu/api/v1/content/zhihu_search`、`/api/zhihu/api/v1/content/global_search`（站内与全网搜索）
 
-四条链路都接受 Hikari 访问令牌（`th-<id>-<secret>`）放入各自的原生鉴权槽；槽位、credit 与各供应商边界详见 [HTTP API 指南](https://ivanli-cn.github.io/tavily-hikari/zh/http-api-guide)。
+六条链路都接受 Hikari 访问令牌（`th-<id>-<secret>`）放入各自的原生鉴权槽；槽位、credit 与各供应商边界详见 [HTTP API 指南](https://ivanli-cn.github.io/tavily-hikari/zh/http-api-guide)。
 
 ## 组件与数据流
 
@@ -125,11 +127,16 @@ curl -X POST http://127.0.0.1:8787/api/keys \
 | `--serpapi-keys` / `SERPAPI_API_KEYS`                                               | 可选的 SerpApi key 引导导入列表（逗号分隔）。未设置时不动 SerpApi 已有 key 行；生产环境优先走管理员 API/控制台。             |
 | `--exa-keys` / `EXA_API_KEYS`                                                       | 与 `SERPAPI_API_KEYS` 相同的引导语义，只作用于 Exa key。                                                                     |
 | `--brave-keys` / `BRAVE_API_KEYS`                                                   | 与 `SERPAPI_API_KEYS` 相同的引导语义，只作用于 Brave key。                                                                   |
+| `--keenable-keys` / `KEENABLE_API_KEYS`                                             | 与 `SERPAPI_API_KEYS` 相同的引导语义，只作用于 Keenable key。                                                                |
+| `--zhihu-keys` / `ZHIHU_API_KEYS`                                                   | 与 `SERPAPI_API_KEYS` 相同的引导语义，只作用于 Zhihu Access Secret。                                                         |
 | `--upstream` / `TAVILY_UPSTREAM`                                                    | Tavily MCP 上游端点，默认 `https://mcp.tavily.com/mcp`；支持带 path prefix 的反代 URL。                                      |
 | `--serpapi-upstream` / `SERPAPI_UPSTREAM`                                           | SerpApi REST 上游基地址，默认 `https://serpapi.com`；支持带 path prefix 的反代 URL。                                         |
 | `--serpapi-mcp-upstream` / `SERPAPI_MCP_UPSTREAM`                                   | SerpApi 托管 MCP 上游端点，默认 `https://mcp.serpapi.com/mcp`；支持带 path prefix 的反代 URL。                               |
 | `--exa-upstream` / `EXA_UPSTREAM`                                                   | Exa REST 上游基地址，默认 `https://api.exa.ai`；支持带 path prefix 的反代 URL。                                              |
 | `--brave-upstream` / `BRAVE_UPSTREAM`                                               | Brave REST 上游基地址，默认 `https://api.search.brave.com`；支持带 path prefix 的反代 URL。                                  |
+| `--keenable-upstream` / `KEENABLE_UPSTREAM`                                         | Keenable REST 上游基地址，默认 `https://api.keenable.ai`；支持带 path prefix 的反代 URL。                                    |
+| `--keenable-mcp-upstream` / `KEENABLE_MCP_UPSTREAM`                                 | Keenable 托管 MCP 上游端点，默认 `https://api.keenable.ai/mcp`；支持带 path prefix 的反代 URL。                              |
+| `--zhihu-upstream` / `ZHIHU_UPSTREAM`                                               | Zhihu REST 上游基地址，默认 `https://developer.zhihu.com`；支持带 path prefix 的反代 URL。                                   |
 | `--bind` / `PROXY_BIND`                                                             | 监听地址，默认 `127.0.0.1`。                                                                                                 |
 | `--port` / `PROXY_PORT`                                                             | 监听端口，默认 `8787`。建议开发期使用高位端口（如 `58087`）。                                                                |
 | `--db-path` / `PROXY_DB_PATH`                                                       | SQLite 文件路径，默认 `tavily_proxy.db`。                                                                                    |
@@ -173,6 +180,9 @@ curl -X POST http://127.0.0.1:8787/api/keys \
 - `SERPAPI_UPSTREAM`、`EXA_UPSTREAM`、`BRAVE_UPSTREAM` 都可以带 path prefix；Hikari 会在该 prefix 后继续拼接各供应商的原生路径（`/search`、`/res/v1/...` 等）。
 - `SERPAPI_MCP_UPSTREAM` 是完整的托管 MCP 端点；反代保留 path prefix 时，配置值里要包含最终的 `/mcp` 路径。
 - `SERPAPI_API_KEYS`、`EXA_API_KEYS`、`BRAVE_API_KEYS` 只同步各自供应商的 key 集合：列表内 key 会被新增或恢复，该供应商不在列表中的 key 会被软删除；未设置时完全不动该供应商的 key 行。
+- `KEENABLE_UPSTREAM` 与 `ZHIHU_UPSTREAM` 都可以带 path prefix；Hikari 会在该 prefix 后继续拼接两家供应商的原生路径（`/v1/search`、`/v1/fetch`、`/api/v1/content/...` 等）。
+- `KEENABLE_MCP_UPSTREAM` 是完整的托管 MCP 端点；反代保留 path prefix 时，配置值里要包含最终的 `/mcp` 路径。
+- `KEENABLE_API_KEYS`、`ZHIHU_API_KEYS` 只同步各自供应商的 key 集合，语义与前文一致；`ZHIHU_API_KEYS` 里放的是 Zhihu Access Secret，不是终端用户 token。
 
 ## HTTP API 速览
 
@@ -433,7 +443,7 @@ export TAVILY_HIKARI_TOKEN="<token>"
 codex mcp list | grep tavily_hikari
 ```
 
-同一枚 token 也可以连接三个供应商专属 MCP 入口：
+同一枚 token 也可以连接五个供应商专属 MCP 入口：
 
 ```
 [mcp_servers.serpapi_hikari]
@@ -447,9 +457,17 @@ bearer_token_env_var = "TAVILY_HIKARI_TOKEN"
 [mcp_servers.brave_hikari]
 url = "https://<your-host>/brave/mcp"
 bearer_token_env_var = "TAVILY_HIKARI_TOKEN"
+
+[mcp_servers.keenable_hikari]
+url = "https://<your-host>/keenable/mcp"
+bearer_token_env_var = "TAVILY_HIKARI_TOKEN"
+
+[mcp_servers.zhihu_hikari]
+url = "https://<your-host>/zhihu/mcp"
+bearer_token_env_var = "TAVILY_HIKARI_TOKEN"
 ```
 
-四个入口都接受 `Authorization: Bearer th-<id>-<secret>`；Exa 与 Brave 还额外接受各自的 native 鉴权头。所有供应商共用同一个 credit 钱包，一枚 token 即可跨供应商使用。
+六个入口都接受 `Authorization: Bearer th-<id>-<secret>`；SerpApi、Exa、Brave 与 Keenable 还额外接受各自的 native 鉴权槽。所有供应商共用同一个 credit 钱包，一枚 token 即可跨供应商使用。
 
 ## 开发与测试
 

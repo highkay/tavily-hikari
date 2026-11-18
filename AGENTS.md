@@ -46,7 +46,7 @@
 
 ## Security & Configuration Tips
 
-- Configure keys via `.env` or env vars (`TAVILY_API_KEYS`, `SERPAPI_API_KEYS`, `EXA_API_KEYS`, `BRAVE_API_KEYS`). Override provider upstreams with `TAVILY_UPSTREAM`, `SERPAPI_UPSTREAM`, `SERPAPI_MCP_UPSTREAM`, `EXA_UPSTREAM`, and `BRAVE_UPSTREAM` (defaults in README).
+- Configure keys via `.env` or env vars (`TAVILY_API_KEYS`, `SERPAPI_API_KEYS`, `EXA_API_KEYS`, `BRAVE_API_KEYS`, `KEENABLE_API_KEYS`, `ZHIHU_API_KEYS`). Override provider upstreams with `TAVILY_UPSTREAM`, `SERPAPI_UPSTREAM`, `SERPAPI_MCP_UPSTREAM`, `EXA_UPSTREAM`, `BRAVE_UPSTREAM`, `KEENABLE_UPSTREAM`, `KEENABLE_MCP_UPSTREAM`, and `ZHIHU_UPSTREAM` (defaults in README).
 - Do not commit secrets or local DB files. Backend can serve `web/dist` when present.
 
 ## Agent skills
@@ -104,11 +104,13 @@ The repository uses a single-context domain layout. See `docs/agents/domain.md`.
 
 **IMPORTANT**
 
-- 2025-03-??: During high-anonymity testing we accidentally hit the official Tavily MCP endpoint. Testing is now restricted to stub or sandbox upstreams only. Never point this project at the production Tavily/SerpApi/Exa/Brave endpoints unless explicitly approved.
+- 2025-03-??: During high-anonymity testing we accidentally hit the official Tavily MCP endpoint. Testing is now restricted to stub or sandbox upstreams only. Never point this project at the production Tavily/SerpApi/Exa/Brave/Keenable/Zhihu endpoints unless explicitly approved. New-provider tests must use the shipped stubs (`mock_keenable`, `mock_zhihu`) with `*_UPSTREAM` vars pointed at `127.0.0.1`.
 
 ### Project-Specific Notes
 
-- 2025-03-??: During high-anonymity testing we accidentally hit the official Tavily MCP endpoint. All future tests must target a local/mock upstream. Never hit production Tavily/SerpApi/Exa/Brave without explicit approval.
+- 2025-03-??: During high-anonymity testing we accidentally hit the official Tavily MCP endpoint. All future tests must target a local/mock upstream. Never hit production Tavily/SerpApi/Exa/Brave/Keenable/Zhihu without explicit approval.
+- Deployment egress checks (Keenable or Zhihu reachability from the target network) are operator runbook steps run once at deployment time: a transport-level check against the real upstream host, with no API traffic. Never run them in CI or automated tests.
+- `.env.example` default provider upstreams point at the production API bases by design (config defaults); running tests, demo mode, or dev probes against those hosts is still forbidden.
 
 ## Local Service Review
 

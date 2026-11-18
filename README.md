@@ -45,7 +45,7 @@ Tavily Hikari is a Rust + Axum proxy for Tavily's MCP endpoint. It multiplexes m
 
 ## Search providers
 
-Tavily Hikari started as a Tavily proxy and now fronts four search providers behind one token, one
+Tavily Hikari started as a Tavily proxy and now fronts six search providers behind one token, one
 key pool, and one shared credit wallet. Each provider keeps its native request shape, its own
 upstream key pool, and its own exhaustion semantics, while quota checks, audit logging, and key
 rotation stay inside Hikari.
@@ -55,8 +55,12 @@ rotation stay inside Hikari.
 - **Exa** — `/exa/mcp`, `/api/exa/search`, `/api/exa/contents`, `/api/exa/answer`
 - **Brave** — `/brave/mcp`, `/api/brave/res/v1/web/search`, `/api/brave/res/v1/news/search`, and
   `/api/brave/res/v1/llm/context`
+- **Keenable**: `/keenable/mcp` plus `/api/keenable/v1/search` and `/api/keenable/v1/fetch`
+  (web search and page fetch)
+- **Zhihu**: `/zhihu/mcp` plus `/api/zhihu/api/v1/content/zhihu_search` and
+  `/api/zhihu/api/v1/content/global_search` (in-site and web-wide Chinese search)
 
-All four accept Hikari access tokens (`th-<id>-<secret>`) in their native auth slots. See the
+All six accept Hikari access tokens (`th-<id>-<secret>`) in their native auth slots. See the
 [HTTP API Guide](https://ivanli-cn.github.io/tavily-hikari/http-api-guide) for slots, credits, and
 per-provider boundaries.
 
@@ -140,11 +144,16 @@ The stock [`docker-compose.yml`](docker-compose.yml) exposes port 8787 and mount
 | `--serpapi-keys` / `SERPAPI_API_KEYS`                                               | Optional SerpApi bootstrap list (comma-separated); prefer the admin API/UI in production.                            |
 | `--exa-keys` / `EXA_API_KEYS`                                                       | Same bootstrap semantics as `SERPAPI_API_KEYS`, scoped to Exa keys.                                                  |
 | `--brave-keys` / `BRAVE_API_KEYS`                                                   | Same bootstrap semantics as `SERPAPI_API_KEYS`, scoped to Brave keys.                                                |
+| `--keenable-keys` / `KEENABLE_API_KEYS`                                             | Same bootstrap semantics as `SERPAPI_API_KEYS`, scoped to Keenable keys.                                             |
+| `--zhihu-keys` / `ZHIHU_API_KEYS`                                                   | Same bootstrap semantics as `SERPAPI_API_KEYS`, scoped to Zhihu Access Secrets.                                      |
 | `--upstream` / `TAVILY_UPSTREAM`                                                    | Tavily MCP upstream endpoint (default `https://mcp.tavily.com/mcp`); path-prefixed reverse-proxy URLs are supported. |
 | `--serpapi-upstream` / `SERPAPI_UPSTREAM`                                           | SerpApi REST upstream base URL (default `https://serpapi.com`); path-prefixed reverse-proxy URLs are supported.      |
 | `--serpapi-mcp-upstream` / `SERPAPI_MCP_UPSTREAM`                                   | SerpApi hosted MCP endpoint (default `https://mcp.serpapi.com/mcp`); path prefixes are supported.                    |
 | `--exa-upstream` / `EXA_UPSTREAM`                                                   | Exa REST upstream base URL (default `https://api.exa.ai`); path-prefixed reverse-proxy URLs are supported.           |
 | `--brave-upstream` / `BRAVE_UPSTREAM`                                               | Brave REST upstream base URL (default `https://api.search.brave.com`); path prefixes are supported.                  |
+| `--keenable-upstream` / `KEENABLE_UPSTREAM`                                         | Keenable REST upstream base URL (default `https://api.keenable.ai`); path prefixes are supported.                    |
+| `--keenable-mcp-upstream` / `KEENABLE_MCP_UPSTREAM`                                 | Keenable hosted MCP endpoint (default `https://api.keenable.ai/mcp`); path prefixes are supported.                   |
+| `--zhihu-upstream` / `ZHIHU_UPSTREAM`                                               | Zhihu REST upstream base URL (default `https://developer.zhihu.com`); path prefixes are supported.                   |
 | `--bind` / `PROXY_BIND`                                                             | Listen address (default `127.0.0.1`).                                                                                |
 | `--port` / `PROXY_PORT`                                                             | Listen port (default `8787`).                                                                                        |
 | `--db-path` / `PROXY_DB_PATH`                                                       | SQLite file path (default `tavily_proxy.db`).                                                                        |
@@ -189,6 +198,12 @@ If `--keys`/`TAVILY_API_KEYS` is supplied, the database sync logic adds or reviv
 - `SERPAPI_UPSTREAM`, `EXA_UPSTREAM`, and `BRAVE_UPSTREAM` may include a path prefix; Hikari appends each provider's native paths (`/search`, `/res/v1/...`) under it.
 - `SERPAPI_MCP_UPSTREAM` is the full hosted MCP endpoint; include the final `/mcp` path when your reverse proxy keeps a path prefix.
 - `SERPAPI_API_KEYS`, `EXA_API_KEYS`, and `BRAVE_API_KEYS` sync only their own provider: listed keys are added or revived and that provider's unlisted keys are soft-deleted, while an unset variable leaves the provider untouched.
+- `KEENABLE_UPSTREAM` and `ZHIHU_UPSTREAM` accept a path prefix; Hikari appends each provider's
+  native paths (`/v1/search`, `/v1/fetch`, `/api/v1/content/...`) under it.
+- `KEENABLE_MCP_UPSTREAM` is the full hosted MCP endpoint; include the final `/mcp` path when your
+  reverse proxy keeps a path prefix.
+- `KEENABLE_API_KEYS` and `ZHIHU_API_KEYS` sync only their own provider with the same add/revive/
+  soft-delete semantics. `ZHIHU_API_KEYS` holds Zhihu Access Secrets, never end-user tokens.
 
 ## HTTP API Cheat Sheet
 
@@ -475,11 +490,19 @@ bearer_token_env_var = "TAVILY_HIKARI_TOKEN"
 [mcp_servers.brave_hikari]
 url = "https://<your-host>/brave/mcp"
 bearer_token_env_var = "TAVILY_HIKARI_TOKEN"
+
+[mcp_servers.keenable_hikari]
+url = "https://<your-host>/keenable/mcp"
+bearer_token_env_var = "TAVILY_HIKARI_TOKEN"
+
+[mcp_servers.zhihu_hikari]
+url = "https://<your-host>/zhihu/mcp"
+bearer_token_env_var = "TAVILY_HIKARI_TOKEN"
 ```
 
-All four servers accept `Authorization: Bearer th-<id>-<secret>`; Exa and Brave additionally
-accept their native auth headers. Credits settle from the shared wallet, so one token works across
-providers.
+All six servers accept `Authorization: Bearer th-<id>-<secret>`; SerpApi, Exa, Brave, and
+Keenable additionally accept their native auth slots. Credits settle from the shared wallet, so
+one token works across providers.
 
 ## Development
 

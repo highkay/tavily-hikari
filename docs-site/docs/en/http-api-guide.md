@@ -98,11 +98,11 @@ curl -H "Authorization: Bearer th-<id>-<secret>" \
   http://127.0.0.1:58087/api/tavily/research/<request_id>
 ```
 
-## SerpApi, Exa, and Brave facades
+## SerpApi, Exa, Brave, Keenable, and Zhihu facades
 
-Besides `/api/tavily/*`, Hikari exposes native REST facades for three more search providers. Each
+Besides `/api/tavily/*`, Hikari exposes native REST facades for five more search providers. Each
 facade accepts the same Hikari token (`th-<id>-<secret>`) in its provider-native auth slot, strips
-it before the upstream call, and injects a pooled upstream key internally. Credits for all four
+it before the upstream call, and injects a pooled upstream key internally. Credits for all six
 providers settle from the same shared wallet.
 
 ### SerpApi
@@ -164,6 +164,61 @@ curl "https://<your-host>/api/brave/res/v1/web/search?q=rust+async+runtime" \
 Credits: `web` and `news` cost 1, `llm_context` costs 2. Boundaries: only web search, news search,
 and LLM Context are proxied; URL extraction/crawl, images, videos, local/place, suggest,
 spellcheck, summarizer, and Answers are not.
+
+### Keenable
+
+| Method | Path                      | Notes                   | Auth                                           |
+| ------ | ------------------------- | ----------------------- | ---------------------------------------------- |
+| `POST` | `/api/keenable/v1/search` | Native web search       | `X-API-Key: th-...` or `Authorization: Bearer` |
+| `GET`  | `/api/keenable/v1/fetch`  | Page fetch (`?url=...`) | `X-API-Key: th-...` or `Authorization: Bearer` |
+
+MCP endpoint: `https://<your-host>/keenable/mcp` (hosted passthrough; `X-API-Key: th-...` or
+`Authorization: Bearer th-...`). Tools: `search_web_pages`, `fetch_page_content`.
+
+```bash
+curl -X POST "https://<your-host>/api/keenable/v1/search" \
+  -H "X-API-Key: th-<id>-<secret>" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "rust async runtime", "max_results": 3}'
+
+curl "https://<your-host>/api/keenable/v1/fetch?url=https%3A%2F%2Fexample.com&max_chars=2000" \
+  -H "X-API-Key: th-<id>-<secret>"
+```
+
+Credits: `search` and `fetch` cost 1 each; `initialize`, `tools/list`, and the other MCP control
+methods are free. Limits: `max_results` 1..50, `snippet_max_length` 180..10000, 10 requests per
+second per organization, and 100,000 free requests per month on the provider's published free tier
+at contract time; plans can change, so re-check with the provider. Boundaries: only search and
+fetch are proxied; the keyless `/public` twins, pay-per-request x402, CLI, and Time Machine
+endpoints are not.
+
+### Zhihu
+
+| Method | Path                                      | Notes           | Auth                    |
+| ------ | ----------------------------------------- | --------------- | ----------------------- |
+| `GET`  | `/api/zhihu/api/v1/content/zhihu_search`  | In-site search  | `Authorization: Bearer` |
+| `GET`  | `/api/zhihu/api/v1/content/global_search` | Web-wide search | `Authorization: Bearer` |
+
+MCP endpoint: `https://<your-host>/zhihu/mcp` (local facade; `Authorization: Bearer th-...`).
+Tools: `zhihu_search` (count 1..10), `zhihu_global_search` (count 1..20, `search_db`
+all/realtime/static).
+
+```bash
+curl "https://<your-host>/api/zhihu/api/v1/content/zhihu_search?Query=rust+async+runtime&Count=3" \
+  -H "Authorization: Bearer th-<id>-<secret>"
+```
+
+Responses keep the native HTTP-200 `{Code, Message, Data}` envelope; only `Code == 0` bills 1
+credit, every other code bills 0 while the client still receives the envelope. `Count` above 10
+(for `zhihu_search`) or 20 (for `global_search`) is rejected locally with a 400 and zero
+upstream calls; `Count <= 0` passes through and the upstream default applies. Boundaries: only
+the two search operations are proxied; hot list, question discovery, `zhida_openai`, the
+knowledge hub, and the other open-platform APIs are not.
+
+Zhihu operator note: the Access Secret is an account-level credential. Hikari offers Zhihu to
+end users through the shared wallet only, never automates multi-account rotation or free-tier
+farming, and operators must verify the resale terms of the Zhihu open platform before any public
+offering.
 
 ## Cherry Studio setup
 
@@ -256,7 +311,7 @@ Those admin endpoints use admin authentication, not Hikari token auth.
 
 ## Per-provider request metrics
 
-Admin and user consoles expose per-provider request counters for the four search providers:
+Admin and user consoles expose per-provider request counters for the six search providers:
 
 - `GET /api/analysis/providers` (admin) returns `generated_at` plus rolling `windows.last24h`,
   `windows.last7d`, and `windows.last30d`. Each window holds rows with `provider`, `requests`,

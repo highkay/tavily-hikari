@@ -96,11 +96,11 @@ curl -H "Authorization: Bearer th-<id>-<secret>" \
   http://127.0.0.1:58087/api/tavily/research/<request_id>
 ```
 
-## SerpApi、Exa 与 Brave facade
+## SerpApi、Exa、Brave、Keenable 与 Zhihu facade
 
-除 `/api/tavily/*` 之外，Hikari 还为另外三家搜索供应商提供原生 REST facade。每个 facade 都接受同一枚
+除 `/api/tavily/*` 之外，Hikari 还为另外五家搜索供应商提供原生 REST facade。每个 facade 都接受同一枚
 Hikari token（`th-<id>-<secret>`），放在该供应商的原生鉴权槽里；Hikari 会在出站前剥离它，并在内部注入
-池内真实上游 key。四家供应商的 credit 都从同一个共享钱包结算。
+池内真实上游 key。六家供应商的 credit 都从同一个共享钱包结算。
 
 ### SerpApi
 
@@ -159,6 +159,54 @@ curl "https://<your-host>/api/brave/res/v1/web/search?q=rust+async+runtime" \
 
 Credit：`web` 与 `news` 各计 1，`llm_context` 计 2。边界：仅代理 web 搜索、news 搜索与 LLM Context；
 URL 提取/爬取、images、videos、local/place、suggest、spellcheck、summarizer 与 Answers 都不支持。
+
+### Keenable
+
+| Method | Path                      | 说明                   | 认证                                           |
+| ------ | ------------------------- | ---------------------- | ---------------------------------------------- |
+| `POST` | `/api/keenable/v1/search` | 原生网页搜索           | `X-API-Key: th-...` 或 `Authorization: Bearer` |
+| `GET`  | `/api/keenable/v1/fetch`  | 页面抓取（`?url=...`） | `X-API-Key: th-...` 或 `Authorization: Bearer` |
+
+MCP 入口：`https://<your-host>/keenable/mcp`（托管直通；支持 `X-API-Key: th-...` 或
+`Authorization: Bearer th-...`）。工具：`search_web_pages`、`fetch_page_content`。
+
+```bash
+curl -X POST "https://<your-host>/api/keenable/v1/search" \
+  -H "X-API-Key: th-<id>-<secret>" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "rust async runtime", "max_results": 3}'
+
+curl "https://<your-host>/api/keenable/v1/fetch?url=https%3A%2F%2Fexample.com&max_chars=2000" \
+  -H "X-API-Key: th-<id>-<secret>"
+```
+
+Credit：`search` 与 `fetch` 各计 1；`initialize`、`tools/list` 等 MCP 控制面方法免费。限制：
+`max_results` 1..50、`snippet_max_length` 180..10000、每组织 10 请求/秒，以及合同签署时供应商公布的
+免费档 100,000 请求/月；套餐可能变化，请以供应商当前公布为准。边界：只代理 search 与 fetch；免密钥
+`/public` 同款、按次付费 x402、CLI 与 Time Machine 端点都不代理。
+
+### Zhihu
+
+| Method | Path                                      | 说明     | 认证                    |
+| ------ | ----------------------------------------- | -------- | ----------------------- |
+| `GET`  | `/api/zhihu/api/v1/content/zhihu_search`  | 站内搜索 | `Authorization: Bearer` |
+| `GET`  | `/api/zhihu/api/v1/content/global_search` | 全网搜索 | `Authorization: Bearer` |
+
+MCP 入口：`https://<your-host>/zhihu/mcp`（本地 facade；`Authorization: Bearer th-...`）。工具：
+`zhihu_search`（count 1..10）、`zhihu_global_search`（count 1..20，`search_db` all/realtime/static）。
+
+```bash
+curl "https://<your-host>/api/zhihu/api/v1/content/zhihu_search?Query=rust+async+runtime&Count=3" \
+  -H "Authorization: Bearer th-<id>-<secret>"
+```
+
+响应保持原生的 HTTP-200 `{Code, Message, Data}` envelope；只有 `Code == 0` 才计 1 credit，其余 code 一律
+计 0，客户端仍然收到该 envelope。`Count` 超过 10（`zhihu_search`）或 20（`global_search`）会被本地以 400
+拒绝且零上游调用；`Count <= 0` 透传并应用上游默认值。边界：只代理这两个搜索操作；热榜、问题推荐、
+`zhida_openai`、知识库与其他开放平台接口都不代理。
+
+Zhihu 运营者注记：Access Secret 是账号级凭据。Hikari 只通过共享钱包向终端用户提供 Zhihu，不自动执行
+多账号轮换或免费档刷量，运营者在任何公开出售前必须自行核对 Zhihu 开放平台的转售条款。
 
 ## Cherry Studio 接入
 
@@ -250,7 +298,7 @@ npx skills add https://github.com/IvanLi-CN/tavily-hikari --global
 
 ## 按供应商的请求指标
 
-管理端与用户控制台都提供四个搜索供应商的按供应商请求数：
+管理端与用户控制台都提供六个搜索供应商的按供应商请求数：
 
 - `GET /api/analysis/providers`（管理员）返回 `generated_at` 与滚动窗口 `windows.last24h`、
   `windows.last7d`、`windows.last30d`；每个窗口是行数组，每行含 `provider`、`requests`、

@@ -24,24 +24,29 @@ Recommended defaults:
 
 No matter which access model you choose, these settings are the main runtime contract:
 
-| Flag / Env                                        | Usually matters | Purpose                                    |
-| ------------------------------------------------- | --------------- | ------------------------------------------ |
-| `--upstream` / `TAVILY_UPSTREAM`                  | yes             | Tavily MCP upstream URL                    |
-| `TAVILY_USAGE_BASE`                               | yes             | Tavily HTTP / usage base URL               |
-| `--serpapi-upstream` / `SERPAPI_UPSTREAM`         | optional        | SerpApi REST upstream base URL             |
-| `--serpapi-mcp-upstream` / `SERPAPI_MCP_UPSTREAM` | optional        | SerpApi hosted MCP upstream URL            |
-| `--exa-upstream` / `EXA_UPSTREAM`                 | optional        | Exa REST upstream base URL                 |
-| `--brave-upstream` / `BRAVE_UPSTREAM`             | optional        | Brave REST upstream base URL               |
-| `--bind` / `PROXY_BIND`                           | yes             | listen address                             |
-| `--port` / `PROXY_PORT`                           | yes             | listen port                                |
-| `--db-path` / `PROXY_DB_PATH`                     | yes             | SQLite database path                       |
-| `LOW_QUOTA_DEPLETION_THRESHOLD`                   | optional        | low-balance 432 key threshold              |
-| `PUBLIC_METRICS_CORS_ORIGINS`                     | optional        | browser origins for the public metrics API |
-| `--static-dir` / `WEB_STATIC_DIR`                 | depends         | frontend static asset directory            |
-| `--keys` / `TAVILY_API_KEYS`                      | optional        | one-time Tavily key bootstrap helper       |
-| `--serpapi-keys` / `SERPAPI_API_KEYS`             | optional        | one-time SerpApi key bootstrap helper      |
-| `--exa-keys` / `EXA_API_KEYS`                     | optional        | one-time Exa key bootstrap helper          |
-| `--brave-keys` / `BRAVE_API_KEYS`                 | optional        | one-time Brave key bootstrap helper        |
+| Flag / Env                                          | Usually matters | Purpose                                    |
+| --------------------------------------------------- | --------------- | ------------------------------------------ |
+| `--upstream` / `TAVILY_UPSTREAM`                    | yes             | Tavily MCP upstream URL                    |
+| `TAVILY_USAGE_BASE`                                 | yes             | Tavily HTTP / usage base URL               |
+| `--serpapi-upstream` / `SERPAPI_UPSTREAM`           | optional        | SerpApi REST upstream base URL             |
+| `--serpapi-mcp-upstream` / `SERPAPI_MCP_UPSTREAM`   | optional        | SerpApi hosted MCP upstream URL            |
+| `--exa-upstream` / `EXA_UPSTREAM`                   | optional        | Exa REST upstream base URL                 |
+| `--brave-upstream` / `BRAVE_UPSTREAM`               | optional        | Brave REST upstream base URL               |
+| `--keenable-upstream` / `KEENABLE_UPSTREAM`         | optional        | Keenable REST upstream base URL            |
+| `--keenable-mcp-upstream` / `KEENABLE_MCP_UPSTREAM` | optional        | Keenable hosted MCP upstream URL           |
+| `--zhihu-upstream` / `ZHIHU_UPSTREAM`               | optional        | Zhihu REST upstream base URL               |
+| `--bind` / `PROXY_BIND`                             | yes             | listen address                             |
+| `--port` / `PROXY_PORT`                             | yes             | listen port                                |
+| `--db-path` / `PROXY_DB_PATH`                       | yes             | SQLite database path                       |
+| `LOW_QUOTA_DEPLETION_THRESHOLD`                     | optional        | low-balance 432 key threshold              |
+| `PUBLIC_METRICS_CORS_ORIGINS`                       | optional        | browser origins for the public metrics API |
+| `--static-dir` / `WEB_STATIC_DIR`                   | depends         | frontend static asset directory            |
+| `--keys` / `TAVILY_API_KEYS`                        | optional        | one-time Tavily key bootstrap helper       |
+| `--serpapi-keys` / `SERPAPI_API_KEYS`               | optional        | one-time SerpApi key bootstrap helper      |
+| `--exa-keys` / `EXA_API_KEYS`                       | optional        | one-time Exa key bootstrap helper          |
+| `--brave-keys` / `BRAVE_API_KEYS`                   | optional        | one-time Brave key bootstrap helper        |
+| `--keenable-keys` / `KEENABLE_API_KEYS`             | optional        | one-time Keenable key bootstrap helper     |
+| `--zhihu-keys` / `ZHIHU_API_KEYS`                   | optional        | one-time Zhihu Access Secret bootstrap     |
 
 Notes:
 
@@ -72,6 +77,15 @@ Notes:
   scoped to their own provider. When one is unset, Hikari leaves that provider's key rows
   untouched; when set, listed keys are added or revived and that provider's unlisted keys are
   soft-deleted. In production, prefer the admin API/UI for long-term key management.
+- `KEENABLE_UPSTREAM` (default `https://api.keenable.ai`) and `ZHIHU_UPSTREAM` (default
+  `https://developer.zhihu.com`) accept a path prefix when a reverse proxy keeps the provider
+  under one; Hikari appends each provider's native paths (`/v1/search`, `/v1/fetch`,
+  `/api/v1/content/...`) under it.
+- `KEENABLE_MCP_UPSTREAM` defaults to `https://api.keenable.ai/mcp` and is treated as the full
+  hosted MCP endpoint. Include the final `/mcp` path when your reverse proxy keeps a path prefix.
+- `KEENABLE_API_KEYS` and `ZHIHU_API_KEYS` follow the same scoped bootstrap semantics.
+  `ZHIHU_API_KEYS` holds Zhihu Access Secrets, never end-user tokens. Both providers also support
+  zero-cost admin key validation; see the [Keenable](/providers-keenable) and [Zhihu](/providers-zhihu) provider pages.
 
 ## Minimum config by deployment shape
 
@@ -342,6 +356,8 @@ If you only want the shortest correct answer:
 
 - [Quick Start](/quick-start)
 - [HTTP API Guide](/http-api-guide)
+- [Keenable Provider](/providers-keenable)
+- [Zhihu Provider](/providers-zhihu)
 - [Deployment & Anonymity](/deployment-anonymity)
 - [FAQ & Troubleshooting](/faq)
 - [Storybook](/storybook.html)

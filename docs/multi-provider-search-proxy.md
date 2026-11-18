@@ -1,13 +1,17 @@
-# 多供应商搜索中转设计（`/api/serpapi/*`、`/api/exa/*`、`/api/brave/*` 与 `/{provider}/mcp`）
+# 多供应商搜索中转设计（`/api/{serpapi,exa,brave,keenable,zhihu}/*` 与 `/{provider}/mcp`）
 
-本文档描述 Tavily Hikari 在既有 Tavily 表面之外新增的 **SerpApi、Exa、Brave Search** 三条搜索供应商链路，
+本文档描述 Tavily Hikari 在既有 Tavily 表面之外新增的 **SerpApi、Exa、Brave Search、Keenable 与 Zhihu** 五条搜索供应商链路，
 覆盖各自的 REST façade、MCP 入口、密钥池接入、计费、健康语义、用量同步、脱敏与合规边界。
 
 本文档是当前实现的接入与维护基线，结构与 `docs/tavily-http-api-proxy.md` 保持一致。
 
-上游合同与决策依据见 `.omo/drafts/serpapi-exa-brave-providers.md`（含 D1-D10 决策与逐商合同摘录）
-与 `docs/adr/0005-multi-provider-upstream-abstraction.md`；实现覆盖与文件锚点见
-`docs/specs/multi-provider-search-integration/IMPLEMENTATION.md`，演进与后续项见同目录 `HISTORY.md`。
+上游合同与决策依据见 `.omo/drafts/serpapi-exa-brave-providers.md`（SerpApi/Exa/Brave 的
+D1-D10 决策与逐商合同摘录）、`.omo/drafts/keenable-integration.md`（Keenable/Zhihu 的
+D1-D12 决策）与 `docs/adr/0005-multi-provider-upstream-abstraction.md`；实现覆盖与文件锚点见
+`docs/specs/multi-provider-search-integration/IMPLEMENTATION.md`（SerpApi/Exa/Brave）与
+`docs/specs/keenable-zhihu-providers/IMPLEMENTATION.md`（Keenable/Zhihu），演进与后续项见各自
+目录的 `HISTORY.md`。Keenable/Zhihu 的逐参数合同以
+`docs/specs/keenable-zhihu-providers/SPEC.md` 为记录基线，本文档只做维护性索引。
 
 ---
 
@@ -22,7 +26,7 @@
 
 需求：
 
-- 在不改变任何 Tavily 行为前提下，把 SerpApi、Exa、Brave 作为同级供应商接入同一套基础设施：
+- 在不改变任何 Tavily 行为前提下，把 SerpApi、Exa、Brave、Keenable、Zhihu 作为同级供应商接入同一套基础设施：
   - 每商独立密钥池（provider-scoped 获取、亲和、退避、隔离）；
   - 共享同一 credit 钱包与按操作计价表；
   - 原生形状 REST façade，`th-` 访问令牌可放入各供应商原生鉴权槽；
@@ -31,8 +35,8 @@
 
 目标：
 
-1. 在 `/api/serpapi/*`、`/api/exa/*`、`/api/brave/*` 下提供原生 HTTP façade。
-2. 在 `/serpapi/mcp`、`/exa/mcp`、`/brave/mcp` 下提供 MCP 入口。
+1. 在 `/api/serpapi/*`、`/api/exa/*`、`/api/brave/*`、`/api/keenable/*`、`/api/zhihu/*` 下提供原生 HTTP façade。
+2. 在 `/serpapi/mcp`、`/exa/mcp`、`/brave/mcp`、`/keenable/mcp`、`/zhihu/mcp` 下提供 MCP 入口。
 3. 对内复用现有 KeyStore、credit 钱包、reservation/settlement、request_logs 与告警体系。
 4. 所有出站请求遵守与 Tavily 同级的高匿白名单；客户端令牌与池内密钥绝不泄露到日志或上游。
 5. Tavily `/mcp` 与 `/api/tavily/*` 字节级不变（golden 套件回归约束）。
@@ -47,18 +51,24 @@
 - 注册表：`src/server/provider_facade.rs:88-159`（REST 路由表）、`:163-167`（MCP 入口表）。
 - 路由挂载：`src/server/provider_facade.rs:218-245`，由 `src/server/serve.rs:566` merge 进主 router。
 
-| Method   | Path                            | 上游端点                                              | 客户端鉴权槽（`th-` 令牌）                                   | 说明                                   |
-| -------- | ------------------------------- | ----------------------------------------------------- | ------------------------------------------------------------ | -------------------------------------- |
-| GET/POST | `/api/serpapi/search`           | `GET {SERPAPI_UPSTREAM}/search`                       | `Authorization: Bearer` 或 query `api_key`                   | 搜索；POST 为 JSON 体到原生 query 映射 |
-| POST     | `/api/exa/search`               | `POST {EXA_UPSTREAM}/search`                          | `Authorization: Bearer` 或头 `x-api-key`                     | 搜索                                   |
-| POST     | `/api/exa/contents`             | `POST {EXA_UPSTREAM}/contents`                        | `Authorization: Bearer` 或头 `x-api-key`                     | URL 内容提取（extract 等价）           |
-| POST     | `/api/exa/answer`               | `POST {EXA_UPSTREAM}/answer`                          | `Authorization: Bearer` 或头 `x-api-key`                     | 带引用回答（非流式）                   |
-| GET      | `/api/brave/res/v1/web/search`  | `GET {BRAVE_UPSTREAM}/res/v1/web/search`              | `Authorization: Bearer` 或头 `X-Subscription-Token`          | Web 搜索（原生路径镜像）               |
-| GET      | `/api/brave/res/v1/news/search` | `GET {BRAVE_UPSTREAM}/res/v1/news/search`             | `Authorization: Bearer` 或头 `X-Subscription-Token`          | 新闻搜索                               |
-| GET      | `/api/brave/res/v1/llm/context` | `GET {BRAVE_UPSTREAM}/res/v1/llm/context`             | `Authorization: Bearer` 或头 `X-Subscription-Token`          | LLM Context（查询驱动预抽取片段）      |
-| ANY      | `/serpapi/mcp`                  | `{SERPAPI_MCP_UPSTREAM}`（托管 MCP）                  | `Authorization: Bearer` 或 query `api_key`                   | 字节直通托管 MCP                       |
-| ANY      | `/exa/mcp`                      | 本地 facade（`POST /search`、`/contents`、`/answer`） | `Authorization: Bearer`、头 `x-api-key` 或 query `exaApiKey` | 本地 MCP facade                        |
-| ANY      | `/brave/mcp`                    | 本地 facade（`GET /res/v1/...`）                      | `Authorization: Bearer` 或头 `X-Subscription-Token`          | 本地 MCP facade                        |
+| Method   | Path                                      | 上游端点                                              | 客户端鉴权槽（`th-` 令牌）                                   | 说明                                   |
+| -------- | ----------------------------------------- | ----------------------------------------------------- | ------------------------------------------------------------ | -------------------------------------- |
+| GET/POST | `/api/serpapi/search`                     | `GET {SERPAPI_UPSTREAM}/search`                       | `Authorization: Bearer` 或 query `api_key`                   | 搜索；POST 为 JSON 体到原生 query 映射 |
+| POST     | `/api/exa/search`                         | `POST {EXA_UPSTREAM}/search`                          | `Authorization: Bearer` 或头 `x-api-key`                     | 搜索                                   |
+| POST     | `/api/exa/contents`                       | `POST {EXA_UPSTREAM}/contents`                        | `Authorization: Bearer` 或头 `x-api-key`                     | URL 内容提取（extract 等价）           |
+| POST     | `/api/exa/answer`                         | `POST {EXA_UPSTREAM}/answer`                          | `Authorization: Bearer` 或头 `x-api-key`                     | 带引用回答（非流式）                   |
+| GET      | `/api/brave/res/v1/web/search`            | `GET {BRAVE_UPSTREAM}/res/v1/web/search`              | `Authorization: Bearer` 或头 `X-Subscription-Token`          | Web 搜索（原生路径镜像）               |
+| GET      | `/api/brave/res/v1/news/search`           | `GET {BRAVE_UPSTREAM}/res/v1/news/search`             | `Authorization: Bearer` 或头 `X-Subscription-Token`          | 新闻搜索                               |
+| GET      | `/api/brave/res/v1/llm/context`           | `GET {BRAVE_UPSTREAM}/res/v1/llm/context`             | `Authorization: Bearer` 或头 `X-Subscription-Token`          | LLM Context（查询驱动预抽取片段）      |
+| POST     | `/api/keenable/v1/search`                 | `POST {KEENABLE_UPSTREAM}/v1/search`                  | `Authorization: Bearer` 或头 `X-API-Key`                     | 搜索（body 字节透传）                  |
+| GET      | `/api/keenable/v1/fetch`                  | `GET {KEENABLE_UPSTREAM}/v1/fetch`                    | `Authorization: Bearer` 或头 `X-API-Key`                     | 页面抓取（query string 透传）          |
+| GET      | `/api/zhihu/api/v1/content/zhihu_search`  | `GET {ZHIHU_UPSTREAM}/api/v1/content/zhihu_search`    | `Authorization: Bearer`（无客户端原生槽）                    | 站内搜索（HTTP-200 `Code` envelope）   |
+| GET      | `/api/zhihu/api/v1/content/global_search` | `GET {ZHIHU_UPSTREAM}/api/v1/content/global_search`   | `Authorization: Bearer`（无客户端原生槽）                    | 全网搜索（`SearchDB`/`Filter` 透传）   |
+| ANY      | `/serpapi/mcp`                            | `{SERPAPI_MCP_UPSTREAM}`（托管 MCP）                  | `Authorization: Bearer` 或 query `api_key`                   | 字节直通托管 MCP                       |
+| ANY      | `/exa/mcp`                                | 本地 facade（`POST /search`、`/contents`、`/answer`） | `Authorization: Bearer`、头 `x-api-key` 或 query `exaApiKey` | 本地 MCP facade                        |
+| ANY      | `/brave/mcp`                              | 本地 facade（`GET /res/v1/...`）                      | `Authorization: Bearer` 或头 `X-Subscription-Token`          | 本地 MCP facade                        |
+| ANY      | `/keenable/mcp`                           | `{KEENABLE_MCP_UPSTREAM}`（托管 MCP）                 | `Authorization: Bearer` 或头 `X-API-Key`                     | 缓冲 JSON-RPC 直通（无 SSE）           |
+| ANY      | `/zhihu/mcp`                              | 本地 facade（两个搜索工具的翻译层）                   | `Authorization: Bearer`（无客户端原生槽）                    | 本地 MCP facade                        |
 
 补充约定：
 
@@ -69,14 +79,21 @@
   见 `src/analysis.rs:915-930`），`auth_token_logs` 保留完整注册路径。
 - SerpApi 的 POST 变体是便捷映射：JSON 体字段（`q`、`engine`、`num`、`start`、`output`、`no_cache`、
   `location`、`gl`、`hl`、`json_restrictor` 等）在本地合并为原生 query 后再出站；GET 变体直接透传 query。
+- Keenable 的 REST 两条路由都是纯透传（search 的 POST body、fetch 的 GET query string 原样出站），
+  不做参数映射；带 key 的成功响应里的 `usage` 字段照常回传客户端。
+- Zhihu 两个 GET 端点的成功与失败共用 HTTP 200 的 `{Code,Message,Data}` envelope：仅 `Code==0` 结算
+  1 credit，其余 code 计 0 且客户端始终收到原始 envelope；`Count` 超过 10（zhihu_search）或 20
+  （global_search）返回本地 typed 400 且零上游调用，`Count <= 0` 透传让上游默认值生效。
 
 ### 2.1 原生兼容与边界约定
 
 各供应商的原生面并不等价（SerpApi 只有搜索族；Exa 有 search/contents/answer；Brave 有搜索族 +
 LLM Context，没有 URL 提取/爬取）。Hikari 的下游合同只覆盖各商原生可用、且当前代理可正确计费和审计的能力：
 
-- 支持：上表 10 个入口所列操作，以及 SerpApi 托管 MCP 的 `search`、`search_table`、`search_dashboard`
-  工具与 `resources` 读取（`resources/*`、`tools/list` 等控制面非计费）。
+- 支持：上表 16 个入口所列操作，以及 SerpApi 托管 MCP 的 `search`、`search_table`、`search_dashboard`
+  工具与 `resources` 读取（`resources/*`、`tools/list` 等控制面非计费），Keenable 托管 MCP 的
+  `search_web_pages`、`fetch_page_content` 工具，Zhihu 本地 facade 的 `zhihu_search`、
+  `zhihu_global_search` 工具。
 - 不支持（本地 typed 拒绝，不会打到上游）：
   - Exa `stream:true`（或任何真值 `stream`）；请求在本地返回 typed `400`
     （错误信息注明 “streaming not supported; omit stream or set false”）。这是既有 free-account
@@ -87,6 +104,11 @@ LLM Context，没有 URL 提取/爬取）。Hikari 的下游合同只覆盖各�
   - 跨供应商自动 fallback；某商密钥全部不可用时返回 Hikari `502`（NoAvailableKeys 语义），
     不会改投其他供应商。
   - 除脱敏外的任何响应体改造；上游 4xx/5xx 一律原样透传。
+  - Keenable 免密钥 `/public` 同款、pay-per-request `/v1/x402/*`、CLI 与 Time Machine 端点。
+  - Zhihu `hot_list`、`question_discovery`、`zhida_openai`、知识库、用户数据、创作者与 PDF/PPT
+    等开放平台能力；官方 SSE MCP 不直通（本地 facade 代替，见 §4.6）。
+  - Keenable/Zhihu 上游响应不做 SSE 透传：Keenable MCP 为缓冲 JSON-RPC，Zhihu MCP 本地翻译后
+    SSE 包裹返回。
 
 ---
 
@@ -97,14 +119,18 @@ LLM Context，没有 URL 提取/爬取）。Hikari 的下游合同只覆盖各�
 所有新入口统一要求 Hikari 访问令牌（`th-<id>-<secret>`），并额外接受“客户端本就可能携带”的原生槽。
 解析实现：`src/server/provider_facade.rs:278-376`（`authenticate_provider_facade_request`）。
 
-| 入口                                | 通用槽                  | 原生头槽               | 原生 query 槽           |
-| ----------------------------------- | ----------------------- | ---------------------- | ----------------------- |
-| `/api/serpapi/search`               | `Authorization: Bearer` | -                      | `api_key`               |
-| `/serpapi/mcp`                      | `Authorization: Bearer` | -                      | `api_key`               |
-| `/api/exa/{search,contents,answer}` | `Authorization: Bearer` | `x-api-key`            | -                       |
-| `/exa/mcp`                          | `Authorization: Bearer` | `x-api-key`            | `exaApiKey`（MCP 专用） |
-| `/api/brave/res/v1/*`               | `Authorization: Bearer` | `X-Subscription-Token` | -                       |
-| `/brave/mcp`                        | `Authorization: Bearer` | `X-Subscription-Token` | -                       |
+| 入口                                 | 通用槽                  | 原生头槽               | 原生 query 槽           |
+| ------------------------------------ | ----------------------- | ---------------------- | ----------------------- |
+| `/api/serpapi/search`                | `Authorization: Bearer` | -                      | `api_key`               |
+| `/serpapi/mcp`                       | `Authorization: Bearer` | -                      | `api_key`               |
+| `/api/exa/{search,contents,answer}`  | `Authorization: Bearer` | `x-api-key`            | -                       |
+| `/exa/mcp`                           | `Authorization: Bearer` | `x-api-key`            | `exaApiKey`（MCP 专用） |
+| `/api/brave/res/v1/*`                | `Authorization: Bearer` | `X-Subscription-Token` | -                       |
+| `/brave/mcp`                         | `Authorization: Bearer` | `X-Subscription-Token` | -                       |
+| `/api/keenable/{v1/search,v1/fetch}` | `Authorization: Bearer` | `X-API-Key`            | -                       |
+| `/keenable/mcp`                      | `Authorization: Bearer` | `X-API-Key`            | -                       |
+| `/api/zhihu/api/v1/content/*`        | `Authorization: Bearer` | -                      | -                       |
+| `/zhihu/mcp`                         | `Authorization: Bearer` | -                      | -                       |
 
 解析顺序（首个非空命中）：`Authorization: Bearer` > 原生头槽 > 原生 query 槽 > Exa MCP query 槽。
 命中后统一走既有 `validate_access_token`，失败一律返回 Hikari 形状的 `401`（绝不返回供应商形状的错误）。
@@ -113,7 +139,9 @@ LLM Context，没有 URL 提取/爬取）。Hikari 的下游合同只覆盖各�
 ### 3.2 剥离与记录语义（strip-before-forward / strip-before-log）
 
 - 转发前：`Authorization`、供应商原生头槽、`X-Hikari-Routing-Key`、原生 query 槽全部从客户端请求中剥离；
-  上游只收到池内选中的真实密钥（按各商注入方式，见 §4）。
+  上游只收到池内选中的真实密钥（按各商注入方式，见 §4）。新增供应商同样入列：客户端 `X-API-Key`
+  与 Zhihu 同名 `Authorization`/`X-Request-Timestamp` 头在白名单与剥离层即被丢弃；Zhihu 出站时间戳
+  由后端时钟每次尝试生成，客户端时间戳绝不转发。
 - 日志前：持久化的 query/headers 只包含剥离后的文本；客户端 `th-` 令牌与池内密钥都不落盘。
   展示层另有短语级脱敏（见 §5.2）。
 - `X-Hikari-Routing-Key` 与 `/api/tavily` 保持同等接受度（M10），但新 façade 使用既有 token/user
@@ -131,13 +159,16 @@ HA business fence、每小时任意请求限频、reserved-credit 预检查、bi
 
 读端点遇到的键级失败优先在池内消化，客户端无感：
 
-- 适用面：Tavily HTTP 读端点与三家 provider REST 读端点（§4）。MCP 表面不进入该契约：
-  pinned 会话按会话迁移语义处理，Exa/Brave 本地 MCP 保持单次尝试。
+- 适用面：Tavily HTTP 读端点与五家 provider REST 读端点（§4，Keenable/Zhihu REST 读实现同样接入
+  重试内核）。MCP 表面不进入该契约：pinned 会话按会话迁移语义处理，Exa/Brave/Zhihu 本地 MCP
+  保持单次尝试。
 - 触发集：键级明确拒绝（429 限速、432 配额耗尽、402 键级耗尽、401/403 auth-block
   家族）与键级瞬时异常（上游 5xx、超时、传输发送错误）。判定使用分析得出的
   effective status：HTTP 200 包体内 envelope 形态的 `status:432` 同样计入耗尽；
   归一化信号优先于数字状态码（Brave 以 422 报 `SUBSCRIPTION_TOKEN_INVALID` 时按
-  auth-block 家族处理）。
+  auth-block 家族处理）。Keenable 402 `billing_error` 计入键级耗尽、429 计入限速；
+  Zhihu 键级失败在 HTTP 200 报体内按 `Code` 归一化（20001 auth-block 家族、30001 限速、
+  90001 瞬态），同样以归一化信号为准。
 - 预算：同一逻辑请求至多 2 次上游尝试（即至多一次换 key），总死线 5 秒，零睡眠；
   Retry-After 超过 2 秒的拒绝不重试（限速臂与瞬时臂同受此门约束），原样返回。预算可用环境变量调整
   （`KEY_RETRY_MAX_ATTEMPTS` 等，默认值与边界见
@@ -148,7 +179,9 @@ HA business fence、每小时任意请求限频、reserved-credit 预检查、bi
   Exa 429 与 Exa 团队级 402（`TEAM_BUDGET_EXCEEDED`，团队限额换 key 无法解除）；
   Exa 402 仅当 body tag 明确为键级（`NO_MORE_CREDITS` / `API_KEY_BUDGET_EXCEEDED`）
   时才换 key，无 tag 证据时同样保守不轮换。SerpApi「run out of searches」429 属耗尽
-  语义，不在 veto 之列，可换 key。
+  语义，不在 veto 之列，可换 key。Keenable `target_error`/`invalid_request_error` 与
+  Zhihu `Code=10001`/未知非零 `Code` 都是客户端错误，不换 key 也不标记 key；Zhihu
+  本地 `Count` 上限 400 零上游调用，同样不进入阶梯。
 - 池内无合格 key 时：客户端收到上游首击拒绝的逐字节原样响应（状态码、
   Retry-After 头、正文），不会改写成 502。
 - 可观测与计费：每次上游尝试各留一条可见 request_logs 行；重试链以 `fallback_reason`
@@ -157,12 +190,15 @@ HA business fence、每小时任意请求限频、reserved-credit 预检查、bi
 
 被拒 key 的标记语义：
 
-| 失败             | 标记                                            | 之后的可选性             |
-| ---------------- | ----------------------------------------------- | ------------------------ |
-| 429 限速         | 短时 transient cooldown                         | 窗口过后即可再次被选中   |
-| 432 配额耗尽     | 月度 exhausted                                  | 续费窗口或手动恢复后复活 |
-| 带关键词 401/403 | quarantine 隔离                                 | 需人工处理               |
-| 裸 401/403       | auth-block 长冷却（无提示 120 秒，上限 900 秒） | 冷却结束后回到池内       |
+| 失败              | 标记                                            | 之后的可选性                      |
+| ----------------- | ----------------------------------------------- | --------------------------------- |
+| 429 限速          | 短时 transient cooldown                         | 窗口过后即可再次被选中            |
+| 432 配额耗尽      | 月度 exhausted                                  | 续费窗口或手动恢复后复活          |
+| 带关键词 401/403  | quarantine 隔离                                 | 需人工处理                        |
+| 裸 401/403        | auth-block 长冷却（无提示 120 秒，上限 900 秒） | 冷却结束后回到池内                |
+| Keenable 402      | 月度 exhausted                                  | UTC 月边界或手动恢复后复活        |
+| Zhihu 20001       | quarantine 隔离                                 | 需人工处理                        |
+| Zhihu 配额 0 采样 | 自然日 exhausted                                | 下一个 Asia/Shanghai 零点自动复活 |
 
 ---
 
@@ -293,6 +329,86 @@ Tavily 的 `/mcp`、`/api/tavily/*`、用量同步（`TAVILY_USAGE_BASE/usage`�
 `quota_sync/manual` 车道）与既有三段 header 白名单保持字节级不变（golden 套件回归约束）。
 provider 化改造只新增旁路，不回写 Tavily 请求路径。
 
+### 4.5 Keenable
+
+**端点与 MCP**
+
+| 入口                      | 上游                                  | 密钥注入                 | 备注                            |
+| ------------------------- | ------------------------------------- | ------------------------ | ------------------------------- |
+| `/api/keenable/v1/search` | `POST {KEENABLE_UPSTREAM}/v1/search`  | 头 `X-API-Key: <pooled>` | body 字节透传（客户端槽先剥离） |
+| `/api/keenable/v1/fetch`  | `GET {KEENABLE_UPSTREAM}/v1/fetch`    | 头 `X-API-Key: <pooled>` | query string 原样透传           |
+| `/keenable/mcp`           | `{KEENABLE_MCP_UPSTREAM}`（托管 MCP） | 头 `X-API-Key: <pooled>` | 缓冲 JSON-RPC 直通；无 SSE      |
+
+REST 参数不翻译：search 支持 `query`、`mode`、`site`、`exclude_domains`、日期过滤、`max_results`
+1..50、`snippet_max_length` 180..10000、`safety_mode`、`session_id` 等；fetch 支持 `url`、
+`max_chars`、`live`、`prompt`（≤2000 字符）、`session_id`。未知参数由上游返回 400。
+
+MCP 工具：`search_web_pages`、`fetch_page_content`（各 1 credit，仅 `tools/call` 计费；
+`initialize`、`ping`、`tools/list`、`notifications/*` 非计费）。成功的 `tools/call` 携带
+`_meta["keenable/usage"]`，其中 `credits_remaining` 被动采集。
+
+**错误语义（`type`/`code` 七值闭合集）**
+
+| 上游 envelope                                                      | 分类信号        | 密钥健康动作                             |
+| ------------------------------------------------------------------ | --------------- | ---------------------------------------- |
+| `authentication_error`（401，`invalid_api_key` 等）                | AuthFailed      | quarantine（invalid_api_key）            |
+| `billing_error` + 402（`insufficient_credits`/`payment_required`） | Exhausted       | 标记 exhausted；UTC 月边界或手动恢复     |
+| `billing_error` + 451                                              | ClientError     | 无惩罚                                   |
+| `permission_error` `credentials_forbidden`/`forbidden`             | AuthFailed      | quarantine                               |
+| `permission_error` 其他 code（`target_blocked` 等）                | ClientError     | 无惩罚（target 错误绝不标记 key）        |
+| `rate_limit_error`（400/429）                                      | RateLimited     | 遵守 `retry_after_seconds`/`Retry-After` |
+| `target_error`（任意状态）                                         | ClientError     | 无惩罚                                   |
+| `api_error`（422/5xx/529）                                         | ServerTransient | 无惩罚                                   |
+| `invalid_request_error`                                            | ClientError     | 无惩罚                                   |
+
+**用量同步（被动采集）**：每个带 key 的 REST 成功响应与 MCP 成功 `tools/call` 采样
+`usage.credits_remaining`（源 `keenable_passive`、`quota_limit` 为空；估算值可能滞后或缺位，
+仅材料变化落库，失败路径不加额外延迟）；`X-RateLimit-*` 头作为近限速信号。admin `sync-usage`
+返回最后一次被动快照，不做主动轮询。速率上限为每组织 10 rps（该组织全部 key 与
+search+fetch 共享）；供应商公布的免费档为 100,000 请求/月（合同签署时，套餐可能变化，
+以供应商当前公布为准）。
+
+**MCP 模式理由**：Keenable 托管 MCP 可用且为 JSON（无 SSE），直通保留官方工具名与 schema；
+Hikari 只做 `X-API-Key` 注入、会话翻译与计费。
+
+### 4.6 Zhihu
+
+**端点与 MCP**
+
+| 入口                                      | 上游                                                | 密钥注入                         | 备注                                       |
+| ----------------------------------------- | --------------------------------------------------- | -------------------------------- | ------------------------------------------ |
+| `/api/zhihu/api/v1/content/zhihu_search`  | `GET {ZHIHU_UPSTREAM}/api/v1/content/zhihu_search`  | `Authorization: Bearer <pooled>` | 服务端生成 `X-Request-Timestamp`；Count≤10 |
+| `/api/zhihu/api/v1/content/global_search` | `GET {ZHIHU_UPSTREAM}/api/v1/content/global_search` | `Authorization: Bearer <pooled>` | 同上；Count≤20、`SearchDB`/`Filter` 透传   |
+| `/zhihu/mcp`                              | 本地 facade（翻译到上面两个 REST 端点）             | 池内 Access Secret 不出 facade   | 两个工具；SSE 包覆；`Code==0` 才计费       |
+
+本地 MCP 工具：`zhihu_search`（`query` 必填、`count` 1..10、`sort_by` 可选）、
+`zhihu_global_search`（`query` 必填、`count` 1..20、`search_db` all/realtime/static、`filter`
+可选）。`initialize`、`ping`、`tools/list`、`notifications` 非计费；`tools/call` 仅在翻译后的 REST
+结果是 `Code==0` 时计 1 credit，非零 `Code` 返回 MCP 工具错误且计 0。GET 打开事件流返回 405，
+未知工具返回 400。
+
+**错误语义（HTTP-200 `Code` envelope）**
+
+| Envelope `Code` | 分类信号                      | 密钥健康动作                       |
+| --------------- | ----------------------------- | ---------------------------------- |
+| `0`             | Ok（计 1 credit）             | 无                                 |
+| `10001`         | ClientError                   | 无惩罚（参数错误）                 |
+| `20001`         | AuthFailed                    | quarantine（invalid_api_key 语义） |
+| `30001`         | RateLimited（无 Retry-After） | 遵守既有限速退避车道               |
+| `90001`         | ServerTransient               | 无惩罚                             |
+| 未知非零        | ClientError                   | 无惩罚（绝不盲目重试新 code）      |
+
+**用量同步（主动自然日车道）**：`GET /api/v1/quota?APIIDs=zhihu_search,global_search`
+（供应商文档标注免费、不消耗业务额度）在既有配额同步 job 家族的新 `quota_sync/zhihu` 车道
+执行（复用 remote-attempt lease 与 per-key egress）。适配器要求两个 API 条目齐全（缺失是
+typed `QuotaDataMissing`），保存 `min(RemainingQuota)`、较小值的 `TotalQuota` 与下一个
+Asia/Shanghai 零点（`quota_renews_at`）。`RemainingQuota==0` 的采样把 key 标记 exhausted 直到
+该自然日边界（`NaturalDay` 恢复策略，绝不落在 UTC 月边界）。
+
+**MCP 模式理由**：Zhihu 官方 MCP 仅支持 SSE，且探测期连接保持打开不回 EOF，不适合既有
+缓冲直通；本地 facade 是既定路径。Access Secret 是账号级凭据：本产品不自动化多账号轮换或
+免费档刷量，向公众提供前运营者须核对 Zhihu 开放平台转售条款。
+
 ---
 
 ## 5. 安全与脱敏
@@ -302,15 +418,18 @@ provider 化改造只新增旁路，不回写 Tavily 请求路径。
 各 façade 使用独立白名单（`src/analysis.rs` 内 `sanitize_serpapi_http_headers_inner` /
 `sanitize_exa_http_headers_inner` / `sanitize_brave_http_headers_inner`）：
 
-| 供应商  | 允许转发的头                                                                |
-| ------- | --------------------------------------------------------------------------- |
-| SerpApi | `accept`、`accept-encoding`、`content-type`                                 |
-| Exa     | `accept`、`accept-encoding`、`content-type`                                 |
-| Brave   | `accept`、`accept-encoding`、`content-type`、`cache-control`、`api-version` |
+| 供应商   | 允许转发的头                                                                |
+| -------- | --------------------------------------------------------------------------- |
+| SerpApi  | `accept`、`accept-encoding`、`content-type`                                 |
+| Exa      | `accept`、`accept-encoding`、`content-type`                                 |
+| Brave    | `accept`、`accept-encoding`、`content-type`、`cache-control`、`api-version` |
+| Keenable | `accept`、`accept-encoding`、`content-type`                                 |
+| Zhihu    | `accept`、`accept-encoding`、`content-type`                                 |
 
 - `User-Agent` 一律不转发（与 Tavily 高匿规则一致）。
-- 客户端密钥槽（`api_key` query、`x-api-key`、`X-Subscription-Token`）在白名单层即被丢弃；
-  池内密钥在 façade 层注入。
+- 客户端密钥槽（`api_key` query、`x-api-key`、`X-Subscription-Token`、`X-API-Key`）在白名单层即被丢弃；
+  池内密钥在 façade 层注入。Zhihu 出站不接受客户端 `Authorization` 与 `X-Request-Timestamp`，
+  时间戳由后端时钟生成。
 - SerpApi MCP 直通复用既有 Control MCP 白名单
   （`accept`、`accept-encoding`、`cache-control`、`content-type`、`last-event-id`、
   `mcp-protocol-version`、`mcp-session-id`、`pragma`）。
@@ -339,12 +458,14 @@ provider 化改造只新增旁路，不回写 Tavily 请求路径。
 
 `POST /api/keys/validate` 对各商使用零/低成本探针，隐藏计费探针被禁止：
 
-| 供应商  | 探针                                    | 判据                                                             |
-| ------- | --------------------------------------- | ---------------------------------------------------------------- |
-| Tavily  | 既有行为不变                            | 不变                                                             |
-| SerpApi | `GET /account?api_key=`（免费、不计次） | 返回套餐字段；无效密钥 401                                       |
-| Exa     | `POST /contents` 空体 `{}`              | 401 = 无效；400/422 = 有效（校验类错误不计费）                   |
-| Brave   | `GET /res/v1/web/search` 不带 `q`       | 422 `SUBSCRIPTION_TOKEN_INVALID` = 无效；422 `VALIDATION` = 有效 |
+| 供应商   | 探针                                                  | 判据                                                              |
+| -------- | ----------------------------------------------------- | ----------------------------------------------------------------- |
+| Tavily   | 既有行为不变                                          | 不变                                                              |
+| SerpApi  | `GET /account?api_key=`（免费、不计次）               | 返回套餐字段；无效密钥 401                                        |
+| Exa      | `POST /contents` 空体 `{}`                            | 401 = 无效；400/422 = 有效（校验类错误不计费）                    |
+| Brave    | `GET /res/v1/web/search` 不带 `q`                     | 422 `SUBSCRIPTION_TOKEN_INVALID` = 无效；422 `VALIDATION` = 有效  |
+| Keenable | `POST /v1/search` 空体 `{}`                           | 400 `missing_parameter` = 有效；401 = 无效（其余状态 typed 原因） |
+| Zhihu    | `GET /api/v1/quota?APIIDs=zhihu_search,global_search` | `Code=0` = 有效；`20001` = 无效（该调用免费、不消耗业务额度）     |
 
 ---
 
@@ -379,12 +500,14 @@ provider 化改造只新增旁路，不回写 Tavily 请求路径。
 
 ### 7.1 Base URL 与鉴权槽
 
-| 供应商  | HTTP Base（Hikari 侧）       | 原生鉴权槽                         | MCP 入口       |
-| ------- | ---------------------------- | ---------------------------------- | -------------- |
-| Tavily  | `https://<host>/api/tavily`  | body `api_key` / Bearer            | `/mcp`         |
-| SerpApi | `https://<host>/api/serpapi` | query `api_key` / Bearer           | `/serpapi/mcp` |
-| Exa     | `https://<host>/api/exa`     | 头 `x-api-key` / Bearer            | `/exa/mcp`     |
-| Brave   | `https://<host>/api/brave`   | 头 `X-Subscription-Token` / Bearer | `/brave/mcp`   |
+| 供应商   | HTTP Base（Hikari 侧）        | 原生鉴权槽                         | MCP 入口        |
+| -------- | ----------------------------- | ---------------------------------- | --------------- |
+| Tavily   | `https://<host>/api/tavily`   | body `api_key` / Bearer            | `/mcp`          |
+| SerpApi  | `https://<host>/api/serpapi`  | query `api_key` / Bearer           | `/serpapi/mcp`  |
+| Exa      | `https://<host>/api/exa`      | 头 `x-api-key` / Bearer            | `/exa/mcp`      |
+| Brave    | `https://<host>/api/brave`    | 头 `X-Subscription-Token` / Bearer | `/brave/mcp`    |
+| Keenable | `https://<host>/api/keenable` | 头 `X-API-Key` / Bearer            | `/keenable/mcp` |
+| Zhihu    | `https://<host>/api/zhihu`    | Bearer（无客户端原生槽）           | `/zhihu/mcp`    |
 
 所有槽位填写 Hikari 访问令牌（`th-<id>-<secret>`），而不是各商官方 key。
 
@@ -405,9 +528,13 @@ provider 化改造只新增旁路，不回写 Tavily 请求路径。
   `skills/exa-hikari-contents`、`skills/exa-hikari-answer`、`skills/brave-hikari-search`、
   `skills/brave-hikari-news`、`skills/brave-hikari-llm-context`；
   `skills/tavily-hikari-best-practices` 增加跨供应商对比；`skills/README.md` 维护 Base/鉴权槽矩阵。
+  Keenable/Zhihu 批次同步新增：`skills/keenable-hikari-{search,fetch,mcp}` 与
+  `skills/zhihu-hikari-{search,global-search,mcp}`，并把两家供应商并入
+  best-practices 对比与 skills README 的鉴权槽矩阵。
 - 本文档不重复完整 API 参考：逐操作请求/响应细节以技能包与 stub 合同测试为准
   （`tests/provider_facades_contract.rs`、`tests/provider_mcp_e2e.rs`）。
-- 公共 docs-site 页面（configuration-access / http-api-guide / faq）由 T28 收敛本文档面向上游用户的章节。
+- 公共 docs-site 页面（configuration-access / http-api-guide / faq）由 T28 收敛本文档面向上游用户的章节；
+  Keenable/Zhihu 批次新增 en+zh 的 providers-keenable / providers-zhihu 页面，双语侧栏均列出两个供应商。
 
 ---
 
@@ -415,12 +542,14 @@ provider 化改造只新增旁路，不回写 Tavily 请求路径。
 
 ### 8.1 边界汇总
 
-| 供应商  | 不做                                                          | 说明                                      |
-| ------- | ------------------------------------------------------------- | ----------------------------------------- |
-| SerpApi | async、search-archive、locations、`output=html`               | 仅同步搜索族 + 托管 MCP 3 工具            |
-| Exa     | 流式、agent/monitors/batches/websets、托管 MCP 直通           | `stream:true` 本地 typed 400；本地 facade |
-| Brave   | URL 提取/爬取、images/videos/place/suggest/summarizer/Answers | 仅 web/news/llm_context                   |
-| 全部    | 跨供应商 fallback；请求体内响应改造；SSE 透传                 | 一个请求只命中被寻址供应商                |
+| 供应商   | 不做                                                               | 说明                                      |
+| -------- | ------------------------------------------------------------------ | ----------------------------------------- |
+| SerpApi  | async、search-archive、locations、`output=html`                    | 仅同步搜索族 + 托管 MCP 3 工具            |
+| Exa      | 流式、agent/monitors/batches/websets、托管 MCP 直通                | `stream:true` 本地 typed 400；本地 facade |
+| Brave    | URL 提取/爬取、images/videos/place/suggest/summarizer/Answers      | 仅 web/news/llm_context                   |
+| Keenable | 免密钥 `/public`、`/v1/x402/*`、CLI、Time Machine                  | 仅 search/fetch + 托管 MCP 2 工具         |
+| Zhihu    | hot_list、question_discovery、zhida_openai、知识库等；官方 SSE MCP | 仅两个搜索 + 本地 facade 2 工具           |
+| 全部     | 跨供应商 fallback；请求体内响应改造；SSE 透传                      | 一个请求只命中被寻址供应商                |
 
 ### 8.2 速率与容量
 
@@ -428,6 +557,11 @@ provider 化改造只新增旁路，不回写 Tavily 请求路径。
   v1 保留按 key 退避（遵守 `Retry-After`），不新增全局限流器；provider 级冷却章（团队级天花板）
   列为后续项（M12，见 `HISTORY.md`）。
 - Brave 每 plan 最多 10 key；429 为秒级限速，退避后自然恢复。
+- Keenable 认证限速为每组织 10 rps，由该组织全部 key 与 search+fetch 共享；多 key 池化不会放大
+  rps 天花板。免费档为 100,000 请求/月（合同签署时公布，套餐可能变化）。
+- Zhihu `Count` 上限 10（站内）/20（全网），超限由本地 typed 400 拒绝；每日额度从免费
+  `/api/v1/quota` 主动同步，`RemainingQuota=0` 时 key 耗尽到下一个 Asia/Shanghai 零点
+  （自然日恢复）。
 
 ### 8.3 数据保留（Brave 操作者注记）
 
@@ -437,12 +571,15 @@ Brave ToS §3(b) 禁止长期保留搜索结果数据。Hikari 的现有 body-re
 
 ### 8.4 法律与运营注记（全部供应商）
 
-- 三家条款都限制转售、密钥共享与多账号轮换：SerpApi §2 / §6、Exa 不可转让
+- 五家条款都限制转售、密钥共享与多账号轮换：SerpApi §2 / §6、Exa 不可转让
   非再许可许可、Brave §3(b)(v)/(xii) 与 §4(a)。
+- Zhihu 的 Access Secret 是账号级凭据；本产品不自动化多账号轮换或免费档刷量，向公众提供前
+  运营者须自行核对 Zhihu 开放平台转售条款。Keenable 的免密钥与按次付费面不在代理范围，
+  公开提供前同样核对 Keenable 服务条款。
 - 本产品以 token 计量转售访问能力，运营者需自行确认与各条款的适配；
   “同一组织自有密钥、在已购配额内池化”是文档化边界；多账号刷量、转售裸 key 不在支持范围。
 - 测试与 CI 只允许 stub/sandbox 上游；既有 “never hit production endpoints” 规则扩展至
-  SerpApi/Exa/Brave（AGENTS.md incident rule）。
+  SerpApi/Exa/Brave/Keenable/Zhihu（AGENTS.md incident rule）。
 
 ---
 
@@ -479,3 +616,11 @@ mihomo 曾对 example.com 返回 502、时延约 5 秒，探针因此把两个�
 
 出口网关（mihomo）配置本身不在本仓库管理范围；要改目标路由需在网关侧处理，本仓库只提供
 应用侧这两个旋钮。代理接入的既有约定见 `docs/high-anonymity-proxy.md`。
+
+### 9.3 部署出口验证（运行手册，不进 CI）
+
+Keenable 与 Zhihu 的 `EgressPolicy` 都是 `DirectAllowed`（与 Tavily/SerpApi/Exa 一致，不含
+Brave 的 `ProxyRequired`），因此直连回退是合法候选。上线前仍应在目标运行网络做一次传输层
+可达性检查：`api.keenable.ai` 与 `developer.zhihu.com`（TLS 握手即可，不发任何 API 流量）。
+这是部署期运营者的 runbook 步骤，只针对真实运行环境，不写成 CI job、不进入自动化测试；
+测试流量仍限定 stub 上游（`mock_keenable` / `mock_zhihu`）。

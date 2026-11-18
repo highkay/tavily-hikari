@@ -126,6 +126,39 @@ changed material is stored. A `402 QUOTA_LIMITED` (or bare `402`) exhausts the k
 advertised window, while `429` is a short second-scale throttle (default 2s backoff, clamped to
 1..=30s).
 
+### Why does Keenable return 402, and how do I read its balance
+
+Keenable reports billing problems as `402 billing_error` with `insufficient_credits`; `451` is a
+client error, not exhaustion. Hikari maps the `402` to `Exhausted`: the key leaves the active
+pool until the next UTC month boundary or a manual restore.
+
+Hikari harvests the balance passively: every keyed success response carries
+`usage.credits_remaining`, persisted only on material change, with `X-RateLimit-*` headers as an
+extra signal. Keenable has no active poll, so admin `sync-usage` returns the last passive
+snapshot. Admin validation is zero-cost by design: the probe sends a search without a `query`,
+and a 400 `missing_parameter` means the key is valid while 401 means invalid.
+
+### Why do Zhihu errors arrive as HTTP 200 with a Code
+
+Zhihu's open platform answers success and failure in the same HTTP-200 envelope:
+`{Code, Message, Data}`. `Code = 0` is success and bills 1 credit; `10001` is a parameter
+error, `20001` an auth failure (missing or invalid Access Secret or timestamp), `30001` rate
+limit, `90001` a provider internal error, and an unknown non-zero code is treated as a client
+error. Only `Code = 0` settles a credit, and the client always receives the envelope. A daily
+`RemainingQuota` of 0 marks the key exhausted until the next natural day (Asia/Shanghai
+midnight), not a calendar month.
+
+### What should I check before enabling Keenable or Zhihu
+
+1. Egress: from the target network, confirm the upstream host is reachable at the transport
+   level (`api.keenable.ai` and `developer.zhihu.com`). That is an operator runbook step done
+   at deployment time, never in CI.
+2. Terms: a Zhihu Access Secret is account-level; don't rotate across personal accounts to
+   farm free quota, and verify the resale terms of the Zhihu open platform before any public
+   offering. Hikari never automates multi-account rotation.
+3. Key validation: both providers support zero-cost admin validation, so adding a key never
+   burns billable probes.
+
 ## Troubleshooting
 
 ### `/admin` does not open, or `/api/keys` returns 401

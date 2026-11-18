@@ -46,6 +46,25 @@ fallback or the upstream. A GET that tries to open an event stream on either MCP
   the upstream request and before logging, then the pooled credential is injected per provider.
 - Upstream response bodies pass through to the client unchanged apart from credential redaction.
 
+## Configuration surface
+
+Env var names and defaults are owned by the config code (`src/main.rs`); this table is the
+contract record and must stay in sync:
+
+| Env var                 | Default                       | Meaning                                              |
+| ----------------------- | ----------------------------- | ---------------------------------------------------- |
+| `KEENABLE_API_KEYS`     | unset                         | Comma-separated Keenable bootstrap keys, scoped sync |
+| `KEENABLE_UPSTREAM`     | `https://api.keenable.ai`     | Keenable REST upstream base URL (path prefix ok)     |
+| `KEENABLE_MCP_UPSTREAM` | `https://api.keenable.ai/mcp` | Full Keenable hosted MCP endpoint                    |
+| `ZHIHU_API_KEYS`        | unset                         | Comma-separated Zhihu bootstrap Access Secrets       |
+| `ZHIHU_UPSTREAM`        | `https://developer.zhihu.com` | Zhihu REST upstream base URL (path prefix ok)        |
+
+Bootstrap semantics: when one of the key lists is set, listed keys are added or revived and that
+provider's unlisted keys are soft-deleted; when unset, that provider's key rows stay untouched.
+There is no `ZHIHU_MCP_UPSTREAM`: `/zhihu/mcp` is a local facade. CLI flags mirror the env names
+(`--keenable-upstream`, `--keenable-mcp-upstream`, `--zhihu-upstream`, `--keenable-keys`,
+`--zhihu-keys`).
+
 ## Keenable REST
 
 Base URL: `https://api.keenable.ai` (default; overridable via the upstream config).
@@ -289,3 +308,18 @@ on a non-zero Zhihu `Code`.
   paths. The flip never happens on a UTC month boundary or a renewal date.
 - The Keenable `402 insufficient_credits` exhaustion flips at the UTC month boundary or on a
   manual restore, never on `NaturalDay`.
+
+## Operator runbook (never CI)
+
+- Deployment egress: before enabling either provider's keys in a deployment, verify from the
+  target network that the upstream host is reachable at the transport level (`api.keenable.ai`
+  and `developer.zhihu.com`; a plain TLS handshake check qualifies and no API traffic is
+  involved). This is an operator runbook step for the environment being deployed, never a CI job
+  and never part of automated tests.
+- Zhihu operator terms: an Access Secret is an account-level credential. The product offers
+  Zhihu to end users through the shared wallet only, never automates multi-account rotation or
+  free-tier farming, and operators must verify the resale terms of the Zhihu open platform
+  before any public offering.
+- Zero-cost validation: admin key validation uses only the free probes (Keenable missing-`query`
+  400-vs-401; Zhihu `/api/v1/quota`). Billable validation probes are forbidden by the existing
+  M13 rule.

@@ -46,6 +46,11 @@ services:
       # EXA_UPSTREAM: http://upstream-mock:8080
       # BRAVE_API_KEYS: brave-demo
       # BRAVE_UPSTREAM: http://upstream-mock:8080
+      # KEENABLE_API_KEYS: keenable-demo
+      # KEENABLE_UPSTREAM: http://upstream-mock:8080
+      # KEENABLE_MCP_UPSTREAM: http://upstream-mock:8080/mcp
+      # ZHIHU_API_KEYS: zhihu-demo
+      # ZHIHU_UPSTREAM: http://upstream-mock:8080
       ADMIN_AUTH_FORWARD_ENABLED: "true"
       FORWARD_AUTH_HEADER: Remote-Email
       FORWARD_AUTH_ADMIN_VALUE: admin@example.com

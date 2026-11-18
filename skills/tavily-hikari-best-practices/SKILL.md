@@ -23,12 +23,13 @@ Use this skill when deciding how to call Tavily Hikari from an agent workflow.
   - CLI and HTTP-style clients use `https://<your-hikari-host>/api/tavily`.
 - Keep searches narrow, save large outputs with `-o` or `--output-dir`, and cite source URLs when
   answering factual questions.
-- Do not test against Tavily production upstream unless the operator explicitly approves it; use
-  local or sandbox Hikari endpoints for smoke tests.
+- Do not test against any provider's production upstream unless the operator explicitly approves
+  it (Tavily, SerpApi, Exa, Brave, Keenable, or Zhihu); use local or sandbox Hikari endpoints
+  for smoke tests.
 
 ## Cross-Provider Comparison
 
-Hikari fronts four search providers. Each keeps its own native request shape, key pool, and
+Hikari fronts six search providers. Each keeps its own native request shape, key pool, and
 exhaustion model, so pick the provider that matches the task before writing queries.
 
 ### When to use which provider
@@ -41,6 +42,10 @@ exhaustion model, so pick the provider that matches the task before writing quer
   and synthesized answers with citations.
 - **Brave** (`/api/brave/*`) for an independent index with a privacy posture, plus the
   `/llm/context` endpoint for token-bounded context blocks.
+- **Keenable** (`/api/keenable/*`) for native-parameter web search plus page fetch with
+  `max_chars`/`live`/`prompt`, and its hosted MCP tools through `/keenable/mcp`.
+- **Zhihu** (`/api/zhihu/*`) for Chinese content: `zhihu_search` confines results to
+  zhihu.com, `global_search` covers the wider web with the `Filter` grammar.
 
 ### Credit costs
 
@@ -57,6 +62,10 @@ can consume credits a Tavily call would otherwise have used.
 | Brave    | `GET /api/brave/res/v1/web/search`  | `/brave/mcp` `brave_web_search`                             | 1                                                              |
 | Brave    | `GET /api/brave/res/v1/news/search` | `/brave/mcp` `brave_news_search`                            | 1                                                              |
 | Brave    | `GET /api/brave/res/v1/llm/context` | `/brave/mcp` `brave_llm_context`                            | 2                                                              |
+| Keenable | `POST /api/keenable/v1/search`      | `/keenable/mcp` `search_web_pages`                          | 1                                                              |
+| Keenable | `GET /api/keenable/v1/fetch`        | `/keenable/mcp` `fetch_page_content`                        | 1                                                              |
+| Zhihu    | `GET /api/zhihu/.../zhihu_search`   | `/zhihu/mcp` `zhihu_search`                                 | 1 (only when `Code == 0`)                                      |
+| Zhihu    | `GET /api/zhihu/.../global_search`  | `/zhihu/mcp` `zhihu_global_search`                          | 1 (only when `Code == 0`)                                      |
 
 Provider failures, local validation rejections, and quota-blocked requests bill zero. When the
 token wallet runs dry, Hikari answers a local `429 quota_exhausted` before any upstream call,
@@ -77,6 +86,17 @@ regardless of provider.
   quarantined rather than exhausted. `402 QUOTA_LIMITED` marks the key `exhausted` for the
   advertised month window (`X-RateLimit-Reset`, harvested passively from response headers). `429`
   arms a second-scale backoff (2 s default) and keeps the key active.
+- **Keenable**: `402 billing_error` (`insufficient_credits`) marks the key `exhausted` until the
+  next UTC month or a manual restore; `451` is a client error. `401` quarantines. `429` follows
+  `Retry-After` (or `retry_after_seconds`) with a second-scale backoff. `target_error` is a
+  client error and never marks the key. The balance is passive: `usage.credits_remaining` is
+  harvested from keyed successes and admin sync returns the last snapshot.
+- **Zhihu**: every answer is HTTP 200 with a `Code`. `20001` quarantines the Access Secret;
+  `30001` arms the rate-limit lane; `90001` is transient; `10001` and unknown codes are client
+  errors. Only `Code == 0` bills. Daily quota sync reads the free `/api/v1/quota`, and a
+  `RemainingQuota` of 0 exhausts the key until the next natural day (Asia/Shanghai midnight).
+  A Zhihu Access Secret is account-level: don't rotate across personal accounts to farm free
+  quota, and verify the resale terms of the Zhihu open platform before any public offering.
 
 ## Quick Smoke
 
