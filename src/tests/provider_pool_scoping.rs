@@ -35,7 +35,7 @@
 use super::*;
 
 use crate::backend_time::BackendTime;
-use crate::providers::ProviderId;
+use crate::providers::{ProviderId, RecoveryPolicy};
 
 fn utc_ts(rfc3339: &str) -> chrono::DateTime<Utc> {
     chrono::DateTime::parse_from_rfc3339(rfc3339)
@@ -463,8 +463,13 @@ async fn zhihu_natural_day_recovery_flips_only_at_quota_renews_at() {
         .expect("zhihu reset before midnight");
     assert_eq!(key_status(&store.pool, "zh-day-a").await, "exhausted");
 
+    let due_key_id = key_id(&store.pool, "zh-day-a").await;
+    let later_key_id = key_id(&store.pool, "zh-day-later").await;
+    assert_eq!(restore_audit_rows(&store.pool, &due_key_id).await, 0);
+
     // At the daily boundary (`<=` boundary): the due key flips, the later
-    // key does not.
+    // key does not, and the flip writes the auto_restore_active audit row
+    // (keenable-integration todo 11).
     clock.set_now_utc(utc_ts("2026-11-17T16:00:00Z"));
     store
         .reset_monthly(ProviderId::Zhihu)
@@ -472,6 +477,25 @@ async fn zhihu_natural_day_recovery_flips_only_at_quota_renews_at() {
         .expect("zhihu reset at midnight");
     assert_eq!(key_status(&store.pool, "zh-day-a").await, "active");
     assert_eq!(key_status(&store.pool, "zh-day-later").await, "exhausted");
+    let (operation, reason, status_before, status_after): (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT operation_code, reason_code, status_before, status_after \
+         FROM api_key_maintenance_records WHERE key_id = ? \
+         ORDER BY created_at DESC, rowid DESC LIMIT 1",
+    )
+    .bind(&due_key_id)
+    .fetch_one(&store.pool)
+    .await
+    .expect("natural-day restore audit row");
+    assert_eq!(operation, MAINTENANCE_OP_AUTO_RESTORE_ACTIVE);
+    assert_eq!(reason.as_deref(), Some("natural_day_recovery"));
+    assert_eq!(status_before.as_deref(), Some("exhausted"));
+    assert_eq!(status_after.as_deref(), Some("active"));
+    assert_eq!(restore_audit_rows(&store.pool, &later_key_id).await, 0);
 
     // A UTC MONTH boundary never flips the not-yet-due Zhihu key (GAP-4),
     // while the Keenable (UtcMonth) sibling recovers on the same flip.
@@ -486,6 +510,418 @@ async fn zhihu_natural_day_recovery_flips_only_at_quota_renews_at() {
         .await
         .expect("keenable reset at month boundary");
     assert_eq!(key_status(&store.pool, "ken-month-a").await, "active");
+}
+
+async fn restore_audit_rows(pool: &sqlx::SqlitePool, key_id: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM api_key_maintenance_records \
+         WHERE key_id = ? AND operation_code = ?",
+    )
+    .bind(key_id)
+    .bind(MAINTENANCE_OP_AUTO_RESTORE_ACTIVE)
+    .fetch_one(pool)
+    .await
+    .expect("restore audit row count")
+}
+
+async fn depletion_rows(pool: &sqlx::SqlitePool) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM api_key_low_quota_depletions")
+        .fetch_one(pool)
+        .await
+        .expect("depletion row count")
+}
+
+/// Zhihu quota sample (keenable-integration todo 11): a `RemainingQuota=0`
+/// snapshot marks the key exhausted and anchors `quota_renews_at` at the
+/// NEXT Asia/Shanghai midnight. One second before it stays exhausted; at the
+/// boundary the sweep flips it and writes the audit row. The sample seam is
+/// NaturalDay-only and never writes `api_key_low_quota_depletions`.
+#[tokio::test]
+async fn zhihu_quota_sample_zero_exhausts_until_next_shanghai_midnight() {
+    let db_path = temp_db_path("zhihu-natural-day-sample");
+    let db_str = db_path.to_string_lossy().to_string();
+    let start = utc_ts("2026-11-17T09:30:00Z");
+    let (backend_time, clock) = BackendTime::manual(start);
+    let proxy = TavilyProxy::with_providers_and_time_in_ha_mode(
+        Vec::<String>::new(),
+        "http://127.0.0.1:9",
+        &db_str,
+        TavilyProxyOptions::from_database_path(&db_str),
+        ProviderBootstrap::default(),
+        backend_time,
+        HaMode::Single,
+    )
+    .await
+    .expect("proxy");
+    let secret = "zh-quota-zero";
+    seed_provider_keys(&proxy.key_store, ProviderId::Zhihu, &[secret.to_string()]).await;
+    let zhihu_key_id = key_id(&proxy.key_store.pool, secret).await;
+
+    // Next Asia/Shanghai midnight after 2026-11-17T09:30Z is
+    // 2026-11-18T00:00:00+08:00 = 2026-11-17T16:00:00Z.
+    let renews_at = RecoveryPolicy::natural_day_renews_at(start.timestamp());
+    assert_eq!(renews_at, utc_ts("2026-11-17T16:00:00Z").timestamp());
+    let effect = proxy
+        .record_provider_quota_sample(
+            ProviderId::Zhihu,
+            &zhihu_key_id,
+            5_000,
+            0,
+            renews_at,
+            "quota_sync/zhihu",
+        )
+        .await
+        .expect("zero quota sample");
+    assert_eq!(effect.code, KEY_EFFECT_MARKED_EXHAUSTED);
+    assert_eq!(key_status(&proxy.key_store.pool, secret).await, "exhausted");
+    let (remaining, stored_renews): (Option<i64>, Option<i64>) =
+        sqlx::query_as("SELECT quota_remaining, quota_renews_at FROM api_keys WHERE id = ?")
+            .bind(&zhihu_key_id)
+            .fetch_one(&proxy.key_store.pool)
+            .await
+            .expect("quota sample row");
+    assert_eq!(remaining, Some(0));
+    assert_eq!(stored_renews, Some(renews_at));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM api_key_maintenance_records \
+             WHERE key_id = ? AND operation_code = ?",
+        )
+        .bind(&zhihu_key_id)
+        .bind(MAINTENANCE_OP_AUTO_MARK_EXHAUSTED)
+        .fetch_one(&proxy.key_store.pool)
+        .await
+        .expect("mark audit row count"),
+        1
+    );
+    assert_eq!(depletion_rows(&proxy.key_store.pool).await, 0);
+
+    // One second before the boundary: still exhausted, no audit row.
+    clock.set_now_utc(utc_ts("2026-11-17T15:59:59Z"));
+    proxy
+        .key_store
+        .reset_monthly(ProviderId::Zhihu)
+        .await
+        .expect("pre-midnight reset");
+    assert_eq!(key_status(&proxy.key_store.pool, secret).await, "exhausted");
+    assert_eq!(
+        restore_audit_rows(&proxy.key_store.pool, &zhihu_key_id).await,
+        0
+    );
+
+    // At the boundary the sweep flips it and writes auto_restore_active.
+    clock.set_now_utc(utc_ts("2026-11-17T16:00:00Z"));
+    proxy
+        .key_store
+        .reset_monthly(ProviderId::Zhihu)
+        .await
+        .expect("midnight reset");
+    assert_eq!(key_status(&proxy.key_store.pool, secret).await, "active");
+    assert_eq!(
+        restore_audit_rows(&proxy.key_store.pool, &zhihu_key_id).await,
+        1
+    );
+    assert_eq!(depletion_rows(&proxy.key_store.pool).await, 0);
+
+    // A later zero sample re-exhausts the key against the NEXT midnight; a
+    // positive sample then restores it immediately (the day already turned).
+    let following_midnight =
+        RecoveryPolicy::natural_day_renews_at(utc_ts("2026-11-17T16:00:01Z").timestamp());
+    proxy
+        .record_provider_quota_sample(
+            ProviderId::Zhihu,
+            &zhihu_key_id,
+            5_000,
+            0,
+            following_midnight,
+            "quota_sync/zhihu",
+        )
+        .await
+        .expect("later zero sample");
+    assert_eq!(key_status(&proxy.key_store.pool, secret).await, "exhausted");
+    proxy
+        .record_provider_quota_sample(
+            ProviderId::Zhihu,
+            &zhihu_key_id,
+            5_000,
+            3,
+            following_midnight,
+            "quota_sync/zhihu",
+        )
+        .await
+        .expect("positive sample");
+    assert_eq!(key_status(&proxy.key_store.pool, secret).await, "active");
+    assert_eq!(
+        restore_audit_rows(&proxy.key_store.pool, &zhihu_key_id).await,
+        2
+    );
+    assert_eq!(depletion_rows(&proxy.key_store.pool).await, 0);
+}
+
+/// Keenable `402` exhaustion (keenable-integration todo 11): the classifier
+/// feeds `reconcile_key_health`, the key stays exhausted through the current
+/// UTC month and flips on the month boundary or a manual restore. A
+/// `target_error` never marks the key. Zero depletion rows in every case.
+#[tokio::test]
+async fn keenable_402_exhausts_until_utc_month_and_target_errors_do_not_mark() {
+    let db_path = temp_db_path("keenable-month-health");
+    let db_str = db_path.to_string_lossy().to_string();
+    let (backend_time, clock) = BackendTime::manual(utc_ts("2026-11-17T09:30:00Z"));
+    let proxy = TavilyProxy::with_providers_and_time_in_ha_mode(
+        Vec::<String>::new(),
+        "http://127.0.0.1:9",
+        &db_str,
+        TavilyProxyOptions::from_database_path(&db_str),
+        ProviderBootstrap::default(),
+        backend_time,
+        HaMode::Single,
+    )
+    .await
+    .expect("proxy");
+    let exhausted_secret = "ken-402";
+    let target_secret = "ken-target";
+    seed_provider_keys(
+        &proxy.key_store,
+        ProviderId::Keenable,
+        &[exhausted_secret.to_string(), target_secret.to_string()],
+    )
+    .await;
+    let exhausted_key_id = key_id(&proxy.key_store.pool, exhausted_secret).await;
+    let target_key_id = key_id(&proxy.key_store.pool, target_secret).await;
+
+    let request = ProviderRestFacadeRequest {
+        provider: ProviderId::Keenable,
+        method: Method::POST,
+        path: "/api/keenable/search".to_string(),
+        kind_path: "/api/keenable/search",
+        upstream_path: "/v1/search",
+        query: None,
+        headers: HeaderMap::new(),
+        body: br#"{"query":"mock"}"#.to_vec(),
+        auth_token_id: None,
+        upstream_operation: "keenable_http_search",
+        client_ip: None,
+    };
+    let sanitized = SanitizedHeaders {
+        headers: HeaderMap::new(),
+        forwarded: Vec::new(),
+        dropped: Vec::new(),
+    };
+
+    let exhausted_lease = ApiKeyLease {
+        id: exhausted_key_id.clone(),
+        secret: exhausted_secret.to_string(),
+    };
+    let billing_body = br#"{"type":"billing_error","code":"insufficient_credits"}"#.as_slice();
+    let billing_signal = classify_provider_failure(
+        ProviderId::Keenable,
+        &ProviderFailureEvidence {
+            status: 402,
+            headers: None,
+            body: billing_body,
+        },
+    );
+    assert_eq!(billing_signal, ProviderFailureSignal::Exhausted);
+    let ctx = ProviderFacadeAttemptContext {
+        request: &request,
+        lease: &exhausted_lease,
+        sanitized_headers: &sanitized,
+        status: StatusCode::PAYMENT_REQUIRED,
+        body_bytes: billing_body,
+        signal: billing_signal,
+        retry_marker: ProviderFacadeRetryMarker::NotInChain,
+    };
+    let effect = proxy
+        .record_keenable_rest_facade_attempt(&ctx)
+        .await
+        .expect("keenable 402 record path");
+    assert_eq!(effect.key_effect.code, KEY_EFFECT_MARKED_EXHAUSTED);
+    assert_eq!(
+        key_status(&proxy.key_store.pool, exhausted_secret).await,
+        "exhausted"
+    );
+
+    let target_lease = ApiKeyLease {
+        id: target_key_id.clone(),
+        secret: target_secret.to_string(),
+    };
+    let target_body = br#"{"type":"target_error","code":"target_blocked"}"#.as_slice();
+    let target_signal = classify_provider_failure(
+        ProviderId::Keenable,
+        &ProviderFailureEvidence {
+            status: 403,
+            headers: None,
+            body: target_body,
+        },
+    );
+    assert_eq!(target_signal, ProviderFailureSignal::ClientError);
+    let target_ctx = ProviderFacadeAttemptContext {
+        request: &request,
+        lease: &target_lease,
+        sanitized_headers: &sanitized,
+        status: StatusCode::FORBIDDEN,
+        body_bytes: target_body,
+        signal: target_signal,
+        retry_marker: ProviderFacadeRetryMarker::NotInChain,
+    };
+    let effect = proxy
+        .record_keenable_rest_facade_attempt(&target_ctx)
+        .await
+        .expect("keenable target_error record path");
+    assert_eq!(effect.key_effect.code, KEY_EFFECT_NONE);
+    assert_eq!(
+        key_status(&proxy.key_store.pool, target_secret).await,
+        "active",
+        "a target_error never marks the key"
+    );
+    assert_eq!(depletion_rows(&proxy.key_store.pool).await, 0);
+
+    // The current UTC month keeps the 402 key down; the month boundary flips it.
+    proxy
+        .key_store
+        .reset_monthly(ProviderId::Keenable)
+        .await
+        .expect("same-month reset");
+    assert_eq!(
+        key_status(&proxy.key_store.pool, exhausted_secret).await,
+        "exhausted"
+    );
+    clock.set_now_utc(utc_ts("2026-12-01T00:00:01Z"));
+    proxy
+        .key_store
+        .reset_monthly(ProviderId::Keenable)
+        .await
+        .expect("utc month reset");
+    assert_eq!(
+        key_status(&proxy.key_store.pool, exhausted_secret).await,
+        "active"
+    );
+
+    // A 402 in the new month stays down until a manual restore.
+    let fresh_ctx = ProviderFacadeAttemptContext {
+        request: &request,
+        lease: &exhausted_lease,
+        sanitized_headers: &sanitized,
+        status: StatusCode::PAYMENT_REQUIRED,
+        body_bytes: billing_body,
+        signal: billing_signal,
+        retry_marker: ProviderFacadeRetryMarker::NotInChain,
+    };
+    proxy
+        .record_keenable_rest_facade_attempt(&fresh_ctx)
+        .await
+        .expect("new-month 402");
+    proxy
+        .key_store
+        .reset_monthly(ProviderId::Keenable)
+        .await
+        .expect("same-new-month reset");
+    assert_eq!(
+        key_status(&proxy.key_store.pool, exhausted_secret).await,
+        "exhausted"
+    );
+    assert!(
+        proxy
+            .key_store
+            .restore_active_status_by_id(&exhausted_key_id)
+            .await
+            .expect("manual restore")
+    );
+    assert_eq!(
+        key_status(&proxy.key_store.pool, exhausted_secret).await,
+        "active"
+    );
+    assert_eq!(depletion_rows(&proxy.key_store.pool).await, 0);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM api_key_quarantines WHERE key_id = ? AND cleared_at IS NULL",
+        )
+        .bind(&target_key_id)
+        .fetch_one(&proxy.key_store.pool)
+        .await
+        .expect("target quarantine count"),
+        0,
+        "neither target_error nor 402 quarantines"
+    );
+}
+
+/// Zhihu `Code=20001` (keenable-integration todo 11): the classifier signal
+/// feeds the existing quarantine machinery through the REST record path, and
+/// the new provider never writes `api_key_low_quota_depletions` (M8).
+#[tokio::test]
+async fn zhihu_code_20001_quarantines_without_depletion_rows() {
+    let db_path = temp_db_path("zhihu-auth-quarantine");
+    let db_str = db_path.to_string_lossy().to_string();
+    let (backend_time, _clock) = BackendTime::manual(utc_ts("2026-11-17T09:30:00Z"));
+    let proxy = TavilyProxy::with_providers_and_time_in_ha_mode(
+        Vec::<String>::new(),
+        "http://127.0.0.1:9",
+        &db_str,
+        TavilyProxyOptions::from_database_path(&db_str),
+        ProviderBootstrap::default(),
+        backend_time,
+        HaMode::Single,
+    )
+    .await
+    .expect("proxy");
+    let secret = "zh-auth-dead";
+    seed_provider_keys(&proxy.key_store, ProviderId::Zhihu, &[secret.to_string()]).await;
+    let zhihu_key_id = key_id(&proxy.key_store.pool, secret).await;
+    let lease = ApiKeyLease {
+        id: zhihu_key_id.clone(),
+        secret: secret.to_string(),
+    };
+    let request = ProviderRestFacadeRequest {
+        provider: ProviderId::Zhihu,
+        method: Method::GET,
+        path: "/api/zhihu/api/v1/content/zhihu_search".to_string(),
+        kind_path: "/api/v1/content/zhihu_search",
+        upstream_path: "/api/v1/content/zhihu_search",
+        query: Some("Query=AI".to_string()),
+        headers: HeaderMap::new(),
+        body: Vec::new(),
+        auth_token_id: None,
+        upstream_operation: "zhihu_http_zhihu_search",
+        client_ip: None,
+    };
+    let sanitized = SanitizedHeaders {
+        headers: HeaderMap::new(),
+        forwarded: Vec::new(),
+        dropped: Vec::new(),
+    };
+    let body = br#"{"Code":20001,"Message":"Authorization failed","Data":null}"#.as_slice();
+    let signal = classify_provider_failure(
+        ProviderId::Zhihu,
+        &ProviderFailureEvidence {
+            status: 200,
+            headers: None,
+            body,
+        },
+    );
+    assert_eq!(signal, ProviderFailureSignal::AuthFailed);
+    let ctx = ProviderFacadeAttemptContext {
+        request: &request,
+        lease: &lease,
+        sanitized_headers: &sanitized,
+        status: StatusCode::OK,
+        body_bytes: body,
+        signal,
+        retry_marker: ProviderFacadeRetryMarker::NotInChain,
+    };
+    let effect = proxy
+        .record_zhihu_rest_facade_attempt(&ctx)
+        .await
+        .expect("zhihu auth record path");
+    assert_eq!(effect.key_effect.code, KEY_EFFECT_QUARANTINED);
+    let reason: Option<String> = sqlx::query_scalar(
+        "SELECT reason_code FROM api_key_quarantines WHERE key_id = ? AND cleared_at IS NULL",
+    )
+    .bind(&zhihu_key_id)
+    .fetch_optional(&proxy.key_store.pool)
+    .await
+    .expect("zhihu quarantine lookup");
+    assert_eq!(reason.as_deref(), Some(BLOCKED_KEY_REASON_INVALID_API_KEY));
+    assert_eq!(depletion_rows(&proxy.key_store.pool).await, 0);
 }
 
 /// Exa SuccessOnly recovery: exhausted Exa keys cross calendar boundaries

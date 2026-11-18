@@ -6,8 +6,8 @@
 //!   EXISTING `reconcile_key_health` machinery applies the acceptance health
 //!   actions (401 / credentials_forbidden auth-fail -> quarantine row, 402
 //!   billing_error/insufficient_credits -> exhausted, 429 -> transient backoff
-//!   on the shared HTTP scope sized by the generic Retry-After lane until
-//!   todo 11 lands the keenable-specific sizing; target_error/target_blocked
+//!   on the shared HTTP scope sized by the todo-11 second-scale lane (60s
+//!   default, 5..=300 clamp); target_error/target_blocked
 //!   and every other client-shaped envelope NEVER marks the key);
 //! * request_logs persistence (provider stamp, legacy `tavily_status_code`
 //!   column carries the upstream status, bodies per retention profile with
@@ -226,10 +226,9 @@ impl TavilyProxy {
 
         // 429 rate_limit_error (todo-3 RateLimited - Keenable has no
         // exhaustion-flavored 429): arm the shared HTTP backoff scope that
-        // provider-scoped acquisition avoids. Sizing runs the generic
-        // Retry-After lane (Retry-After / retry_after_seconds through the
-        // shared ladder clamp) until todo 11 lands the keenable-specific
-        // second-scale sizing on the same scope.
+        // provider-scoped acquisition avoids. Sizing runs the todo-11
+        // second-scale lane (Retry-After / retry_after_seconds, 60s default,
+        // 5..=300 clamp) on the same scope.
         let armed_backoff = match ctx.signal {
             ProviderFailureSignal::RateLimited { .. } => {
                 let now = self.backend_time.now_ts();

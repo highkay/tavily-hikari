@@ -269,6 +269,38 @@ fn brave_second_scale_and_exa_minute_ladder_pins_unchanged() {
     );
 }
 
+/// Keenable/Zhihu second-scale lanes (keenable-integration todo 11): a
+/// missing Retry-After defaults to 60s and every value clamps to 5..=300.
+#[test]
+fn keenable_and_zhihu_rate_limited_backoff_is_second_scale_5_to_300() {
+    for provider in [ProviderId::Keenable, ProviderId::Zhihu] {
+        assert_eq!(
+            TavilyProxy::effective_provider_rate_limited_backoff_secs(
+                provider,
+                ProviderFailureSignal::RateLimited {
+                    retry_after_secs: None
+                },
+                0,
+            ),
+            Some(60),
+            "{provider} second-scale default"
+        );
+        for (retry_after, expected) in [(Some(1), 5), (Some(45), 45), (Some(900), 300)] {
+            assert_eq!(
+                TavilyProxy::effective_provider_rate_limited_backoff_secs(
+                    provider,
+                    ProviderFailureSignal::RateLimited {
+                        retry_after_secs: retry_after
+                    },
+                    0,
+                ),
+                Some(expected),
+                "{provider} retry_after={retry_after:?}"
+            );
+        }
+    }
+}
+
 /// Arm→success semantics per provider on the shared scope: the 429 row shape
 /// the goldens pin (scope http_global, reason upstream_rate_limited_429,
 /// per-provider sizing) expires by cooldown and is NOT cleared by the

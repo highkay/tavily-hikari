@@ -50,8 +50,8 @@ pub use proxy_provider_facade_brave::{BraveFacadeOutcome, brave_facade_outcome};
 // bookkeeping contract over the todo-3 keenable classifier — 402
 // billing_error/insufficient_credits exhausts, 401/credentials auth-fails
 // into quarantine, target_error/target_blocked stays a client error that
-// never marks the key, 429 arms the shared HTTP backoff scope (generic
-// Retry-After lane until todo 11's keenable-specific sizing) — PLUS the
+// never marks the key, 429 arms the shared HTTP backoff scope (todo-11
+// second-scale sizing: 60s default, 5..=300 clamp) — PLUS the
 // todo-7 PASSIVE CREDIT HARVEST that persists usage.credits_remaining
 // through the no-limit quota-sample seam with source `keenable_passive`
 // (best-effort, material-change-only, zero extra requests; the live key

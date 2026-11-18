@@ -7,6 +7,32 @@ use crate::providers::{
 
 /// Display, the SQLTEXT helper `as_str`, and FromStr must agree on one stable
 /// lowercase key per provider (the DB/wire spelling).
+/// `NaturalDay` hands the next Asia/Shanghai midnight to `quota_renews_at`
+/// (keenable-integration todo 11). The boundary is strictly after the sample
+/// instant, so a zero sample taken at exactly midnight waits a full day.
+#[test]
+fn natural_day_renews_at_is_the_next_shanghai_midnight() {
+    let ts = |value: &str| {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .expect("valid rfc3339 fixture")
+            .timestamp()
+    };
+    assert_eq!(
+        RecoveryPolicy::natural_day_renews_at(ts("2026-11-17T09:30:00Z")),
+        ts("2026-11-17T16:00:00Z"),
+        "09:30Z = 17:30 Asia/Shanghai -> 2026-11-18T00:00+08:00"
+    );
+    assert_eq!(
+        RecoveryPolicy::natural_day_renews_at(ts("2026-11-17T15:59:59Z")),
+        ts("2026-11-17T16:00:00Z")
+    );
+    assert_eq!(
+        RecoveryPolicy::natural_day_renews_at(ts("2026-11-17T16:00:00Z")),
+        ts("2026-11-18T16:00:00Z"),
+        "exactly at midnight -> the following midnight"
+    );
+}
+
 #[test]
 fn provider_id_display_from_str_roundtrip_all_four() {
     // Given: every provider and its canonical lowercase key.

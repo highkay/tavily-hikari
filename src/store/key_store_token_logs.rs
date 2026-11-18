@@ -1435,8 +1435,11 @@ impl KeyStore {
     /// - `SuccessOnly` (Exa): NO calendar flip at all; recovery happens via
     ///   `restore_active_status` on the next successful call or manual admin
     ///   restore.
-    /// - `NaturalDay` (Zhihu): same renewal-date flip as `RenewalDate`,
-    ///   never a UTC month boundary.
+    /// - `NaturalDay` (Zhihu; keenable-integration todo 11): exhausted ->
+    ///   active only at the per-key `quota_renews_at` (the NEXT Asia/Shanghai
+    ///   midnight, epoch seconds), never at a UTC month boundary; each flip
+    ///   writes the `auto_restore_active` audit row. Keenable keeps the
+    ///   `UtcMonth` branch above and never reaches this policy.
     pub(crate) async fn reset_monthly(
         &self,
         provider: crate::providers::ProviderId,
@@ -1468,9 +1471,13 @@ impl KeyStore {
                 .execute(&self.pool)
                 .await?;
             }
-            crate::providers::RecoveryPolicy::RenewalDate
-            | crate::providers::RecoveryPolicy::NaturalDay => {
+            crate::providers::RecoveryPolicy::RenewalDate => {
+                // SerpApi keeps the pre-todo-11 bulk UPDATE; its audit row is
+                // written by the snapshot-scoped quota-sync adapter.
                 self.recover_keys_by_renewal_date(provider, now_ts).await?;
+            }
+            crate::providers::RecoveryPolicy::NaturalDay => {
+                self.recover_natural_day_keys(provider, now_ts).await?;
             }
             crate::providers::RecoveryPolicy::SuccessOnly => {}
         }

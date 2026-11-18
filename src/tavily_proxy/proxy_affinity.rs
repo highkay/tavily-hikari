@@ -13,6 +13,12 @@ const BRAVE_RATE_LIMITED_BACKOFF_MAX_SECS: i64 = 30;
 /// SerpApi's dual 429 is exhaustion, never this lane.
 const SERPAPI_RATE_LIMITED_BACKOFF_DEFAULT_SECS: i64 = 3600;
 const SERPAPI_RATE_LIMITED_BACKOFF_MAX_SECS: i64 = 3600;
+/// Keenable/Zhihu RateLimited lanes (keenable-integration todo 11): both
+/// upstreams are second-scale, so a missing Retry-After defaults to one
+/// minute and every value clamps to 5..=300 seconds.
+const PROVIDER_RATE_LIMITED_BACKOFF_DEFAULT_SECS: i64 = 60;
+const PROVIDER_RATE_LIMITED_BACKOFF_MIN_SECS: i64 = 5;
+const PROVIDER_RATE_LIMITED_BACKOFF_MAX_SECS: i64 = 300;
 /// Auth-block family transient backoff range (plan provider-key-429-retry todo
 /// 2): a bare 401/403 block is key-scoped and outlives the minute-scale
 /// rate-limit ladder, so the family keeps its 120s no-Retry-After base
@@ -347,6 +353,19 @@ impl TavilyProxy {
                         secs.clamp(
                             MCP_SESSION_INIT_BACKOFF_MIN_SECS,
                             SERPAPI_RATE_LIMITED_BACKOFF_MAX_SECS,
+                        )
+                    }),
+            ),
+            // Keenable 429 rate_limit_error / Zhihu Code=30001
+            // (keenable-integration todo 11): second-scale default 60s,
+            // Retry-After honored inside the 5..=300 clamp.
+            providers::ProviderId::Keenable | providers::ProviderId::Zhihu => Some(
+                retry_after_secs
+                    .and_then(|secs| i64::try_from(secs).ok())
+                    .map_or(PROVIDER_RATE_LIMITED_BACKOFF_DEFAULT_SECS, |secs| {
+                        secs.clamp(
+                            PROVIDER_RATE_LIMITED_BACKOFF_MIN_SECS,
+                            PROVIDER_RATE_LIMITED_BACKOFF_MAX_SECS,
                         )
                     }),
             ),
@@ -1624,6 +1643,116 @@ impl TavilyProxy {
                 ))
             }
         }
+    }
+
+    /// Records one provider quota sample and applies its NaturalDay health
+    /// (keenable-integration todo 11; the todo-12 Zhihu adapter calls this
+    /// after parsing `/api/v1/quota`).
+    ///
+    /// `NaturalDay` providers are the only accepted callers: Keenable's
+    /// prepaid balance and every other lane keep their own recovery owner. The
+    /// snapshot is persisted first (sample row, live quota fields, and the
+    /// caller-supplied `quota_renews_at` anchor = the next Asia/Shanghai
+    /// midnight), then a zero-remaining sample marks the key exhausted while a
+    /// positive sample on an exhausted key restores it immediately: the
+    /// natural day already turned, and waiting for the sweep would strand the
+    /// key behind the freshly advanced renewal anchor. Both transitions carry
+    /// the same `auto_*` audit rows as the request-path reconcile, and neither
+    /// ever writes `api_key_low_quota_depletions` (M8).
+    // The todo-12 Zhihu quota adapter is the production caller of this seam.
+    #[allow(dead_code)]
+    pub(crate) async fn record_provider_quota_sample(
+        &self,
+        provider: providers::ProviderId,
+        key_id: &str,
+        limit: i64,
+        remaining: i64,
+        renews_at: i64,
+        source: &str,
+    ) -> Result<KeyEffect, ProxyError> {
+        if providers::spec_for(provider).recovery != providers::RecoveryPolicy::NaturalDay {
+            return Err(ProxyError::Other(format!(
+                "provider {provider} does not use natural-day quota recovery"
+            )));
+        }
+        let now = self.backend_time.now_ts();
+        self.key_store
+            .record_quota_sync_sample(key_id, limit, remaining, now, source)
+            .await?;
+        self.key_store
+            .update_provider_key_quota(key_id, limit, remaining, Some(renews_at), now)
+            .await?;
+        let before = self.key_store.fetch_key_state_snapshot(key_id).await?;
+
+        if remaining > 0 {
+            let changed = self.key_store.restore_active_status_by_id(key_id).await?;
+            if !changed {
+                return Ok(KeyEffect::none());
+            }
+            let after = self.key_store.fetch_key_state_snapshot(key_id).await?;
+            self.key_store
+                .insert_api_key_maintenance_record(ApiKeyMaintenanceRecord {
+                    id: nanoid!(12),
+                    key_id: key_id.to_string(),
+                    source: MAINTENANCE_SOURCE_SYSTEM.to_string(),
+                    operation_code: MAINTENANCE_OP_AUTO_RESTORE_ACTIVE.to_string(),
+                    operation_summary: "自动恢复为 active".to_string(),
+                    reason_code: Some("natural_day_quota_recovered".to_string()),
+                    reason_summary: Some("自然日额度快照恢复".to_string()),
+                    reason_detail: Some(format!(
+                        "source={source} quota_remaining={remaining} quota_renews_at={renews_at}"
+                    )),
+                    request_log_id: None,
+                    auth_token_log_id: None,
+                    auth_token_id: None,
+                    actor_user_id: None,
+                    actor_display_name: None,
+                    status_before: before.status,
+                    status_after: after.status,
+                    quarantine_before: before.quarantined,
+                    quarantine_after: after.quarantined,
+                    created_at: now,
+                })
+                .await?;
+            return Ok(KeyEffect::new(
+                KEY_EFFECT_RESTORED_ACTIVE,
+                "The system automatically restored this exhausted key to active",
+            ));
+        }
+
+        let changed = self.key_store.mark_quota_exhausted_by_id(key_id).await?;
+        if !changed {
+            return Ok(KeyEffect::none());
+        }
+        let after = self.key_store.fetch_key_state_snapshot(key_id).await?;
+        self.key_store
+            .insert_api_key_maintenance_record(ApiKeyMaintenanceRecord {
+                id: nanoid!(12),
+                key_id: key_id.to_string(),
+                source: MAINTENANCE_SOURCE_SYSTEM.to_string(),
+                operation_code: MAINTENANCE_OP_AUTO_MARK_EXHAUSTED.to_string(),
+                operation_summary: "自动标记为 exhausted".to_string(),
+                reason_code: Some("quota_exhausted".to_string()),
+                reason_summary: Some("自然日额度耗尽".to_string()),
+                reason_detail: Some(format!(
+                    "source={source} quota_remaining=0 quota_renews_at={renews_at}"
+                )),
+                request_log_id: None,
+                auth_token_log_id: None,
+                auth_token_id: None,
+                actor_user_id: None,
+                actor_display_name: None,
+                status_before: before.status,
+                status_after: after.status,
+                quarantine_before: before.quarantined,
+                quarantine_after: after.quarantined,
+                created_at: now,
+            })
+            .await?;
+        Ok(KeyEffect::new(
+            KEY_EFFECT_MARKED_EXHAUSTED,
+            "The system automatically marked this key as exhausted",
+        ))
     }
 
     pub(crate) async fn clear_transient_backoffs_after_success(

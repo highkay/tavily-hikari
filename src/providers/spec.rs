@@ -45,6 +45,21 @@ pub enum RecoveryPolicy {
     NaturalDay,
 }
 
+impl RecoveryPolicy {
+    /// Epoch seconds of the NEXT Asia/Shanghai midnight strictly after
+    /// `now_ts` — the `quota_renews_at` handoff for `NaturalDay`
+    /// (keenable-integration todo 11). Asia/Shanghai is a fixed UTC+8 offset
+    /// (no DST), so this is pure arithmetic on the injected backend clock and
+    /// never consults the host timezone.
+    pub fn natural_day_renews_at(now_ts: i64) -> i64 {
+        const SHANGHAI_OFFSET_SECS: i64 = 8 * 60 * 60;
+        const SECS_PER_DAY: i64 = 24 * 60 * 60;
+        let shifted = now_ts + SHANGHAI_OFFSET_SECS;
+        let next_local_midnight = (shifted.div_euclid(SECS_PER_DAY) + 1) * SECS_PER_DAY;
+        next_local_midnight - SHANGHAI_OFFSET_SECS
+    }
+}
+
 /// Whether a provider's upstream can be reached through the synthetic
 /// `__direct__` egress at all.
 ///

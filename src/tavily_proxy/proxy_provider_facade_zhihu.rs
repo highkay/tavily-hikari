@@ -192,8 +192,8 @@ impl TavilyProxy {
 
         // `Code=30001` is throughput, never exhaustion: arm the shared HTTP
         // backoff scope that provider-scoped acquisition avoids. The code
-        // carries no Retry-After, so the second-scale default (60s, clamped
-        // 30..300 by the shared helper) applies.
+        // carries no Retry-After, so the todo-11 second-scale lane (60s
+        // default, 5..=300 clamp) applies.
         let armed_backoff = match ctx.signal {
             ProviderFailureSignal::RateLimited { .. } => {
                 let now = self.backend_time.now_ts();
