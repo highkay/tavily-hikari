@@ -457,6 +457,27 @@ async fn run_manual_key_quota_sync_with_outcome(
                 },
             ))
         }
+        ProviderId::Keenable => {
+            // Passive credit harvest (keenable-integration todo 12): return
+            // the last persisted `usage.credits_remaining` snapshot. Never a
+            // live call — Keenable has no balance API Hikari may poll.
+            Ok(ManualKeyQuotaSyncOutcome::ProviderSnapshot(
+                ProviderQuotaSyncSnapshot {
+                    source: "passive",
+                    provider,
+                    quota_limit: metrics.as_ref().and_then(|metric| metric.quota_limit),
+                    quota_remaining: metrics.as_ref().and_then(|metric| metric.quota_remaining),
+                    quota_renews_at: metrics.as_ref().and_then(|metric| metric.quota_renews_at),
+                    quota_synced_at: metrics.as_ref().and_then(|metric| metric.quota_synced_at),
+                },
+            ))
+        }
+        ProviderId::Zhihu => {
+            // Active daily adapter (keenable-integration todo 12): the free
+            // `/api/v1/quota` read through the shared lease + per-key egress.
+            let snapshot = sync_zhihu_key_quota(state.as_ref(), key_id).await?;
+            Ok(ManualKeyQuotaSyncOutcome::ProviderSnapshot(snapshot))
+        }
         ProviderId::Exa => Err(ManualQuotaSyncError::new(
             StatusCode::CONFLICT,
             "sync_unsupported",
@@ -464,16 +485,6 @@ async fn run_manual_key_quota_sync_with_outcome(
                 .to_string(),
         )
         .with_provider(ProviderId::Exa)),
-        // Typed todo-2 boundary (todo 12 replaces it): Keenable returns its
-        // last passive snapshot and Zhihu runs the live /api/v1/quota read
-        // once the quota adapter lands. Until then the sync is a typed 501
-        // sync_pending — never a live call, never a snapshot, never a key mark.
-        ProviderId::Keenable | ProviderId::Zhihu => Err(ManualQuotaSyncError::new(
-            StatusCode::NOT_IMPLEMENTED,
-            "sync_pending",
-            format!("{provider} quota sync is not wired yet"),
-        )
-        .with_provider(provider)),
     }
 }
 
@@ -590,6 +601,92 @@ async fn sync_serpapi_key_quota(
 /// Bound for the serpapi /account fetch; /account is free but must not stall
 /// the admin request beyond the legacy job-timeout scale.
 const PROVIDER_QUOTA_SYNC_TIMEOUT_SECS: u64 = 20;
+
+/// Zhihu live `/api/v1/quota` sync (keenable-integration todo 12). Free, so
+/// the manual probe never bills. The parsed snapshot runs through the SAME
+/// `NaturalDay` handoff as the scheduled lane, so a manual sync can also
+/// restore an exhausted key when the day already turned.
+async fn sync_zhihu_key_quota(
+    state: &AppState,
+    key_id: &str,
+) -> Result<ProviderQuotaSyncSnapshot, ManualQuotaSyncError> {
+    let api_key = state
+        .proxy
+        .get_api_key_secret(key_id)
+        .await
+        .map_err(|err| {
+            ManualQuotaSyncError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "sync_failed",
+                err.to_string(),
+            )
+        })?
+        .ok_or_else(|| {
+            ManualQuotaSyncError::new(
+                StatusCode::NOT_FOUND,
+                "sync_failed",
+                format!("api key secret not found for {key_id}"),
+            )
+        })?;
+    let admission = remote_attempt_admission_for_state(state);
+    let snapshot = state
+        .proxy
+        .fetch_zhihu_quota_for_sync(
+            &api_key,
+            key_id,
+            admission,
+            true,
+            Duration::from_secs(PROVIDER_QUOTA_SYNC_TIMEOUT_SECS),
+        )
+        .await
+        .map_err(|err| match err {
+            tavily_hikari::ProxyError::UsageHttp { status, body } => {
+                let http_status = if status == reqwest::StatusCode::UNAUTHORIZED {
+                    StatusCode::UNAUTHORIZED
+                } else if status == reqwest::StatusCode::FORBIDDEN {
+                    StatusCode::FORBIDDEN
+                } else if status.is_client_error() {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::BAD_GATEWAY
+                };
+                ManualQuotaSyncError::new(
+                    http_status,
+                    "usage_http",
+                    format!("Zhihu quota request failed with {status}: {body}"),
+                )
+            }
+            tavily_hikari::ProxyError::QuotaDataMissing { reason } => ManualQuotaSyncError::new(
+                StatusCode::BAD_REQUEST,
+                "quota_data_missing",
+                reason,
+            ),
+            other => ManualQuotaSyncError::new(
+                StatusCode::BAD_GATEWAY,
+                "sync_failed",
+                other.to_string(),
+            ),
+        })?;
+    state
+        .proxy
+        .record_zhihu_quota_sync(key_id, &snapshot, "quota_sync/manual")
+        .await
+        .map_err(|err| {
+            ManualQuotaSyncError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "sync_failed",
+                err.to_string(),
+            )
+        })?;
+    Ok(ProviderQuotaSyncSnapshot {
+        source: "live",
+        provider: tavily_hikari::providers::ProviderId::Zhihu,
+        quota_limit: Some(snapshot.quota_limit),
+        quota_remaining: Some(snapshot.quota_remaining),
+        quota_renews_at: Some(snapshot.quota_renews_at),
+        quota_synced_at: Some(snapshot.quota_synced_at),
+    })
+}
 
 async fn run_manual_key_quota_sync(
     state: Arc<AppState>,

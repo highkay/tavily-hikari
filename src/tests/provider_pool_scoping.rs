@@ -565,9 +565,9 @@ async fn zhihu_quota_sample_zero_exhausts_until_next_shanghai_midnight() {
         .record_provider_quota_sample(
             ProviderId::Zhihu,
             &zhihu_key_id,
-            5_000,
+            Some(5_000),
             0,
-            renews_at,
+            Some(renews_at),
             "quota_sync/zhihu",
         )
         .await
@@ -631,9 +631,9 @@ async fn zhihu_quota_sample_zero_exhausts_until_next_shanghai_midnight() {
         .record_provider_quota_sample(
             ProviderId::Zhihu,
             &zhihu_key_id,
-            5_000,
+            Some(5_000),
             0,
-            following_midnight,
+            Some(following_midnight),
             "quota_sync/zhihu",
         )
         .await
@@ -643,9 +643,9 @@ async fn zhihu_quota_sample_zero_exhausts_until_next_shanghai_midnight() {
         .record_provider_quota_sample(
             ProviderId::Zhihu,
             &zhihu_key_id,
-            5_000,
+            Some(5_000),
             3,
-            following_midnight,
+            Some(following_midnight),
             "quota_sync/zhihu",
         )
         .await

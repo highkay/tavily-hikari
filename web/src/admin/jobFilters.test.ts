@@ -91,5 +91,12 @@ describe('admin job filters', () => {
     expect(countAdminJobGroups(jobs).quota).toBe(1)
     expect(adminJobTypeLabel('quota_sync/serpapi', ZH.admin.jobs)).toBe('SerpApi 同步额度')
     expect(adminJobTypeLabel('quota_sync/serpapi', EN.admin.jobs)).toBe('SerpApi quota sync')
+
+    // keenable-integration todo 12: the Zhihu daily-quota lane is in the
+    // same quota group and has dedicated en/zh labels.
+    expect(jobMatchesGroup('quota_sync/zhihu', 'quota')).toBe(true)
+    expect(jobMatchesGroup('quota_sync/zhihu', 'usage')).toBe(false)
+    expect(adminJobTypeLabel('quota_sync/zhihu', ZH.admin.jobs)).toBe('知乎同步额度')
+    expect(adminJobTypeLabel('quota_sync/zhihu', EN.admin.jobs)).toBe('Zhihu quota sync')
   })
 })

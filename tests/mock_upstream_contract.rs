@@ -798,6 +798,36 @@ async fn mock_zhihu_scripted_branches_and_observation_endpoints() {
         "Code=0 remaining=0,0",
     );
 
+    // tok-quota-tight: the 3/10 QA plan (zhihu_search 3/10, global 5/20).
+    let response = zhihu_get(
+        &client,
+        &format!("{base}/api/v1/quota?APIIDs=zhihu_search,global_search"),
+        Some("tok-quota-tight"),
+        Some("1789000000"),
+    )
+    .await;
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["Code"], json!(0));
+    let entries = body["Data"].as_array().expect("quota entries");
+    let zhihu_entry = entries
+        .iter()
+        .find(|entry| entry["APIID"] == json!("zhihu_search"))
+        .expect("zhihu_search entry");
+    assert_eq!(zhihu_entry["TotalQuota"], json!(10));
+    assert_eq!(zhihu_entry["RemainingQuota"], json!(3));
+    let global_entry = entries
+        .iter()
+        .find(|entry| entry["APIID"] == json!("global_search"))
+        .expect("global_search entry");
+    assert_eq!(global_entry["TotalQuota"], json!(20));
+    assert_eq!(global_entry["RemainingQuota"], json!(5));
+    matrix.record(
+        "mock_zhihu",
+        "tok-quota-tight quota",
+        200,
+        "Code=0 zhihu_search=3/10 global_search=5/20",
+    );
+
     // Observation endpoints.
     let metrics: Value = client
         .get(format!("{base}/metrics"))
@@ -809,11 +839,11 @@ async fn mock_zhihu_scripted_branches_and_observation_endpoints() {
         .expect("metrics json");
     assert_eq!(metrics["zhihu_search"], json!(6));
     assert_eq!(metrics["global_search"], json!(2));
-    assert_eq!(metrics["quota"], json!(2));
+    assert_eq!(metrics["quota"], json!(3));
     assert_eq!(metrics["auth_failures"], json!(3));
     assert_eq!(
         metrics["last_authorization"],
-        json!("Bearer tok-quota-zero")
+        json!("Bearer tok-quota-tight")
     );
     assert_eq!(metrics["last_x_request_timestamp"], json!("1789000000"));
 
@@ -846,5 +876,5 @@ async fn mock_zhihu_scripted_branches_and_observation_endpoints() {
         ),
     );
 
-    matrix.finish(11);
+    matrix.finish(12);
 }

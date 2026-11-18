@@ -17,7 +17,8 @@
 //!   the bin-boundary kind);
 //! * the PASSIVE CREDIT HARVEST: every success body carrying
 //!   `usage.credits_remaining` is persisted ONLY on a material change
-//!   through `KeyStore::record_quota_sync_sample_without_limit` with the
+//!   through the shared provider quota-sample handoff
+//!   (`record_provider_quota_sample`, Keenable passive posture) with the
 //!   distinct source `keenable_passive`. The harvest adds ZERO outbound
 //!   requests (it reads the already-buffered response body), never fails the
 //!   request (best-effort, contention-skipped), leaves the live key's
@@ -355,11 +356,11 @@ impl TavilyProxy {
         })
     }
 
-    /// Passive credit harvest (keenable-integration todo 7). Parses
+    /// Passive credit harvest (keenable-integration todo 7 / todo 12): parses
     /// `usage.credits_remaining` from the ALREADY-BUFFERED response body
     /// (zero extra requests) and, only on a material change, persists
-    /// `quota_remaining` / `quota_synced_at` through the no-limit
-    /// quota-sample seam with source `keenable_passive`. The live key keeps
+    /// `quota_remaining` / `quota_synced_at` through the shared provider
+    /// quota-sample handoff with source `keenable_passive`. The live key keeps
     /// `quota_limit` NULL and `quota_renews_at` untouched. Best-effort: a
     /// missing balance returns before any DB read (bounding failure-path
     /// latency), and any read/write error is logged at debug and swallowed so
@@ -392,7 +393,8 @@ impl TavilyProxy {
     }
 
     /// Material-change persistence shared by the REST and hosted-MCP passive
-    /// harvests (todo-7 contract, unchanged semantics).
+    /// harvests (todo-7 contract, now carried by the todo-12 shared quota
+    /// handoff with the Keenable passive posture: no limit, no renewal).
     async fn persist_keenable_passive_credits(&self, key_id: &str, credits_remaining: i64) {
         // Bounded foreground read of the stored balance to gate the material
         // change. On error treat as absent (best-effort) - a redundant write
@@ -415,11 +417,12 @@ impl TavilyProxy {
 
         let now = self.backend_time.now_ts();
         if let Err(err) = self
-            .key_store
-            .record_quota_sync_sample_without_limit(
+            .record_provider_quota_sample(
+                providers::ProviderId::Keenable,
                 key_id,
+                None,
                 credits_remaining,
-                now,
+                None,
                 KEENABLE_PASSIVE_QUOTA_SYNC_SOURCE,
             )
             .await
@@ -432,6 +435,14 @@ impl TavilyProxy {
                 "keenable passive quota harvest skipped (best-effort, contention-safe)"
             );
         }
+        tracing::debug!(
+            component = "provider_facade",
+            event = "keenable_passive_quota_harvest",
+            api_key_id = %key_id,
+            credits_remaining,
+            captured_at = now,
+            "keenable passive credit balance persisted"
+        );
     }
 
     /// Transport-failure audit row for the Keenable REST facade (mirrors the

@@ -17,6 +17,9 @@ const TAVILY_SECRET: &str = "tvly-dispatch-guard-a";
 const SERPAPI_SECRET: &str = "serp-dispatch-guard-a";
 const EXA_SECRET: &str = "exa-dispatch-guard-a";
 const BRAVE_SECRET: &str = "brv-dispatch-guard-a";
+const KEENABLE_SECRET: &str = "ken-dispatch-guard-a";
+const ZHIHU_SECRET: &str = "zh-dispatch-guard-a";
+const ZHIHU_MISSING_SECRET: &str = "zh-dispatch-missing-a";
 
 #[derive(Default)]
 struct DispatchEgress {
@@ -28,6 +31,10 @@ struct DispatchEgress {
     // never-polled assertions read the SAME atomics the mocks bump.
     exa_counter: Arc<AtomicUsize>,
     brave_counter: Arc<AtomicUsize>,
+    keenable_counter: Arc<AtomicUsize>,
+    zhihu_quota_requests: AtomicUsize,
+    zhihu_authorization: StdMutex<Option<String>>,
+    zhihu_timestamp: StdMutex<Option<String>>,
 }
 
 impl DispatchEgress {
@@ -124,6 +131,77 @@ async fn spawn_counter_mock(counter: Arc<AtomicUsize>) -> SocketAddr {
     .await
 }
 
+/// The QA tight plan mirrored from `mock_zhihu tok-quota-tight`: the
+/// `zhihu_search` API is the limiter at 3/10, so the adapter must store
+/// remaining=3 and limit=10.
+fn tight_zhihu_quota_body() -> Value {
+    json!({
+        "Code": 0,
+        "Message": "success",
+        "Data": [
+            {
+                "APIID": "zhihu_search",
+                "APIName": "知乎搜索",
+                "TotalQuota": 10,
+                "TotalUsed": 7,
+                "RemainingQuota": 3
+            },
+            {
+                "APIID": "global_search",
+                "APIName": "全网搜索",
+                "TotalQuota": 20,
+                "TotalUsed": 15,
+                "RemainingQuota": 5
+            }
+        ]
+    })
+}
+
+fn zhihu_quota_body_without_global_search() -> Value {
+    json!({
+        "Code": 0,
+        "Message": "success",
+        "Data": [{
+            "APIID": "zhihu_search",
+            "APIName": "知乎搜索",
+            "TotalQuota": 10,
+            "TotalUsed": 7,
+            "RemainingQuota": 3
+        }]
+    })
+}
+
+/// Free Zhihu `/api/v1/quota` mock: same `{Code,Message,Data[]}` envelope as
+/// `mock_zhihu`, recording the pooled Bearer + timestamp so the lane's auth
+/// injection is observable.
+async fn spawn_zhihu_quota_mock(
+    obs: Arc<DispatchEgress>,
+    body: Arc<StdMutex<Value>>,
+) -> SocketAddr {
+    bind_dispatch_ephemeral(
+        Router::new().route(
+            "/api/v1/quota",
+            get(move |headers: HeaderMap| {
+                let obs = obs.clone();
+                let body = body.clone();
+                async move {
+                    obs.zhihu_quota_requests.fetch_add(1, Ordering::SeqCst);
+                    *obs.zhihu_authorization.lock().expect("zhihu auth lock") = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    *obs.zhihu_timestamp.lock().expect("zhihu timestamp lock") = headers
+                        .get("x-request-timestamp")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    Json(body.lock().expect("zhihu quota body lock").clone())
+                }
+            }),
+        ),
+    )
+    .await
+}
+
 struct DispatchHarness {
     state: Arc<AppState>,
     admin_addr: SocketAddr,
@@ -131,6 +209,7 @@ struct DispatchHarness {
     pool: sqlx::SqlitePool,
     obs: Arc<DispatchEgress>,
     db_path: std::path::PathBuf,
+    zhihu_quota_body: Arc<StdMutex<Value>>,
 }
 
 impl Drop for DispatchHarness {
@@ -149,18 +228,22 @@ async fn spawn_dispatch_harness(prefix: &str) -> DispatchHarness {
     let account_addr = spawn_account_mock(obs.clone()).await;
     let exa_addr = spawn_counter_mock(obs.exa_counter.clone()).await;
     let brave_addr = spawn_counter_mock(obs.brave_counter.clone()).await;
+    let keenable_addr = spawn_counter_mock(obs.keenable_counter.clone()).await;
+    let zhihu_quota_body = Arc::new(StdMutex::new(tight_zhihu_quota_body()));
+    let zhihu_addr = spawn_zhihu_quota_mock(obs.clone(), zhihu_quota_body.clone()).await;
     let providers = tavily_hikari::ProviderBootstrap {
         serpapi_upstream: format!("http://{account_addr}"),
         serpapi_mcp_upstream: format!("http://{account_addr}/mcp"),
         exa_upstream: format!("http://{exa_addr}"),
         brave_upstream: format!("http://{brave_addr}"),
+        keenable_upstream: format!("http://{keenable_addr}"),
+        keenable_mcp_upstream: format!("http://{keenable_addr}/mcp"),
+        zhihu_upstream: format!("http://{zhihu_addr}"),
         serpapi_keys: vec![SERPAPI_SECRET.to_string()],
         exa_keys: vec![EXA_SECRET.to_string()],
         brave_keys: vec![BRAVE_SECRET.to_string()],
-        // keenable-integration todo 6: no quota-sync adapter exists for either
-        // provider here (todo 12 owns it); registry defaults keep the rows
-        // untouched and the dispatch never dials them.
-        ..tavily_hikari::ProviderBootstrap::default()
+        keenable_keys: vec![KEENABLE_SECRET.to_string()],
+        zhihu_keys: vec![ZHIHU_SECRET.to_string()],
     };
     let proxy = TavilyProxy::with_providers_in_ha_mode(
         vec![TAVILY_SECRET.to_string()],
@@ -202,6 +285,7 @@ async fn spawn_dispatch_harness(prefix: &str) -> DispatchHarness {
         pool,
         obs,
         db_path,
+        zhihu_quota_body,
     }
 }
 
@@ -252,6 +336,44 @@ impl DispatchHarness {
         (succeeded, status, message)
     }
 
+    /// Claim + dispatch an ALREADY-QUEUED job (the scheduler sweep's durable
+    /// row), so the test drives exactly the jobs the lane enqueued instead of
+    /// minting a second one.
+    async fn dispatch_queued_job(
+        &self,
+        job_id: i64,
+        job_type: &str,
+        key_id: &str,
+    ) -> (bool, String, Option<String>) {
+        let claim = self
+            .state
+            .proxy
+            .scheduled_job_mark_running(job_id)
+            .await
+            .expect("claim queued job")
+            .expect("queued job becomes running");
+        let succeeded = run_manual_claimed_job(
+            self.state.clone(),
+            job_type.to_string(),
+            Some(key_id.to_string()),
+            ClaimedScheduledJob {
+                job_id: claim.id,
+                claim_generation: claim.claim_generation,
+                _job_execution_gate: None,
+            },
+            None,
+            true,
+        )
+        .await;
+        let (status, message): (String, Option<String>) =
+            sqlx::query_as("SELECT status, message FROM scheduled_jobs WHERE id = ?")
+                .bind(claim.id)
+                .fetch_one(&self.pool)
+                .await
+                .expect("read queued job row");
+        (succeeded, status, message)
+    }
+
     async fn key_row(
         &self,
         key_id: &str,
@@ -274,6 +396,18 @@ impl DispatchHarness {
             .expect("request completes")
             .status()
             .as_u16()
+    }
+
+    async fn post_json(&self, path: &str) -> (u16, Value) {
+        let response = self
+            .client
+            .post(format!("http://{}{}", self.admin_addr, path))
+            .send()
+            .await
+            .expect("request completes");
+        let status = response.status().as_u16();
+        let body = response.json().await.unwrap_or(Value::Null);
+        (status, body)
     }
 }
 
@@ -337,7 +471,7 @@ async fn serpapi_quota_sync_job_updates_all_four_fields_via_dispatch() {
 async fn tavily_quota_sync_lane_fails_closed_on_foreign_keys() {
     let harness = spawn_dispatch_harness("tavily-lane-guard-sweep").await;
 
-    for secret in [SERPAPI_SECRET, EXA_SECRET, BRAVE_SECRET] {
+    for secret in [SERPAPI_SECRET, EXA_SECRET, BRAVE_SECRET, KEENABLE_SECRET, ZHIHU_SECRET] {
         let key_id = harness.key_id(secret).await;
         let (succeeded, status, message) = harness.dispatch_job("quota_sync", &key_id).await;
         assert!(
@@ -425,6 +559,7 @@ async fn lane_pending_selections_enumerate_only_own_provider() {
     let harness = spawn_dispatch_harness("lane-pending-selection").await;
     let tavily_id = harness.key_id(TAVILY_SECRET).await;
     let serpapi_id = harness.key_id(SERPAPI_SECRET).await;
+    let zhihu_id = harness.key_id(ZHIHU_SECRET).await;
 
     // Hot lane precondition: every key looks recently used.
     let now = Utc::now().timestamp();
@@ -477,13 +612,35 @@ async fn lane_pending_selections_enumerate_only_own_provider() {
         .await
         .expect("serpapi hot list");
     assert_eq!(serpapi_hot, vec![serpapi_id]);
+    let zhihu_cold = harness
+        .state
+        .proxy
+        .list_keys_pending_provider_quota_sync(
+            tavily_hikari::providers::ProviderId::Zhihu,
+            24 * 3600,
+        )
+        .await
+        .expect("zhihu cold list");
+    assert_eq!(zhihu_cold, vec![zhihu_id.clone()]);
+    let zhihu_hot = harness
+        .state
+        .proxy
+        .list_keys_pending_hot_provider_quota_sync(
+            tavily_hikari::providers::ProviderId::Zhihu,
+            2 * 3600,
+            15 * 60,
+        )
+        .await
+        .expect("zhihu hot list");
+    assert_eq!(zhihu_hot, vec![zhihu_id]);
 }
 
 /// Admin manual sync-usage entry point (admin_auth.rs:348 path) re-asserted
-/// for zero-leak: foreign keys take their T10 provider arms (serpapi live
-/// snapshot via /account, brave passive snapshot, exa 409) and the Tavily
-/// /usage mock receives NOTHING; exa/brave upstream counters stay at zero
-/// (no polling of any kind).
+/// for zero-leak: foreign keys take their provider arms (serpapi live
+/// snapshot via /account, brave/keenable passive snapshots, zhihu live
+/// `/api/v1/quota`, exa 409) and the Tavily /usage mock receives NOTHING;
+/// exa/brave/keenable upstream counters stay at zero (no polling of any
+/// kind).
 #[tokio::test]
 async fn admin_manual_sync_usage_keeps_tavily_usage_free_of_foreign_keys() {
     let harness = spawn_dispatch_harness("admin-sync-usage-sweep").await;
@@ -491,6 +648,8 @@ async fn admin_manual_sync_usage_keeps_tavily_usage_free_of_foreign_keys() {
     let serpapi_id = harness.key_id(SERPAPI_SECRET).await;
     let exa_id = harness.key_id(EXA_SECRET).await;
     let brave_id = harness.key_id(BRAVE_SECRET).await;
+    let keenable_id = harness.key_id(KEENABLE_SECRET).await;
+    let zhihu_id = harness.key_id(ZHIHU_SECRET).await;
 
     let serpapi_status = harness
         .post_status(&format!("/api/keys/{serpapi_id}/sync-usage"))
@@ -510,6 +669,41 @@ async fn admin_manual_sync_usage_keeps_tavily_usage_free_of_foreign_keys() {
         brave_status, 200,
         "brave manual sync returns the passive snapshot (T10 arm)"
     );
+    let keenable_status = harness
+        .post_status(&format!("/api/keys/{keenable_id}/sync-usage"))
+        .await;
+    assert_eq!(
+        keenable_status, 200,
+        "keenable manual sync returns the last passive snapshot"
+    );
+    sqlx::query(
+        "UPDATE api_keys SET quota_remaining = 42, quota_synced_at = 1700000000 WHERE id = ?",
+    )
+    .bind(&keenable_id)
+    .execute(&harness.pool)
+    .await
+    .expect("seed keenable passive snapshot");
+    let (keenable_status, keenable_body) = harness
+        .post_json(&format!("/api/keys/{keenable_id}/sync-usage"))
+        .await;
+    assert_eq!(keenable_status, 200);
+    assert_eq!(keenable_body["source"], json!("passive"));
+    assert_eq!(keenable_body["provider"], json!("keenable"));
+    assert_eq!(keenable_body["quota_limit"], Value::Null);
+    assert_eq!(keenable_body["quota_remaining"], json!(42));
+    assert_eq!(keenable_body["quota_synced_at"], json!(1_700_000_000));
+    let (zhihu_status, zhihu_body) = harness
+        .post_json(&format!("/api/keys/{zhihu_id}/sync-usage"))
+        .await;
+    assert_eq!(
+        zhihu_status, 200,
+        "zhihu manual sync runs the live /api/v1/quota adapter"
+    );
+    assert_eq!(zhihu_body["source"], json!("live"));
+    assert_eq!(zhihu_body["provider"], json!("zhihu"));
+    assert_eq!(zhihu_body["quota_limit"], json!(10));
+    assert_eq!(zhihu_body["quota_remaining"], json!(3));
+    assert!(zhihu_body["quota_renews_at"].as_i64().is_some());
 
     assert_eq!(
         harness.obs.usage_requests.load(Ordering::SeqCst),
@@ -517,22 +711,231 @@ async fn admin_manual_sync_usage_keeps_tavily_usage_free_of_foreign_keys() {
         "zero-leak: manual sync of foreign keys never touches Tavily /usage"
     );
     assert_eq!(harness.obs.account_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(harness.obs.zhihu_quota_requests.load(Ordering::SeqCst), 1);
     assert_eq!(harness.obs.exa_counter.load(Ordering::SeqCst), 0);
     assert_eq!(harness.obs.brave_counter.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        harness.obs.keenable_counter.load(Ordering::SeqCst),
+        0,
+        "MUST NOT: Keenable is never polled (passive snapshot only)"
+    );
 }
 
-/// Registry pin (M4): `quota_sync/serpapi` is the ONE new entry in the
-/// fixed REMOTE_IO_SCHEDULED_JOB_TYPES array ([&str; 8] -> [&str; 9]) and
-/// rides the shared single remote-attempt lease while keeping the
-/// durable-write DB execution gate discipline of the Tavily family.
+/// Acceptance (keenable-integration todo 12): the `quota_sync/zhihu`
+/// dispatch arm stores remaining=3 and limit=10 from the tight plan, anchors
+/// the next Asia/Shanghai midnight, and never dials Tavily /usage.
+#[tokio::test]
+async fn zhihu_quota_sync_job_persists_tight_plan_via_dispatch() {
+    let harness = spawn_dispatch_harness("zhihu-quota-dispatch-tight").await;
+    let key_id = harness.key_id(ZHIHU_SECRET).await;
+
+    let (succeeded, status, message) = harness
+        .dispatch_job(QUOTA_SYNC_ZHIHU_JOB_TYPE, &key_id)
+        .await;
+    assert!(succeeded, "job succeeds: {status} {message:?}");
+    assert_eq!(status, "success");
+    let message = message.expect("success message");
+    assert!(
+        message.contains("limit=10") && message.contains("remaining=3"),
+        "job message carries the tight plan: {message}"
+    );
+
+    let (key_status, limit, remaining, synced_at, renews_at) = harness.key_row(&key_id).await;
+    assert_eq!(key_status, "active");
+    assert_eq!(limit, Some(10));
+    assert_eq!(remaining, Some(3));
+    let synced_at = synced_at.expect("quota_synced_at stamped");
+    assert_eq!(
+        renews_at,
+        Some(tavily_hikari::providers::RecoveryPolicy::natural_day_renews_at(
+            synced_at
+        )),
+        "renews_at uses the shared NaturalDay boundary helper"
+    );
+    assert_eq!(harness.obs.zhihu_quota_requests.load(Ordering::SeqCst), 1);
+    let expected_authorization = format!("Bearer {ZHIHU_SECRET}");
+    assert_eq!(
+        harness
+            .obs
+            .zhihu_authorization
+            .lock()
+            .expect("zhihu auth lock")
+            .as_deref(),
+        Some(expected_authorization.as_str())
+    );
+    assert!(
+        harness
+            .obs
+            .zhihu_timestamp
+            .lock()
+            .expect("zhihu timestamp lock")
+            .as_deref()
+            .is_some_and(|value| !value.is_empty()),
+        "a fresh server-side timestamp is sent"
+    );
+    assert_eq!(
+        harness.obs.usage_requests.load(Ordering::SeqCst),
+        0,
+        "zero-leak: the Zhihu lane never touches Tavily /usage"
+    );
+    assert_eq!(harness.obs.keenable_counter.load(Ordering::SeqCst), 0);
+}
+
+/// Scheduler dispatch gate: one sweep enqueues exactly ONE Zhihu job per due
+/// key, each job performs exactly ONE outbound `/api/v1/quota` call, and a
+/// second sweep enqueues nothing once every key is freshly synced.
+#[tokio::test]
+async fn zhihu_quota_sweep_enqueues_one_job_and_one_outbound_per_due_key() {
+    let harness = spawn_dispatch_harness("zhihu-sweep-one-per-key").await;
+    sqlx::query(
+        "INSERT INTO api_keys (id, api_key, provider, status, created_at) \
+         VALUES ('zhihu-sweep-second-key', ?, 'zhihu', 'active', ?)",
+    )
+    .bind(ZHIHU_MISSING_SECRET)
+    .bind(Utc::now().timestamp())
+    .execute(&harness.pool)
+    .await
+    .expect("seed second zhihu key");
+    let first_key = harness.key_id(ZHIHU_SECRET).await;
+    let second_key = harness.key_id(ZHIHU_MISSING_SECRET).await;
+
+    run_quota_sync_sweep(harness.state.as_ref(), true, 0).await;
+    let jobs: Vec<(i64, Option<String>)> = sqlx::query_as(
+        "SELECT id, key_id FROM scheduled_jobs WHERE job_type = ? ORDER BY id ASC",
+    )
+    .bind(QUOTA_SYNC_ZHIHU_JOB_TYPE)
+    .fetch_all(&harness.pool)
+    .await
+    .expect("read zhihu jobs");
+    assert_eq!(jobs.len(), 2, "one job per due key: {jobs:?}");
+    let mut enqueued_keys: Vec<String> = jobs
+        .iter()
+        .map(|(_, key_id)| key_id.clone().expect("job carries a key id"))
+        .collect();
+    enqueued_keys.sort();
+    let mut expected_keys = vec![first_key.clone(), second_key.clone()];
+    expected_keys.sort();
+    assert_eq!(enqueued_keys, expected_keys);
+
+    for (job_id, key_id) in &jobs {
+        let key_id = key_id.as_deref().expect("swept key id");
+        let (succeeded, status, message) = harness
+            .dispatch_queued_job(*job_id, QUOTA_SYNC_ZHIHU_JOB_TYPE, key_id)
+            .await;
+        assert!(succeeded, "swept job succeeds: {status} {message:?}");
+    }
+    assert_eq!(
+        harness.obs.zhihu_quota_requests.load(Ordering::SeqCst),
+        2,
+        "exactly one outbound per due key"
+    );
+    for key_id in [&first_key, &second_key] {
+        let (_, limit, remaining, synced_at, renews_at) = harness.key_row(key_id).await;
+        assert_eq!(limit, Some(10));
+        assert_eq!(remaining, Some(3));
+        let synced_at = synced_at.expect("synced_at stamped");
+        assert_eq!(
+            renews_at,
+            Some(tavily_hikari::providers::RecoveryPolicy::natural_day_renews_at(
+                synced_at
+            ))
+        );
+    }
+
+    run_quota_sync_sweep(harness.state.as_ref(), true, 0).await;
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scheduled_jobs WHERE job_type = ?")
+            .bind(QUOTA_SYNC_ZHIHU_JOB_TYPE)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("count zhihu jobs");
+    assert_eq!(count, 2, "freshly synced keys are not due again");
+    assert_eq!(
+        harness.obs.zhihu_quota_requests.load(Ordering::SeqCst),
+        2,
+        "no extra outbound on a second sweep"
+    );
+    assert_eq!(harness.obs.usage_requests.load(Ordering::SeqCst), 0);
+}
+
+/// Symmetric zero-leak guard: the Zhihu lane refuses every foreign key before
+/// any egress (a Tavily/Keenable/SerpApi secret must never reach Zhihu).
+#[tokio::test]
+async fn zhihu_quota_sync_lane_fails_closed_on_foreign_keys() {
+    let harness = spawn_dispatch_harness("zhihu-lane-guard-sweep").await;
+
+    for secret in [TAVILY_SECRET, KEENABLE_SECRET, SERPAPI_SECRET] {
+        let key_id = harness.key_id(secret).await;
+        let (succeeded, status, message) = harness
+            .dispatch_job(QUOTA_SYNC_ZHIHU_JOB_TYPE, &key_id)
+            .await;
+        assert!(
+            !succeeded,
+            "the zhihu lane must refuse foreign key {secret}"
+        );
+        assert_eq!(status, "error");
+        let message = message.expect("guard message");
+        assert!(
+            message.contains("provider_guard_rejected"),
+            "typed guard rejection for {secret}, got: {message}"
+        );
+    }
+    assert_eq!(
+        harness.obs.zhihu_quota_requests.load(Ordering::SeqCst),
+        0,
+        "zero-leak: no Zhihu request left for any foreign key"
+    );
+    assert_eq!(harness.obs.usage_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(harness.obs.keenable_counter.load(Ordering::SeqCst), 0);
+}
+
+/// QA failure arm through the real dispatch arm: a payload without
+/// `global_search` is a typed `QuotaDataMissing` job error and the key's
+/// quota fields stay NULL (never a silent 0).
+#[tokio::test]
+async fn zhihu_quota_missing_entry_via_dispatch_is_typed_without_zero_write() {
+    let harness = spawn_dispatch_harness("zhihu-quota-missing-entry-dispatch").await;
+    let key_id = harness.key_id(ZHIHU_SECRET).await;
+    *harness
+        .zhihu_quota_body
+        .lock()
+        .expect("zhihu quota body lock") = zhihu_quota_body_without_global_search();
+
+    let (succeeded, status, message) = harness
+        .dispatch_job(QUOTA_SYNC_ZHIHU_JOB_TYPE, &key_id)
+        .await;
+    assert!(!succeeded);
+    assert_eq!(status, "error");
+    let message = message.expect("failure message");
+    assert!(
+        message.contains("quota_data_missing") && message.contains("global_search"),
+        "typed missing-entry error: {message}"
+    );
+    let (_, limit, remaining, synced_at, _) = harness.key_row(&key_id).await;
+    assert_eq!(limit, None);
+    assert_eq!(remaining, None, "never a silent 0");
+    assert_eq!(synced_at, None);
+    assert_eq!(harness.obs.zhihu_quota_requests.load(Ordering::SeqCst), 1);
+}
+
+/// Registry pin (M4 + keenable-integration todo 12): `quota_sync/zhihu` is
+/// the newest entry in the fixed REMOTE_IO_SCHEDULED_JOB_TYPES array
+/// ([&str; 9] -> [&str; 10]) and rides the shared single remote-attempt lease
+/// with the durable-write DB execution gate discipline of the quota family.
 #[test]
 fn serpapi_job_type_registered_as_remote_io_with_db_gate() {
-    assert_eq!(REMOTE_IO_SCHEDULED_JOB_TYPES.len(), 9);
+    assert_eq!(REMOTE_IO_SCHEDULED_JOB_TYPES.len(), 10);
     assert!(REMOTE_IO_SCHEDULED_JOB_TYPES.contains(&QUOTA_SYNC_SERPAPI_JOB_TYPE));
+    assert!(REMOTE_IO_SCHEDULED_JOB_TYPES.contains(&QUOTA_SYNC_ZHIHU_JOB_TYPE));
     assert_eq!(QUOTA_SYNC_SERPAPI_JOB_TYPE, "quota_sync/serpapi");
+    assert_eq!(QUOTA_SYNC_ZHIHU_JOB_TYPE, "quota_sync/zhihu");
     assert!(scheduled_job_uses_remote_io(QUOTA_SYNC_SERPAPI_JOB_TYPE));
+    assert!(scheduled_job_uses_remote_io(QUOTA_SYNC_ZHIHU_JOB_TYPE));
     assert!(scheduled_job_uses_db_execution_gate(
         QUOTA_SYNC_SERPAPI_JOB_TYPE
+    ));
+    assert!(scheduled_job_uses_db_execution_gate(
+        QUOTA_SYNC_ZHIHU_JOB_TYPE
     ));
     // No exa/brave job type exists anywhere in the registry (never polled).
     assert!(
@@ -540,6 +943,13 @@ fn serpapi_job_type_registered_as_remote_io_with_db_gate() {
             .iter()
             .any(|job_type| job_type.contains("exa") || job_type.contains("brave")),
         "exa/brave have NO scheduler lane or job type"
+    );
+    // Keenable is never polled: the only Keenable quota posture is passive.
+    assert!(
+        !REMOTE_IO_SCHEDULED_JOB_TYPES
+            .iter()
+            .any(|job_type| job_type.contains("keenable")),
+        "keenable has NO scheduler lane (passive harvest only)"
     );
 }
 

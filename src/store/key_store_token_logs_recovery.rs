@@ -92,9 +92,8 @@ impl KeyStore {
     }
 
     /// By-id twin of `mark_quota_exhausted` for health seams that hold the
-    /// public key id (the NaturalDay quota-sample path). The todo-12 Zhihu
-    /// adapter is its production caller once that lane lands.
-    #[allow(dead_code)]
+    /// public key id (the `NaturalDay` quota-sample path). The todo-12 Zhihu
+    /// adapter is its production caller.
     pub(crate) async fn mark_quota_exhausted_by_id(&self, key_id: &str) -> Result<bool, ProxyError> {
         let now = self.backend_time.now_ts();
         let res = sqlx::query(

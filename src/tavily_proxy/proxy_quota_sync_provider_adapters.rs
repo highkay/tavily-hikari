@@ -109,6 +109,91 @@ pub fn parse_serpapi_account_snapshot(
     })
 }
 
+/// The two Zhihu search APIs whose daily quota the adapter reconciles.
+/// Iteration order is the deterministic tie-breaker when both entries report
+/// the same `RemainingQuota`: `zhihu_search` (the narrower vertical) wins.
+const ZHIHU_QUOTA_API_IDS: [&str; 2] = ["zhihu_search", "global_search"];
+const ZHIHU_QUOTA_API_IDS_QUERY: &str = "zhihu_search,global_search";
+
+/// Typed Zhihu daily-quota snapshot (keenable-integration todo 12).
+///
+/// `quota_renews_at` is always the next Asia/Shanghai midnight (the
+/// `NaturalDay` policy's handoff, computed from the injected backend clock),
+/// never a UTC month boundary and never a per-API independent reset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZhihuQuotaSnapshot {
+    pub quota_limit: i64,
+    pub quota_remaining: i64,
+    pub quota_renews_at: i64,
+    pub quota_synced_at: i64,
+}
+
+/// Pure field mapping for `GET /api/v1/quota` (SPEC "Quota").
+///
+/// Reads the `{Code,Message,Data[]}` envelope, requires BOTH
+/// `zhihu_search` and `global_search` entries with numeric
+/// `TotalQuota`/`RemainingQuota`, and stores the minimum remaining across the
+/// two together with the limit of the entry that produced that minimum. A
+/// missing entry or field is a typed `QuotaDataMissing`, never a silent zero.
+/// `RemainingQuota == 0` is a valid run-out state: the caller persists it and
+/// the `NaturalDay` sweep restores the key at `quota_renews_at`.
+pub fn parse_zhihu_quota_snapshot(
+    payload: &Value,
+    synced_at: i64,
+) -> Result<ZhihuQuotaSnapshot, ProxyError> {
+    if payload.get("Code").and_then(Value::as_i64) != Some(0) {
+        let code = payload
+            .get("Code")
+            .map(Value::to_string)
+            .unwrap_or_else(|| "missing".to_string());
+        let message = payload
+            .get("Message")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        return Err(ProxyError::QuotaDataMissing {
+            reason: format!("Zhihu quota response is not Code=0 (Code={code}, Message={message})"),
+        });
+    }
+    let Some(entries) = payload.get("Data").and_then(Value::as_array) else {
+        return Err(ProxyError::QuotaDataMissing {
+            reason: "Zhihu quota response lacks Data[]".to_owned(),
+        });
+    };
+    let mut selected: Option<(i64, i64)> = None;
+    for api_id in ZHIHU_QUOTA_API_IDS {
+        let Some(entry) = entries
+            .iter()
+            .find(|entry| entry.get("APIID").and_then(Value::as_str) == Some(api_id))
+        else {
+            return Err(ProxyError::QuotaDataMissing {
+                reason: format!("Zhihu quota response lacks the {api_id} entry"),
+            });
+        };
+        let (Some(total_quota), Some(remaining_quota)) = (
+            entry.get("TotalQuota").and_then(Value::as_i64),
+            entry.get("RemainingQuota").and_then(Value::as_i64),
+        ) else {
+            return Err(ProxyError::QuotaDataMissing {
+                reason: format!(
+                    "Zhihu quota {api_id} entry lacks TotalQuota/RemainingQuota"
+                ),
+            });
+        };
+        match selected {
+            Some((best_remaining, _)) if remaining_quota >= best_remaining => {}
+            _ => selected = Some((remaining_quota, total_quota)),
+        }
+    }
+    let (quota_remaining, quota_limit) =
+        selected.expect("both Zhihu quota entries were required above");
+    Ok(ZhihuQuotaSnapshot {
+        quota_limit,
+        quota_remaining,
+        quota_renews_at: providers::RecoveryPolicy::natural_day_renews_at(synced_at),
+        quota_synced_at: synced_at,
+    })
+}
+
 /// Typed failure of the SerpApi `/account` fetch, shared by the scheduler and
 /// the admin manual lane.
 ///
@@ -434,6 +519,105 @@ impl TavilyProxy {
             "serpapi /account reported a non-Active account status (note only, key NOT disabled)"
         );
         Ok(true)
+    }
+
+    /// Scheduler-facing Zhihu `GET /api/v1/quota` fetch (keenable-integration
+    /// todo 12): the free natural-day quota source, ridden through the same
+    /// per-key forward-proxy plan + single remote-attempt lease as the other
+    /// provider lanes. The pooled Access Secret travels ONLY as the native
+    /// `Authorization: Bearer` header; a fresh server-side
+    /// `X-Request-Timestamp` is generated per attempt from the backend clock.
+    ///
+    /// Transport failures are mapped to literal messages because the reqwest
+    /// `Display` embeds the upstream URL (no secret lives there, but the
+    /// SERPAPI discipline is kept so a future query-slot change cannot leak).
+    pub async fn fetch_zhihu_quota_for_sync(
+        &self,
+        secret: &str,
+        key_id: &str,
+        admission: std::sync::Arc<crate::RemoteAttemptAdmissionController>,
+        manual_remote_attempt: bool,
+        request_timeout: Duration,
+    ) -> Result<ZhihuQuotaSnapshot, ProxyError> {
+        let base = self.provider_rest_base(providers::ProviderId::Zhihu)?;
+        let url = build_path_prefixed_url(&base, "/api/v1/quota");
+        let plan = self.prepare_forward_proxy_plan(key_id).await;
+        let remote_attempt = if manual_remote_attempt {
+            admission.acquire_manual_attempt().await
+        } else {
+            admission.acquire_attempt().await
+        }
+        .map_err(|reason| ProxyError::Other(reason.to_string()))?;
+
+        let authorization = format!("Bearer {secret}");
+        let timestamp = self.backend_time.now_ts().to_string();
+        let request_url = url.clone();
+        let send_result = self
+            .send_with_forward_proxy_plan(
+                providers::ProviderId::Zhihu,
+                Some(key_id),
+                "quota_sync",
+                plan,
+                |client| {
+                    remote_attempt.mark_request_started();
+                    client
+                        .get(request_url.clone())
+                        .query(&[("APIIDs", ZHIHU_QUOTA_API_IDS_QUERY)])
+                        .header(reqwest::header::AUTHORIZATION, authorization.clone())
+                        .header("x-request-timestamp", timestamp.clone())
+                        .header(
+                            reqwest::header::CONTENT_TYPE,
+                            "application/json",
+                        )
+                        .timeout(request_timeout)
+                },
+            )
+            .await;
+        let (resp, _relay_lease) = match send_result {
+            Ok(pair) => pair,
+            Err(ProxyError::Http(error)) => {
+                return Err(ProxyError::Other(if error.is_timeout() {
+                    "zhihu quota request timed out".to_string()
+                } else {
+                    "zhihu quota request transport failed".to_string()
+                }));
+            }
+            Err(err) => return Err(err),
+        };
+        let status = resp.status();
+        let bytes = resp.bytes().await.map_err(|_| {
+            ProxyError::Other("zhihu quota response body read failed".to_string())
+        })?;
+        if !status.is_success() {
+            return Err(ProxyError::UsageHttp {
+                status,
+                body: String::from_utf8_lossy(&bytes).into_owned(),
+            });
+        }
+        let json: Value = serde_json::from_slice(&bytes)
+            .map_err(|err| ProxyError::Other(format!("invalid zhihu quota json: {err}")))?;
+        parse_zhihu_quota_snapshot(&json, self.backend_time.now_ts())
+    }
+
+    /// Persist one Zhihu daily snapshot through the shared provider quota
+    /// sample handoff. `NaturalDay` owns the exhausted/active transitions and
+    /// the `auto_restore_active` audit rows here; the caller only supplies the
+    /// parsed numbers and source label.
+    pub async fn record_zhihu_quota_sync(
+        &self,
+        key_id: &str,
+        snapshot: &ZhihuQuotaSnapshot,
+        source: &str,
+    ) -> Result<KeyEffect, ProxyError> {
+        self.record_provider_quota_sample(
+            providers::ProviderId::Zhihu,
+            key_id,
+            Some(snapshot.quota_limit),
+            snapshot.quota_remaining,
+            Some(snapshot.quota_renews_at),
+            source,
+        )
+        .await
     }
 
     /// M4 hard guard for the Tavily /usage probe seam

@@ -71,8 +71,8 @@ const EXCEPTIONS: &[(&str, usize, &str)] = &[
     ),
     (
         "src/server/schedulers.rs",
-        3120,
-        "The scheduler retains the consolidated durable-job lifecycle while request-scoped remote-attempt admission is rolled out across existing maintenance job types; task-dispatch extraction remains a separate behavior-preserving change.",
+        3140,
+        "The scheduler retains the consolidated durable-job lifecycle while request-scoped remote-attempt admission is rolled out across existing maintenance job types and the todo-12 Zhihu quota lane adds its dispatch arm; task-dispatch extraction remains a separate behavior-preserving change.",
     ),
     (
         "src/tavily_proxy/proxy_quota_sync_and_jobs.rs",

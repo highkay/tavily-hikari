@@ -27,6 +27,9 @@ const QUOTA_JOB_TYPES = new Set([
   // Plan todo 23: the todo-19 SerpApi provider quota-sync job type. Backend
   // landing is the pending todo-19 commit; the label map entry is additive.
   'quota_sync/serpapi',
+  // keenable-integration todo 12: the Zhihu daily-quota lane shares the
+  // existing quota filter group.
+  'quota_sync/zhihu',
 ])
 const USAGE_JOB_TYPES = new Set(['token_usage_rollup', 'usage_aggregation'])
 const LOG_JOB_TYPES = new Set([

@@ -5,7 +5,7 @@
 //! `Authorization: Bearer` plus `X-Request-Timestamp`, always answering HTTP
 //! 200 with the `{Code,Message,Data}` envelope. Scripted tokens drive the
 //! classifier arms the facade consumes; `tok-quota-zero` reports a spent
-//! natural-day quota.
+//! natural-day quota and `tok-quota-tight` reports the 3/10 QA plan.
 //!
 //! `GET /metrics` and `GET /last-bodies` are additive observation endpoints:
 //! facade suites use them to prove request counts, header forwarding, and that
@@ -29,6 +29,9 @@ const TOK_RATE: &str = "tok-rate";
 const TOK_INTERNAL: &str = "tok-internal";
 const TOK_BADPARAM: &str = "tok-badparam";
 const TOK_QUOTA_ZERO: &str = "tok-quota-zero";
+/// Tight natural-day plan used by the quota-sync QA: `zhihu_search` 3/10 and
+/// `global_search` 5/20, so the adapter must store remaining=3, limit=10.
+const TOK_QUOTA_TIGHT: &str = "tok-quota-tight";
 
 const QUOTA_TOTAL: u64 = 5_000;
 
@@ -57,12 +60,14 @@ enum TokenStatus {
     Internal,
     BadParam,
     QuotaZero,
+    QuotaTight,
 }
 
 #[derive(Clone, Copy)]
 enum Gate {
     Good,
     QuotaZero,
+    QuotaTight,
 }
 
 #[derive(Debug, Default)]
@@ -97,6 +102,7 @@ impl MockState {
             TOK_INTERNAL => TokenStatus::Internal,
             TOK_BADPARAM => TokenStatus::BadParam,
             TOK_QUOTA_ZERO => TokenStatus::QuotaZero,
+            TOK_QUOTA_TIGHT => TokenStatus::QuotaTight,
             _ if self.tokens.iter().any(|known| known == token) => TokenStatus::Good,
             _ => TokenStatus::Auth,
         }
@@ -159,6 +165,7 @@ fn authorize(state: &MockState, headers: &HeaderMap) -> Result<Gate, Box<Respons
     match state.classify(token) {
         TokenStatus::Good => Ok(Gate::Good),
         TokenStatus::QuotaZero => Ok(Gate::QuotaZero),
+        TokenStatus::QuotaTight => Ok(Gate::QuotaTight),
         TokenStatus::Auth => Err(Box::new(auth_failed(state))),
         TokenStatus::Rate => Err(Box::new(envelope(
             30001,
@@ -270,22 +277,31 @@ struct QuotaParams {
     api_ids: Option<String>,
 }
 
-fn quota_entry(api_id: &str, api_name: &str, used: u64, zero: bool) -> Value {
-    let total_used = if zero { QUOTA_TOTAL } else { used };
+fn quota_entry(api_id: &str, api_name: &str, total: u64, used: u64) -> Value {
     json!({
         "APIID": api_id,
         "APIName": api_name,
-        "TotalQuota": QUOTA_TOTAL,
-        "TotalUsed": total_used,
-        "RemainingQuota": QUOTA_TOTAL - total_used
+        "TotalQuota": total,
+        "TotalUsed": used,
+        "RemainingQuota": total - used
     })
 }
 
-fn quota_payload(zero: bool, requested: Option<&[String]>) -> Value {
-    let all = [
-        quota_entry("global_search", "全网搜索", 1, zero),
-        quota_entry("zhihu_search", "知乎搜索", 2, zero),
-    ];
+fn quota_payload(gate: Gate, requested: Option<&[String]>) -> Value {
+    let all = match gate {
+        Gate::Good => [
+            quota_entry("global_search", "全网搜索", QUOTA_TOTAL, 1),
+            quota_entry("zhihu_search", "知乎搜索", QUOTA_TOTAL, 2),
+        ],
+        Gate::QuotaZero => [
+            quota_entry("global_search", "全网搜索", QUOTA_TOTAL, QUOTA_TOTAL),
+            quota_entry("zhihu_search", "知乎搜索", QUOTA_TOTAL, QUOTA_TOTAL),
+        ],
+        Gate::QuotaTight => [
+            quota_entry("global_search", "全网搜索", 20, 15),
+            quota_entry("zhihu_search", "知乎搜索", 10, 7),
+        ],
+    };
     let entries: Vec<Value> = all
         .into_iter()
         .filter(|entry| match requested {
@@ -324,11 +340,7 @@ async fn handle_quota(
     {
         return envelope(10001, "APIIDs参数格式错误或包含未知API ID", Value::Null);
     }
-    envelope(
-        0,
-        "success",
-        quota_payload(matches!(gate, Gate::QuotaZero), requested.as_deref()),
-    )
+    envelope(0, "success", quota_payload(gate, requested.as_deref()))
 }
 
 async fn handle_metrics(State(state): State<Arc<MockState>>) -> Json<Value> {

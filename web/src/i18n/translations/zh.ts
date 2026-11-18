@@ -1492,6 +1492,7 @@ export const ZH: TranslationShape = {
           'quota_sync/hot': '热 Key 同步',
           'quota_sync/manual': '手动同步',
           'quota_sync/serpapi': 'SerpApi 同步额度',
+          'quota_sync/zhihu': '知乎同步额度',
           token_usage_rollup: '用量聚合',
           usage_aggregation: '用量聚合',
           auth_token_logs_gc: '访问令牌日志清理',

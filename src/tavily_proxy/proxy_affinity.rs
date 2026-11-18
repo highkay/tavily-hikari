@@ -1645,36 +1645,58 @@ impl TavilyProxy {
         }
     }
 
-    /// Records one provider quota sample and applies its NaturalDay health
-    /// (keenable-integration todo 11; the todo-12 Zhihu adapter calls this
-    /// after parsing `/api/v1/quota`).
+    /// Records one provider quota sample through the ONE handoff shared by
+    /// both quota postures (keenable-integration todo 12):
     ///
-    /// `NaturalDay` providers are the only accepted callers: Keenable's
-    /// prepaid balance and every other lane keep their own recovery owner. The
-    /// snapshot is persisted first (sample row, live quota fields, and the
-    /// caller-supplied `quota_renews_at` anchor = the next Asia/Shanghai
-    /// midnight), then a zero-remaining sample marks the key exhausted while a
-    /// positive sample on an exhausted key restores it immediately: the
-    /// natural day already turned, and waiting for the sweep would strand the
-    /// key behind the freshly advanced renewal anchor. Both transitions carry
-    /// the same `auto_*` audit rows as the request-path reconcile, and neither
-    /// ever writes `api_key_low_quota_depletions` (M8).
-    // The todo-12 Zhihu quota adapter is the production caller of this seam.
-    #[allow(dead_code)]
+    /// - `NaturalDay` (Zhihu): `Some(limit)` + `Some(renews_at)` are required.
+    ///   The snapshot is persisted first (sample row, live quota fields, and
+    ///   the caller-supplied `quota_renews_at` anchor = the next Asia/Shanghai
+    ///   midnight), then a zero-remaining sample marks the key exhausted while
+    ///   a positive sample on an exhausted key restores it immediately: the
+    ///   natural day already turned, and waiting for the sweep would strand the
+    ///   key behind the freshly advanced renewal anchor. Both transitions carry
+    ///   the same `auto_*` audit rows as the request-path reconcile, and
+    ///   neither ever writes `api_key_low_quota_depletions` (M8).
+    /// - Keenable passive balance: `limit` and `renews_at` MUST be `None`. The
+    ///   no-limit sample seam preserves the live NULL `quota_limit` and the
+    ///   untouched `quota_renews_at`; a harvested balance never changes key
+    ///   status by itself (the 402/health path owns exhaustion).
+    ///
+    /// Mixing the postures (a limit for Keenable, or a missing limit/renewal
+    /// anchor for a natural-day provider) is a typed error, so units can never
+    /// cross providers.
     pub(crate) async fn record_provider_quota_sample(
         &self,
         provider: providers::ProviderId,
         key_id: &str,
-        limit: i64,
+        limit: Option<i64>,
         remaining: i64,
-        renews_at: i64,
+        renews_at: Option<i64>,
         source: &str,
     ) -> Result<KeyEffect, ProxyError> {
+        if provider == providers::ProviderId::Keenable {
+            if limit.is_some() || renews_at.is_some() {
+                return Err(ProxyError::Other(
+                    "keenable passive quota samples must not carry a limit or renewal anchor"
+                        .to_string(),
+                ));
+            }
+            let now = self.backend_time.now_ts();
+            self.key_store
+                .record_quota_sync_sample_without_limit(key_id, remaining, now, source)
+                .await?;
+            return Ok(KeyEffect::none());
+        }
         if providers::spec_for(provider).recovery != providers::RecoveryPolicy::NaturalDay {
             return Err(ProxyError::Other(format!(
                 "provider {provider} does not use natural-day quota recovery"
             )));
         }
+        let (Some(limit), Some(renews_at)) = (limit, renews_at) else {
+            return Err(ProxyError::Other(format!(
+                "provider {provider} natural-day quota sample requires a limit and renewal anchor"
+            )));
+        };
         let now = self.backend_time.now_ts();
         self.key_store
             .record_quota_sync_sample(key_id, limit, remaining, now, source)

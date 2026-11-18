@@ -157,6 +157,64 @@ impl ZhihuHarness {
     }
 }
 
+/// QA (keenable-integration todo 12): the REAL `mock_zhihu` tight plan
+/// (`tok-quota-tight`: `zhihu_search` 3/10, `global_search` 5/20) drives the
+/// admin manual sync-usage arm to persist `quota_remaining=3`,
+/// `quota_limit=10` and a `NaturalDay` renewal anchor through the live
+/// `/api/v1/quota` adapter.
+#[tokio::test]
+async fn real_mock_zhihu_tight_plan_persists_through_manual_sync() {
+    let harness = spawn_harness("zhihu-quota-tight-real", &["tok-quota-tight"]).await;
+    let pool = harness.pool().await;
+    let key_id: String = sqlx::query_scalar(
+        "SELECT id FROM api_keys WHERE provider = 'zhihu' AND deleted_at IS NULL \
+         ORDER BY created_at ASC, rowid ASC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("zhihu key row");
+
+    let response = Client::new()
+        .post(format!("{}/api/keys/{key_id}/sync-usage", harness.base_url))
+        .send()
+        .await
+        .expect("manual sync request");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["source"], json!("live"));
+    assert_eq!(body["provider"], json!("zhihu"));
+    assert_eq!(body["quota_limit"], json!(10));
+    assert_eq!(body["quota_remaining"], json!(3));
+    assert!(body["quota_renews_at"].as_i64().is_some());
+
+    let (limit, remaining, renews_at): (Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT quota_limit, quota_remaining, quota_renews_at FROM api_keys WHERE id = ?",
+    )
+    .bind(&key_id)
+    .fetch_one(&pool)
+    .await
+    .expect("key quota row");
+    assert_eq!((limit, remaining), (Some(10), Some(3)));
+    assert!(renews_at.is_some(), "NaturalDay renewal anchor stored");
+
+    let metrics = harness.mock_metrics().await;
+    let quota_reads = metrics["quota"].as_u64().unwrap_or(0);
+    assert!(
+        quota_reads >= 1,
+        "the live quota endpoint was read (scheduler startup may race one extra read): {quota_reads}"
+    );
+    assert_eq!(
+        metrics["last_authorization"],
+        json!("Bearer tok-quota-tight")
+    );
+    assert!(
+        metrics["last_x_request_timestamp"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()),
+        "server-generated request timestamp"
+    );
+}
+
 pub(crate) async fn charged_credits(pool: &sqlx::SqlitePool, token_id: &str) -> i64 {
     sqlx::query_scalar(
         "SELECT COALESCE(SUM(business_credits), 0) FROM billing_ledger \

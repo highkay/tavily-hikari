@@ -56,6 +56,9 @@ struct EgressObservation {
     brave_requests: AtomicUsize,
     seen_usage_bearers: StdMutex<Vec<String>>,
     last_account_api_key: StdMutex<Option<String>>,
+    zhihu_quota_requests: AtomicUsize,
+    seen_zhihu_quota_authorization: StdMutex<Option<String>>,
+    seen_zhihu_quota_timestamp: StdMutex<Option<String>>,
 }
 
 impl EgressObservation {
@@ -1324,4 +1327,387 @@ async fn exa_and_brave_endpoints_are_never_polled_by_quota_sync() {
     assert_eq!(obs.exa_requests.load(Ordering::SeqCst), 0);
     assert_eq!(obs.brave_requests.load(Ordering::SeqCst), 0);
     assert_eq!(obs.account_requests.load(Ordering::SeqCst), 1);
+}
+
+// =====================================================================================
+// Zhihu daily quota adapter (keenable-integration todo 12)
+// =====================================================================================
+
+fn zhihu_quota_payload(zhihu: (i64, i64), global: (i64, i64)) -> serde_json::Value {
+    let entry = |api_id: &str, name: &str, (total, used): (i64, i64)| {
+        json!({
+            "APIID": api_id,
+            "APIName": name,
+            "TotalQuota": total,
+            "TotalUsed": used,
+            "RemainingQuota": total - used
+        })
+    };
+    json!({
+        "Code": 0,
+        "Message": "success",
+        "Data": [
+            entry("zhihu_search", "知乎搜索", zhihu),
+            entry("global_search", "全网搜索", global),
+        ]
+    })
+}
+
+/// Tight QA plan: `zhihu_search` 3/10, `global_search` 5/20 => remaining 3,
+/// limit 10 (the limit of the API that produced the minimum).
+#[test]
+fn parse_zhihu_quota_takes_min_remaining_and_matching_limit() {
+    let synced_at = utc_ts("2026-11-17T09:30:00Z").timestamp();
+    let snapshot = parse_zhihu_quota_snapshot(&zhihu_quota_payload((10, 7), (20, 15)), synced_at)
+        .expect("tight plan parses");
+    assert_eq!(snapshot.quota_remaining, 3);
+    assert_eq!(snapshot.quota_limit, 10);
+    assert_eq!(snapshot.quota_synced_at, synced_at);
+    assert_eq!(
+        snapshot.quota_renews_at,
+        crate::providers::RecoveryPolicy::natural_day_renews_at(synced_at),
+        "renews_at is the shared NaturalDay handoff, not duplicated boundary math"
+    );
+}
+
+/// The min is taken across BOTH APIs even when the narrower API is not the
+/// first numeric entry: global_search can be the limiter.
+#[test]
+fn parse_zhihu_quota_min_can_come_from_global_search() {
+    let snapshot = parse_zhihu_quota_snapshot(
+        &zhihu_quota_payload((10, 5), (20, 19)),
+        utc_ts("2026-11-17T09:30:00Z").timestamp(),
+    )
+    .expect("payload parses");
+    assert_eq!(snapshot.quota_remaining, 1);
+    assert_eq!(snapshot.quota_limit, 20);
+}
+
+/// A payload without `global_search` is a typed `QuotaDataMissing`, never a
+/// silent zero-quota write (QA failure arm).
+#[test]
+fn parse_zhihu_quota_missing_entry_is_typed_not_zero() {
+    let payload = json!({
+        "Code": 0,
+        "Message": "success",
+        "Data": [{
+            "APIID": "zhihu_search",
+            "APIName": "知乎搜索",
+            "TotalQuota": 10,
+            "TotalUsed": 7,
+            "RemainingQuota": 3
+        }]
+    });
+    let err = parse_zhihu_quota_snapshot(&payload, 1_700_000_000)
+        .expect_err("missing global_search must be a typed error");
+    let ProxyError::QuotaDataMissing { reason } = err else {
+        panic!("expected QuotaDataMissing, got {err:?}");
+    };
+    assert!(
+        reason.contains("global_search"),
+        "the typed reason names the missing API: {reason}"
+    );
+}
+
+/// `RemainingQuota == 0` is a valid run-out snapshot: it persists as zero and
+/// keeps the limit of the API that ran out (the NaturalDay sweep restores it).
+#[test]
+fn parse_zhihu_quota_accepts_zero_remaining() {
+    let snapshot = parse_zhihu_quota_snapshot(
+        &zhihu_quota_payload((10, 10), (20, 5)),
+        utc_ts("2026-11-17T09:30:00Z").timestamp(),
+    )
+    .expect("zero remaining is valid");
+    assert_eq!(snapshot.quota_remaining, 0);
+    assert_eq!(snapshot.quota_limit, 10);
+}
+
+/// The renewal anchor rolls at the next Asia/Shanghai midnight (UTC+8), not
+/// at a UTC day/month boundary.
+#[test]
+fn parse_zhihu_quota_renews_at_rolls_at_shanghai_midnight() {
+    let before_midnight = utc_ts("2026-11-17T15:59:59Z").timestamp();
+    let at_midnight = utc_ts("2026-11-17T16:00:00Z").timestamp();
+    let snapshot =
+        parse_zhihu_quota_snapshot(&zhihu_quota_payload((10, 7), (20, 15)), before_midnight)
+            .expect("payload parses");
+    assert_eq!(snapshot.quota_renews_at, at_midnight);
+    let next_day = utc_ts("2026-11-18T16:00:00Z").timestamp();
+    let snapshot = parse_zhihu_quota_snapshot(&zhihu_quota_payload((10, 7), (20, 15)), at_midnight)
+        .expect("payload parses");
+    assert_eq!(
+        snapshot.quota_renews_at, next_day,
+        "a sample exactly at midnight points at the FOLLOWING midnight"
+    );
+}
+
+/// A non-zero `Code` envelope is typed, never parsed as an empty Data[] zero.
+#[test]
+fn parse_zhihu_quota_non_zero_code_is_typed() {
+    let payload = json!({"Code": 20001, "Message": "auth failed", "Data": null});
+    let err = parse_zhihu_quota_snapshot(&payload, 1_700_000_000)
+        .expect_err("non-zero Code must be typed");
+    assert!(matches!(err, ProxyError::QuotaDataMissing { .. }));
+}
+
+/// In-process stand-in for `mock_zhihu /api/v1/quota`: same 3/10 + 5/20
+/// payload shape, records the pooled Authorization and timestamp headers.
+struct ZhihuQuotaMock {
+    base: String,
+}
+
+async fn spawn_zhihu_quota_mock(
+    obs: Arc<EgressObservation>,
+    body: serde_json::Value,
+) -> ZhihuQuotaMock {
+    let body = Arc::new(StdMutex::new(body));
+    let app = Router::new().route(
+        "/api/v1/quota",
+        get({
+            let obs = obs.clone();
+            let body = body.clone();
+            move |headers: axum::http::HeaderMap| {
+                let obs = obs.clone();
+                let body = body.clone();
+                async move {
+                    obs.zhihu_quota_requests.fetch_add(1, Ordering::SeqCst);
+                    *obs.seen_zhihu_quota_authorization
+                        .lock()
+                        .expect("zhihu auth lock") = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    *obs.seen_zhihu_quota_timestamp
+                        .lock()
+                        .expect("zhihu timestamp lock") = headers
+                        .get("x-request-timestamp")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    Json(body.lock().expect("zhihu quota body lock").clone())
+                }
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind zhihu mock");
+    let addr = listener.local_addr().expect("zhihu mock addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .await
+            .expect("zhihu quota mock runs");
+    });
+    ZhihuQuotaMock {
+        base: format!("http://{addr}"),
+    }
+}
+
+async fn build_zhihu_quota_proxy(
+    db_stem: &str,
+    zhihu_base: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (TavilyProxy, crate::ManualBackendTime) {
+    let db_path = temp_db_path(db_stem);
+    let db_str = db_path.to_string_lossy().to_string();
+    let (backend_time, clock) = BackendTime::manual(now);
+    let bootstrap = ProviderBootstrap {
+        serpapi_upstream: "http://127.0.0.1:9".to_string(),
+        serpapi_mcp_upstream: "http://127.0.0.1:9/mcp".to_string(),
+        exa_upstream: "http://127.0.0.1:9".to_string(),
+        brave_upstream: "http://127.0.0.1:9".to_string(),
+        keenable_upstream: "http://127.0.0.1:9".to_string(),
+        keenable_mcp_upstream: "http://127.0.0.1:9/mcp".to_string(),
+        zhihu_upstream: zhihu_base.to_string(),
+        ..ProviderBootstrap::default()
+    };
+    let proxy = TavilyProxy::with_providers_and_time_in_ha_mode(
+        Vec::<String>::new(),
+        "http://127.0.0.1:9",
+        &db_str,
+        TavilyProxyOptions::from_database_path(&db_str),
+        bootstrap,
+        backend_time,
+        HaMode::Single,
+    )
+    .await
+    .expect("create zhihu quota proxy");
+    (proxy, clock)
+}
+
+/// Acceptance: the live adapter persists min remaining, the matching limit,
+/// the shared NaturalDay renewal anchor, and the sync timestamp; the secret
+/// travels as Bearer with a server-generated timestamp, and Tavily /usage is
+/// never contacted.
+#[tokio::test]
+async fn zhihu_quota_sync_persists_tight_plan_through_natural_day_handoff() {
+    let obs = Arc::new(EgressObservation::default());
+    let mocks = spawn_zhihu_quota_mock(obs.clone(), zhihu_quota_payload((10, 7), (20, 15))).await;
+    let now = utc_ts("2026-11-17T09:30:00Z");
+    let (proxy, _clock) = build_zhihu_quota_proxy("zhihu-quota-tight", &mocks.base, now).await;
+    let secret = "zh-quota-tight-a";
+    proxy
+        .key_store
+        .sync_keys(ProviderId::Zhihu, &[secret.to_string()])
+        .await
+        .expect("seed zhihu key");
+    let key_id = key_id_for(&proxy.key_store.pool, secret).await;
+
+    let admission = Arc::new(RemoteAttemptAdmissionController::default());
+    let snapshot = proxy
+        .fetch_zhihu_quota_for_sync(secret, &key_id, admission, false, Duration::from_secs(5))
+        .await
+        .expect("zhihu quota fetch succeeds");
+    assert_eq!(snapshot.quota_remaining, 3);
+    assert_eq!(snapshot.quota_limit, 10);
+    let effect = proxy
+        .record_zhihu_quota_sync(&key_id, &snapshot, "quota_sync/zhihu")
+        .await
+        .expect("zhihu snapshot persists");
+    assert_eq!(effect.code, KEY_EFFECT_NONE);
+
+    let expected_renews_at =
+        crate::providers::RecoveryPolicy::natural_day_renews_at(now.timestamp());
+    let (status, limit, remaining, synced_at, renews_at) =
+        fetch_key_row(&proxy.key_store.pool, &key_id).await;
+    assert_eq!(status, "active");
+    assert_eq!(limit, Some(10));
+    assert_eq!(remaining, Some(3));
+    assert_eq!(synced_at, Some(now.timestamp()));
+    assert_eq!(renews_at, Some(expected_renews_at));
+    assert_eq!(depletion_row_count(&proxy.key_store.pool).await, 0);
+
+    assert_eq!(obs.zhihu_quota_requests.load(Ordering::SeqCst), 1);
+    let expected_authorization = format!("Bearer {secret}");
+    assert_eq!(
+        obs.seen_zhihu_quota_authorization
+            .lock()
+            .expect("zhihu auth lock")
+            .as_deref(),
+        Some(expected_authorization.as_str()),
+        "the Access Secret travels as the native Bearer header"
+    );
+    assert!(
+        obs.seen_zhihu_quota_timestamp
+            .lock()
+            .expect("zhihu timestamp lock")
+            .as_deref()
+            .is_some_and(|value| !value.is_empty()),
+        "a fresh server-side X-Request-Timestamp accompanies the call"
+    );
+    assert_eq!(
+        obs.usage_requests.load(Ordering::SeqCst),
+        0,
+        "zero-leak: the Zhihu lane never dials the Tavily /usage base"
+    );
+}
+
+/// Failure arm: a payload without `global_search` surfaces as a typed
+/// `QuotaDataMissing` through the live adapter and leaves the key's quota
+/// fields untouched (never a silent 0).
+#[tokio::test]
+async fn zhihu_quota_missing_global_search_is_typed_and_writes_nothing() {
+    let obs = Arc::new(EgressObservation::default());
+    let payload = json!({
+        "Code": 0,
+        "Message": "success",
+        "Data": [{
+            "APIID": "zhihu_search",
+            "APIName": "知乎搜索",
+            "TotalQuota": 10,
+            "TotalUsed": 7,
+            "RemainingQuota": 3
+        }]
+    });
+    let mocks = spawn_zhihu_quota_mock(obs.clone(), payload).await;
+    let now = utc_ts("2026-11-17T09:30:00Z");
+    let (proxy, _clock) =
+        build_zhihu_quota_proxy("zhihu-quota-missing-entry", &mocks.base, now).await;
+    let secret = "zh-quota-missing-a";
+    proxy
+        .key_store
+        .sync_keys(ProviderId::Zhihu, &[secret.to_string()])
+        .await
+        .expect("seed zhihu key");
+    let key_id = key_id_for(&proxy.key_store.pool, secret).await;
+
+    let admission = Arc::new(RemoteAttemptAdmissionController::default());
+    let err = proxy
+        .fetch_zhihu_quota_for_sync(secret, &key_id, admission, false, Duration::from_secs(5))
+        .await
+        .expect_err("missing entry must fail");
+    let ProxyError::QuotaDataMissing { reason } = err else {
+        panic!("expected QuotaDataMissing, got {err:?}");
+    };
+    assert!(reason.contains("global_search"), "{reason}");
+    let (status, limit, remaining, synced_at, renews_at) =
+        fetch_key_row(&proxy.key_store.pool, &key_id).await;
+    assert_eq!(status, "active");
+    assert_eq!(limit, None);
+    assert_eq!(remaining, None, "never a silent 0");
+    assert_eq!(synced_at, None);
+    assert_eq!(renews_at, None);
+    assert_eq!(obs.zhihu_quota_requests.load(Ordering::SeqCst), 1);
+}
+
+/// Carry-forward (todo 11 handoff): the Keenable passive posture rides the
+/// SAME provider quota-sample seam with no limit/renewal anchor, preserving
+/// NULL `quota_limit` and leaving status untouched.
+#[tokio::test]
+async fn keenable_passive_quota_handoff_keeps_null_limit_and_status() {
+    let (proxy, _clock) = build_adapter_proxy(
+        "keenable-passive-handoff",
+        &MockUpstreams {
+            base: "http://127.0.0.1:9".to_string(),
+        },
+        utc_ts("2026-11-17T09:30:00Z"),
+    )
+    .await;
+    let secret = "ken-passive-handoff-a";
+    proxy
+        .key_store
+        .sync_keys(ProviderId::Keenable, &[secret.to_string()])
+        .await
+        .expect("seed keenable key");
+    let key_id = key_id_for(&proxy.key_store.pool, secret).await;
+
+    let effect = proxy
+        .record_provider_quota_sample(
+            ProviderId::Keenable,
+            &key_id,
+            None,
+            42,
+            None,
+            "keenable_passive",
+        )
+        .await
+        .expect("passive sample persists");
+    assert_eq!(effect.code, KEY_EFFECT_NONE);
+    let (status, limit, remaining, synced_at, renews_at) =
+        fetch_key_row(&proxy.key_store.pool, &key_id).await;
+    assert_eq!(status, "active", "a harvested balance never changes status");
+    assert_eq!(limit, None, "Keenable has no plan limit (NULL stays NULL)");
+    assert_eq!(remaining, Some(42));
+    assert_eq!(synced_at, Some(utc_ts("2026-11-17T09:30:00Z").timestamp()));
+    assert_eq!(renews_at, None, "no calendar reset for a prepaid balance");
+    let source: String = sqlx::query_scalar(
+        "SELECT source FROM api_key_quota_sync_samples WHERE key_id = ? ORDER BY id DESC LIMIT 1",
+    )
+    .bind(&key_id)
+    .fetch_one(&proxy.key_store.pool)
+    .await
+    .expect("sample row source");
+    assert_eq!(source, "keenable_passive");
+
+    let err = proxy
+        .record_provider_quota_sample(
+            ProviderId::Keenable,
+            &key_id,
+            Some(10),
+            42,
+            None,
+            "keenable_passive",
+        )
+        .await
+        .expect_err("a Keenable passive sample must not carry a limit");
+    assert!(err.to_string().contains("must not carry a limit"));
 }

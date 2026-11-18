@@ -1493,6 +1493,7 @@ export const EN: TranslationShape = {
           'quota_sync/hot': 'Hot quota sync',
           'quota_sync/manual': 'Manual sync',
           'quota_sync/serpapi': 'SerpApi quota sync',
+          'quota_sync/zhihu': 'Zhihu quota sync',
           token_usage_rollup: 'Usage rollups',
           usage_aggregation: 'Usage rollups',
           auth_token_logs_gc: 'Access-token log cleanup',

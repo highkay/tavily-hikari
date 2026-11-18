@@ -425,11 +425,12 @@ fn duration_until_next_local_daily_run(now: DateTime<Local>, hour: u32, minute: 
     tavily_hikari::duration_until_next_local_daily_run(now, hour, minute)
 }
 
-const REMOTE_IO_SCHEDULED_JOB_TYPES: [&str; 9] = [
+const REMOTE_IO_SCHEDULED_JOB_TYPES: [&str; 10] = [
     "quota_sync",
     "quota_sync/manual",
     "quota_sync/hot",
     "quota_sync/serpapi",
+    "quota_sync/zhihu",
     LINUXDO_USER_STATUS_SYNC_JOB_TYPE,
     LINUXDO_CREDIT_RECHARGE_LIFECYCLE_JOB_TYPE,
     "upstream_reconciliation",
@@ -795,8 +796,8 @@ fn spawn_quota_sync_scheduler(state: Arc<AppState>) {
 }
 
 /// ONE quota-sync sweep (cold = 24h pending threshold, hot = 2h-active/15m
-/// stale thresholds). The serpapi `/account` lane enqueues FIRST — a Tavily
-/// backlog must never delay it — and the Tavily lane then enqueues at most
+/// stale thresholds). The provider lanes enqueue FIRST — a Tavily backlog must
+/// never delay them — and the Tavily lane then enqueues at most
 /// `PER_SWEEP_ENQUEUE_CAP` keys. `jitter_max_inclusive` bounds the random
 /// pacing delay before each enqueue (300s cold / 60s hot in production).
 async fn run_quota_sync_sweep(state: &AppState, cold: bool, jitter_max_inclusive: u64) {
@@ -832,6 +833,9 @@ async fn run_quota_sync_sweep(state: &AppState, cold: bool, jitter_max_inclusive
     // new loop or interval. Enqueued FIRST: a Tavily backlog must never delay
     // this lane.
     run_serpapi_pending_quota_sync_lane(state, cold, jitter_max_inclusive).await;
+    // keenable-integration todo 12: the Zhihu daily-quota lane rides the SAME
+    // sweep/lease/dedupe machinery — one more job type, never a new loop.
+    run_zhihu_pending_quota_sync_lane(state, cold, jitter_max_inclusive).await;
 
     let (job_type, log_prefix) = if cold {
         ("quota_sync", "quota-sync")
@@ -2587,6 +2591,19 @@ async fn run_manual_claimed_job(
         "quota_sync/serpapi" => {
             drop(_job_execution_gate);
             run_serpapi_quota_sync_claimed_job(
+                &state,
+                key_id,
+                job_id,
+                claim_generation,
+                manual_remote_attempt,
+            )
+            .await
+        }
+        // keenable-integration todo 12: the ONE Zhihu daily-quota dispatch
+        // arm; body lives in schedulers_provider_quota_sync.rs.
+        "quota_sync/zhihu" => {
+            drop(_job_execution_gate);
+            run_zhihu_quota_sync_claimed_job(
                 &state,
                 key_id,
                 job_id,
