@@ -8,6 +8,12 @@
 //! per-token billing lock under parallel mixed-provider requests, persisted
 //! log hygiene across every provider surface, and NoAvailableKeys isolation.
 //!
+//! Keenable/Zhihu hardening (keenable-integration todo 20) extends the same
+//! harness to SIX providers: the shared wallet spends across the two new
+//! providers and the reserved-credit pre-check gates the NEXT call of either
+//! (cell 7), and the persisted-row privacy scan covers their X-API-Key /
+//! Bearer pool secrets across REST + MCP surfaces (cell 8).
+//!
 //! Real server binary + the four real mock provider binaries
 //! (`mock_tavily` / `mock_serpapi` / `mock_exa` / `mock_brave`) + direct
 //! sqlite assertions (the proven `provider_facades_contract.rs` /
@@ -44,6 +50,8 @@ const TAVILY_POOL_KEY: &str = "mx-tavily-pool-key";
 const SERPAPI_POOL_KEY: &str = "mx-serpapi-pool-key";
 const EXA_POOL_KEY: &str = "mx-exa-pool-key";
 const BRAVE_POOL_KEY: &str = "mx-brave-pool-key";
+const KEENABLE_POOL_KEY: &str = "mx-keenable-pool-key";
+const ZHIHU_POOL_KEY: &str = "mx-zhihu-pool-key";
 
 // ---------------------------------------------------------------------------
 // Shared harness utilities.
@@ -246,6 +254,34 @@ async fn brave_web_search(base: &str, token: &str, query: &str) -> (StatusCode, 
     brave_get(base, token, "/api/brave/res/v1/web/search", query).await
 }
 
+/// POST one Keenable search with the Hikari Bearer token (todo-20 matrix).
+async fn keenable_search(base: &str, token: &str, query: &str) -> (StatusCode, Value) {
+    let response = Client::new()
+        .post(format!("{base}/api/keenable/v1/search"))
+        .bearer_auth(token)
+        .json(&json!({ "query": query }))
+        .send()
+        .await
+        .expect("keenable search request");
+    let status = response.status();
+    (status, response.json().await.unwrap_or(Value::Null))
+}
+
+/// GET one Zhihu content search with the Hikari Bearer token (todo-20
+/// matrix). `Count=3` stays inside the 10 cap so the local guard passes.
+async fn zhihu_search(base: &str, token: &str, query: &str) -> (StatusCode, Value) {
+    let response = Client::new()
+        .get(format!(
+            "{base}/api/zhihu/api/v1/content/zhihu_search?Query={query}&Count=3"
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("zhihu search request");
+    let status = response.status();
+    (status, response.json().await.unwrap_or(Value::Null))
+}
+
 /// Raw MCP-over-HTTP POST returning (status, session header, body bytes).
 async fn mcp_post(
     base: &str,
@@ -309,6 +345,8 @@ struct MatrixHarness {
     exa_base: String,
     brave_base: String,
     tavily_base: String,
+    keenable_base: String,
+    zhihu_base: String,
     _server: ChildGuard,
     _mocks: Vec<ChildGuard>,
 }
@@ -373,6 +411,24 @@ async fn try_spawn_matrix_harness(
             TAVILY_POOL_KEY,
         ),
     });
+    let keenable_port = reserve_local_port();
+    mocks.push(ChildGuard {
+        child: spawn_mock(
+            "MOCK_KEENABLE_TEST_BIN",
+            env!("CARGO_BIN_EXE_mock_keenable"),
+            keenable_port,
+            KEENABLE_POOL_KEY,
+        ),
+    });
+    let zhihu_port = reserve_local_port();
+    mocks.push(ChildGuard {
+        child: spawn_mock(
+            "MOCK_ZHIHU_TEST_BIN",
+            env!("CARGO_BIN_EXE_mock_zhihu"),
+            zhihu_port,
+            ZHIHU_POOL_KEY,
+        ),
+    });
 
     let port = reserve_local_port();
     let db_path = temp_db_path(prefix);
@@ -405,6 +461,17 @@ async fn try_spawn_matrix_harness(
         .env("EXA_API_KEYS", EXA_POOL_KEY)
         .env("BRAVE_UPSTREAM", format!("http://127.0.0.1:{brave_port}"))
         .env("BRAVE_API_KEYS", BRAVE_POOL_KEY)
+        .env(
+            "KEENABLE_UPSTREAM",
+            format!("http://127.0.0.1:{keenable_port}"),
+        )
+        .env(
+            "KEENABLE_MCP_UPSTREAM",
+            format!("http://127.0.0.1:{keenable_port}/mcp"),
+        )
+        .env("KEENABLE_API_KEYS", KEENABLE_POOL_KEY)
+        .env("ZHIHU_UPSTREAM", format!("http://127.0.0.1:{zhihu_port}"))
+        .env("ZHIHU_API_KEYS", ZHIHU_POOL_KEY)
         .env("TAVILY_DISABLE_BACKGROUND_TASKS", "1")
         .env("PROXY_BIND", "127.0.0.1")
         .env("PROXY_PORT", port.to_string())
@@ -426,7 +493,7 @@ async fn try_spawn_matrix_harness(
         remove_sqlite_files(&db_path);
         return None;
     }
-    for provider in ["tavily", "serpapi", "exa", "brave"] {
+    for provider in ["tavily", "serpapi", "exa", "brave", "keenable", "zhihu"] {
         wait_for_provider_keys(&db_str, provider, 1).await;
     }
 
@@ -443,6 +510,8 @@ async fn try_spawn_matrix_harness(
         exa_base: format!("http://127.0.0.1:{exa_port}"),
         brave_base: format!("http://127.0.0.1:{brave_port}"),
         tavily_base: format!("http://127.0.0.1:{tavily_port}"),
+        keenable_base: format!("http://127.0.0.1:{keenable_port}"),
+        zhihu_base: format!("http://127.0.0.1:{zhihu_port}"),
         _server: ChildGuard { child: server },
         _mocks: mocks,
     })
@@ -456,6 +525,8 @@ fn spawn_mock(env_var: &str, compile_time: &str, port: u16, key: &str) -> Child 
     command.arg("--bind").arg(format!("127.0.0.1:{port}"));
     if compile_time.contains("mock_tavily") {
         command.arg("--preseeded-keys").arg(key);
+    } else if compile_time.contains("mock_zhihu") {
+        command.arg("--tokens").arg(key);
     } else {
         command.arg("--keys").arg(key);
     }
@@ -580,6 +651,17 @@ impl MatrixHarness {
             .and_then(|record| record.get("usage"))
             .and_then(Value::as_i64)
             .expect("tavily mock key usage")
+    }
+
+    /// mock_keenable `/metrics` — the zero-upstream detector for the
+    /// Keenable leg (search counter + the last-seen credential slots).
+    async fn keenable_metrics(&self) -> Value {
+        mock_json(&self.keenable_base, "/metrics").await
+    }
+
+    /// mock_zhihu `/metrics` — the zero-upstream detector for the Zhihu leg.
+    async fn zhihu_metrics(&self) -> Value {
+        mock_json(&self.zhihu_base, "/metrics").await
     }
 
     /// Seed one bound user + account quota + bound token through SQLite
@@ -1156,4 +1238,213 @@ async fn empty_provider_pool_does_not_starve_other_providers() {
         ],
         "no serpapi bucket — the empty pool never charged"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Cell 7 — shared wallet spans the Keenable + Zhihu providers (todo 20).
+// ---------------------------------------------------------------------------
+
+/// Matrix cell 7 (keenable-integration todo 20): ONE token spends a Keenable
+/// search (1 credit) plus a Zhihu search (1 credit) against a 2-credit
+/// monthly limit, and the NEXT call of EITHER provider is locally rejected
+/// with 429 `quota_exhausted` and ZERO upstream stub calls — the shared
+/// reserved-credit pre-check covers the two new providers exactly like the
+/// original four.
+#[tokio::test]
+async fn shared_wallet_spends_keenable_and_zhihu_then_gates_either() {
+    let harness = spawn_matrix_harness("matrix-ke-zh-wallet", Some(2)).await;
+    let (base, token) = (harness.base_url.clone(), harness.token.clone());
+
+    let (status, body) = keenable_search(&base, &token, "matrix-keenable").await;
+    assert_eq!(status, StatusCode::OK, "keenable search via shared wallet");
+    assert_eq!(
+        body["usage"]["credits_remaining"],
+        json!(99_999),
+        "the native Keenable body passes through: {body}"
+    );
+    let (status, body) = zhihu_search(&base, &token, "matrix-zhihu").await;
+    assert_eq!(status, StatusCode::OK, "zhihu search via shared wallet");
+    assert_eq!(
+        body["Code"],
+        json!(0),
+        "the native Zhihu envelope passes through: {body}"
+    );
+
+    assert_eq!(harness.month_count().await, 2, "wallet fully spent");
+    assert_eq!(
+        harness.charged_ledger_count().await,
+        2,
+        "one charged ledger row per new-provider op"
+    );
+    assert_eq!(
+        harness.charged_provider_breakdown(&harness.token_id).await,
+        vec![("keenable".to_string(), 1, 1), ("zhihu".to_string(), 1, 1),],
+        "both new providers settle exactly one credit from the one wallet"
+    );
+
+    // Snapshot the two new providers' upstream observation surfaces.
+    let keenable_before = harness.keenable_metrics().await;
+    let zhihu_before = harness.zhihu_metrics().await;
+
+    // The NEXT call of either provider is rejected locally.
+    let (status, body) = keenable_search(&base, &token, "matrix-next-keenable").await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the next keenable call is gated by the shared wallet"
+    );
+    assert_eq!(
+        body.get("error").and_then(Value::as_str),
+        Some("quota_exhausted")
+    );
+    let (status, body) = zhihu_search(&base, &token, "matrix-next-zhihu").await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the next zhihu call is gated by the shared wallet"
+    );
+    assert_eq!(
+        body.get("error").and_then(Value::as_str),
+        Some("quota_exhausted")
+    );
+
+    // ZERO upstream stub calls: both mock snapshots identical, wallet frozen.
+    assert_eq!(harness.month_count().await, 2, "rejections never settle");
+    assert_eq!(
+        harness.keenable_metrics().await,
+        keenable_before,
+        "keenable mock was never reached by the rejected request"
+    );
+    assert_eq!(
+        harness.zhihu_metrics().await,
+        zhihu_before,
+        "zhihu mock was never reached by the rejected request"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cell 8 — Keenable/Zhihu persisted-row privacy (todo 20).
+// ---------------------------------------------------------------------------
+
+/// Matrix cell 8 (keenable-integration todo 20 privacy gate): after one REST
+/// call per new-provider route and one MCP tools/call per new-provider MCP
+/// surface, NO persisted `request_logs` row — including response bodies —
+/// carries the Keenable pooled `X-API-Key` secret, the Zhihu pooled Bearer
+/// Access Secret, or the Hikari `th-` token (sent through the client-side
+/// `X-API-Key` and `Authorization` slots to exercise the strip paths).
+#[tokio::test]
+async fn persisted_rows_never_carry_keenable_or_zhihu_secrets() {
+    let harness = spawn_matrix_harness("matrix-ke-zh-privacy", None).await;
+    let (base, token) = (harness.base_url.clone(), harness.token.clone());
+
+    // REST surface, Keenable: the native client slot carries the th- token
+    // (the executor must swap it for the pooled key upstream).
+    let response = Client::new()
+        .post(format!("{base}/api/keenable/v1/search"))
+        .header("x-api-key", &token)
+        .json(&json!({ "query": "privacy-keenable" }))
+        .send()
+        .await
+        .expect("keenable search via native slot");
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = Client::new()
+        .get(format!(
+            "{base}/api/keenable/v1/fetch?url=https%3A%2F%2Fexample.com%2Fprivacy"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("keenable fetch");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // REST surface, Zhihu: adversarial client headers (a forged timestamp
+    // and a forged X-API-Key) ride the request; the server must replace or
+    // drop them before the upstream.
+    for path in [
+        "/api/zhihu/api/v1/content/zhihu_search?Query=privacy-zhihu&Count=3",
+        "/api/zhihu/api/v1/content/global_search?Query=privacy-global&Count=3",
+    ] {
+        let response = Client::new()
+            .get(format!("{base}{path}"))
+            .bearer_auth(&token)
+            .header("x-request-timestamp", "1")
+            .header("x-api-key", "evil-client-slot")
+            .send()
+            .await
+            .expect("zhihu facade request");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "zhihu route serves the native envelope: {path}"
+        );
+    }
+
+    // MCP surfaces: initialize then one billable tools/call each.
+    let keenable_init =
+        mcp_post(&base, "/keenable/mcp", &token, None, &initialize_message(1)).await;
+    assert_eq!(keenable_init.0, StatusCode::OK, "keenable mcp initialize");
+    let keenable_session = keenable_init.1.expect("keenable mcp session header");
+    let (status, _, _) = mcp_post(
+        &base,
+        "/keenable/mcp",
+        &token,
+        Some(&keenable_session),
+        &tools_call_message(2, "search_web_pages", json!({ "query": "privacy" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "keenable mcp tools/call");
+
+    let (status, _, _) = mcp_post(&base, "/zhihu/mcp", &token, None, &initialize_message(3)).await;
+    assert_eq!(status, StatusCode::OK, "zhihu mcp initialize");
+    let (status, _, _) = mcp_post(
+        &base,
+        "/zhihu/mcp",
+        &token,
+        None,
+        &tools_call_message(4, "zhihu_search", json!({ "query": "privacy", "count": 3 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "zhihu mcp tools/call");
+
+    // Every upstream call landed on the two new providers' mocks (the MCP
+    // legs reached their own upstream only).
+    assert_eq!(
+        harness.keenable_metrics().await["search"],
+        json!(1),
+        "one keenable REST search"
+    );
+    assert_eq!(harness.keenable_metrics().await["mcp_tools_call"], json!(1));
+    assert_eq!(harness.zhihu_metrics().await["zhihu_search"], json!(2));
+    assert_eq!(harness.zhihu_metrics().await["global_search"], json!(1));
+
+    // The privacy gate: scan EVERY persisted text field of EVERY row. Unlike
+    // cell 5 (which exempts response bodies only for the mock_tavily echo),
+    // neither new mock echoes any credential, so all six fields must be
+    // clean of both pool secrets AND the th- token.
+    let rows = harness.persisted_request_log_fields().await;
+    assert!(rows.len() >= 8, "all new-provider surfaces persisted a row");
+    let secret_tail = token
+        .strip_prefix("th-")
+        .and_then(|rest| rest.split_once('-').map(|(_, secret)| secret.to_string()))
+        .expect("token secret tail");
+    for (index, fields) in rows.iter().enumerate() {
+        for text in fields {
+            assert!(
+                !text.contains(&token),
+                "persisted row {index} must never carry the full th- token"
+            );
+            assert!(
+                !text.contains(&secret_tail),
+                "persisted row {index} must never carry the th- secret tail"
+            );
+            assert!(
+                !text.contains(KEENABLE_POOL_KEY),
+                "persisted row {index} must never carry the keenable X-API-Key secret"
+            );
+            assert!(
+                !text.contains(ZHIHU_POOL_KEY),
+                "persisted row {index} must never carry the zhihu Bearer secret"
+            );
+        }
+    }
 }

@@ -2789,3 +2789,12 @@ async fn exa_unknown_tool_and_deprecated_shims_are_typed_errors() {
 
 include!("common/provider_mcp_e2e_zhihu_harness.rs");
 include!("common/provider_mcp_e2e_zhihu_cases.rs");
+
+// ---------------------------------------------------------------------------
+// Keenable + Zhihu cross-surface MCP hardening matrix (keenable-integration
+// todo 20) — both provider MCP surfaces live in one server instance so the
+// shared-wallet, cross-surface session, and control-plane cells can be
+// expressed (extracted into tests/common/ for the 3050-line source budget;
+// same crate-root include scope as the harness files above).
+// ---------------------------------------------------------------------------
+include!("common/provider_mcp_e2e_keenable_zhihu_matrix.rs");

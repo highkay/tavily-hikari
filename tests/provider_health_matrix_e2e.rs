@@ -20,6 +20,14 @@
 //!   /api/brave/res/v1/web/search logs kind api:brave/web; request_logs keeps
 //!   the CANONICAL path (golden-pinned) while auth_token_logs keeps the
 //!   registered full path (T14-committed bin boundary).
+//!
+//! Keenable/Zhihu legs (keenable-integration todo 20): keenable 402
+//! exhaustion marks the knob with zero depletion rows (the brave M8 mirror),
+//! keenable UtcMonth recovery flips an exhausted key from a prior month on
+//! the live acquire path, and zhihu NaturalDay exhaustion lands through the
+//! live `/api/v1/quota` sync-usage adapter (RemainingQuota=0) with the key
+//! staying exhausted before the natural-day boundary and flipping (with its
+//! auto_restore_active audit row) after it.
 
 use std::{
     net::TcpListener as StdTcpListener,
@@ -135,6 +143,13 @@ struct ProviderCfg {
     keys_env: &'static str,
     pool_keys: &'static [&'static str],
     mock_keys: &'static [&'static str],
+    /// CLI flag that seeds the mock's scripted credentials: `--keys` for
+    /// every existing mock, `--tokens` for mock_zhihu (todo 20).
+    mock_key_flag: &'static str,
+    /// Disable the server's background tasks for this configuration: the
+    /// todo-20 Zhihu NaturalDay legs seed `quota_renews_at` directly, and the
+    /// background quota-sync lane must not race the seeded value.
+    disable_background_tasks: bool,
 }
 
 const SERPAPI_CFG_THROTTLED: ProviderCfg = ProviderCfg {
@@ -146,6 +161,8 @@ const SERPAPI_CFG_THROTTLED: ProviderCfg = ProviderCfg {
     keys_env: "SERPAPI_API_KEYS",
     pool_keys: &["key-throttled", "sp-live"],
     mock_keys: &["sp-live"],
+    mock_key_flag: "--keys",
+    disable_background_tasks: false,
 };
 
 const BRAVE_CFG_THROTTLED: ProviderCfg = ProviderCfg {
@@ -157,6 +174,8 @@ const BRAVE_CFG_THROTTLED: ProviderCfg = ProviderCfg {
     keys_env: "BRAVE_API_KEYS",
     pool_keys: &["key-throttled", "br-live"],
     mock_keys: &["br-live"],
+    mock_key_flag: "--keys",
+    disable_background_tasks: false,
 };
 
 const SERPAPI_CFG_BAD: ProviderCfg = ProviderCfg {
@@ -168,6 +187,8 @@ const SERPAPI_CFG_BAD: ProviderCfg = ProviderCfg {
     keys_env: "SERPAPI_API_KEYS",
     pool_keys: &["sp-bad"],
     mock_keys: &["sp-good"],
+    mock_key_flag: "--keys",
+    disable_background_tasks: false,
 };
 
 const SERPAPI_CFG_EXHAUSTED: ProviderCfg = ProviderCfg {
@@ -179,6 +200,8 @@ const SERPAPI_CFG_EXHAUSTED: ProviderCfg = ProviderCfg {
     keys_env: "SERPAPI_API_KEYS",
     pool_keys: &["key-exhausted"],
     mock_keys: &["sp-good"],
+    mock_key_flag: "--keys",
+    disable_background_tasks: false,
 };
 
 const EXA_CFG_EXHAUSTED: ProviderCfg = ProviderCfg {
@@ -190,6 +213,8 @@ const EXA_CFG_EXHAUSTED: ProviderCfg = ProviderCfg {
     keys_env: "EXA_API_KEYS",
     pool_keys: &["key-exhausted"],
     mock_keys: &["ex-good"],
+    mock_key_flag: "--keys",
+    disable_background_tasks: false,
 };
 
 const BRAVE_CFG_HARVEST_EXHAUST: ProviderCfg = ProviderCfg {
@@ -201,6 +226,8 @@ const BRAVE_CFG_HARVEST_EXHAUST: ProviderCfg = ProviderCfg {
     keys_env: "BRAVE_API_KEYS",
     pool_keys: &["br-live", "key-exhausted"],
     mock_keys: &["br-live"],
+    mock_key_flag: "--keys",
+    disable_background_tasks: false,
 };
 
 const EXA_CFG_LIVE: ProviderCfg = ProviderCfg {
@@ -212,6 +239,8 @@ const EXA_CFG_LIVE: ProviderCfg = ProviderCfg {
     keys_env: "EXA_API_KEYS",
     pool_keys: &["ex-live"],
     mock_keys: &["ex-live"],
+    mock_key_flag: "--keys",
+    disable_background_tasks: false,
 };
 
 const SERPAPI_CFG_RENEWAL: ProviderCfg = ProviderCfg {
@@ -223,6 +252,8 @@ const SERPAPI_CFG_RENEWAL: ProviderCfg = ProviderCfg {
     keys_env: "SERPAPI_API_KEYS",
     pool_keys: &["sp-renew"],
     mock_keys: &["sp-renew"],
+    mock_key_flag: "--keys",
+    disable_background_tasks: false,
 };
 
 const BRAVE_CFG_MONTH: ProviderCfg = ProviderCfg {
@@ -234,6 +265,8 @@ const BRAVE_CFG_MONTH: ProviderCfg = ProviderCfg {
     keys_env: "BRAVE_API_KEYS",
     pool_keys: &["br-month"],
     mock_keys: &["br-month"],
+    mock_key_flag: "--keys",
+    disable_background_tasks: false,
 };
 
 const BRAVE_CFG_LIVE: ProviderCfg = ProviderCfg {
@@ -245,6 +278,59 @@ const BRAVE_CFG_LIVE: ProviderCfg = ProviderCfg {
     keys_env: "BRAVE_API_KEYS",
     pool_keys: &["br-live"],
     mock_keys: &["br-live"],
+    mock_key_flag: "--keys",
+    disable_background_tasks: false,
+};
+
+// Keenable/Zhihu configurations (keenable-integration todo 20).
+
+/// Two-key keenable pool with the mock's 402 knob LRU-first: the bounded
+/// cross-key retry absorbs the 402 on the healthy sibling while the knob is
+/// fully marked exhausted (the brave M8 mirror).
+const KEENABLE_CFG_EXHAUSTED: ProviderCfg = ProviderCfg {
+    provider: "keenable",
+    mock_bin_env: "MOCK_KEENABLE_TEST_BIN",
+    mock_bin_name: "mock_keenable",
+    mock_bin_exe: env!("CARGO_BIN_EXE_mock_keenable"),
+    upstream_env: "KEENABLE_UPSTREAM",
+    keys_env: "KEENABLE_API_KEYS",
+    pool_keys: &["key-exhausted", "ke-live"],
+    mock_keys: &["ke-live"],
+    mock_key_flag: "--keys",
+    disable_background_tasks: false,
+};
+
+/// Single live keenable key used by the UtcMonth recovery flip (the brave
+/// month-window mirror: seed exhausted in a PRIOR month, request, flip).
+const KEENABLE_CFG_MONTH: ProviderCfg = ProviderCfg {
+    provider: "keenable",
+    mock_bin_env: "MOCK_KEENABLE_TEST_BIN",
+    mock_bin_name: "mock_keenable",
+    mock_bin_exe: env!("CARGO_BIN_EXE_mock_keenable"),
+    upstream_env: "KEENABLE_UPSTREAM",
+    keys_env: "KEENABLE_API_KEYS",
+    pool_keys: &["ke-month"],
+    mock_keys: &["ke-month"],
+    mock_key_flag: "--keys",
+    disable_background_tasks: false,
+};
+
+/// Zhihu pool for the NaturalDay legs: `tok-quota-zero` (the mock's spent
+/// natural-day plan) plus a live sibling. The live sibling keeps tier-1
+/// leasing off the exhausted key, so the NaturalDay sweep is the only
+/// mechanism that can ever flip `tok-quota-zero` (a success-restore would
+/// require leasing it).
+const ZHIHU_CFG_NATURAL_DAY: ProviderCfg = ProviderCfg {
+    provider: "zhihu",
+    mock_bin_env: "MOCK_ZHIHU_TEST_BIN",
+    mock_bin_name: "mock_zhihu",
+    mock_bin_exe: env!("CARGO_BIN_EXE_mock_zhihu"),
+    upstream_env: "ZHIHU_UPSTREAM",
+    keys_env: "ZHIHU_API_KEYS",
+    pool_keys: &["tok-quota-zero", "tok-live"],
+    mock_keys: &["tok-quota-zero", "tok-live"],
+    mock_key_flag: "--tokens",
+    disable_background_tasks: true,
 };
 
 struct HealthHarness {
@@ -285,7 +371,7 @@ async fn try_spawn_harness(prefix: &str, providers: &[ProviderCfg]) -> Option<He
         ))
         .arg("--bind")
         .arg(format!("127.0.0.1:{mock_port}"))
-        .arg("--keys")
+        .arg(cfg.mock_key_flag)
         .arg(cfg.mock_keys.join(","))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -318,11 +404,21 @@ async fn try_spawn_harness(prefix: &str, providers: &[ProviderCfg]) -> Option<He
             "SERPAPI_MCP_UPSTREAM",
             format!("http://127.0.0.1:{dead_port}/mcp"),
         )
+        // The keenable hosted-MCP surface is never exercised by this suite;
+        // pin it to a dead local port so production is unreachable by
+        // construction (the facades/matrix harnesses do the same).
+        .env(
+            "KEENABLE_MCP_UPSTREAM",
+            format!("http://127.0.0.1:{dead_port}/mcp"),
+        )
         .env("PROXY_BIND", "127.0.0.1")
         .env("PROXY_PORT", port.to_string())
         .env("PROXY_DB_PATH", &db_str)
         .env("DEV_OPEN_ADMIN", "true")
         .env("RUST_LOG", "warn,tavily_hikari=info,sqlx::query=error");
+    if providers.iter().any(|cfg| cfg.disable_background_tasks) {
+        command.env("TAVILY_DISABLE_BACKGROUND_TASKS", "1");
+    }
     for (name, value) in &server_env {
         command.env(name, value);
     }
@@ -507,6 +603,34 @@ impl HealthHarness {
             .send()
             .await
             .expect("brave request");
+        let status = response.status();
+        (status, response.json().await.expect("json body"))
+    }
+
+    /// POST one Keenable search with the harness Bearer token (todo 20).
+    async fn post_keenable_search(&self, query: &str) -> (reqwest::StatusCode, Value) {
+        let response = Client::new()
+            .post(format!("{}/api/keenable/v1/search", self.base_url))
+            .bearer_auth(&self.token)
+            .json(&json!({ "query": query }))
+            .send()
+            .await
+            .expect("keenable request");
+        let status = response.status();
+        (status, response.json().await.expect("json body"))
+    }
+
+    /// GET one Zhihu content search with the harness Bearer token (todo 20).
+    async fn get_zhihu_search(&self, query: &str) -> (reqwest::StatusCode, Value) {
+        let response = Client::new()
+            .get(format!(
+                "{}/api/zhihu/api/v1/content/zhihu_search?Query={query}&Count=3",
+                self.base_url
+            ))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .expect("zhihu request");
         let status = response.status();
         (status, response.json().await.expect("json body"))
     }
@@ -1085,6 +1209,239 @@ async fn brave_registered_full_path_logs_canonical_kind_with_full_path_on_token_
             .as_deref(),
         Some("api:brave/web"),
         "registered path logs the canonical kind"
+    );
+    pool.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// Keenable/Zhihu exhaustion + recovery legs (keenable-integration todo 20).
+// ---------------------------------------------------------------------------
+
+/// Keenable exhaustion leg (todo 20): with the mock's 402 knob LRU-first and
+/// a healthy sibling pooled, the bounded cross-key retry absorbs the 402
+/// inside the request — the client sees 200 — while the knob is FULLY marked
+/// exhausted with its audit row and ZERO api_key_low_quota_depletions rows
+/// (the brave M8 mirror; no Tavily-432 depletion semantics for keenable).
+#[tokio::test]
+async fn keenable_402_exhausts_marks_and_writes_zero_depletion_rows() {
+    let harness = spawn_harness("health-keenable-402", &[KEENABLE_CFG_EXHAUSTED]).await;
+    harness.make_lru_first("key-exhausted").await;
+
+    let (status, body) = harness.post_keenable_search("keenable exhaust probe").await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "an eligible pool absorbs the keenable 402: {}",
+        body
+    );
+
+    assert_eq!(
+        harness.key_status("key-exhausted").await,
+        "exhausted",
+        "the 402 knob is fully marked exhausted"
+    );
+    assert_eq!(
+        harness
+            .maintenance_count("key-exhausted", "auto_mark_exhausted")
+            .await,
+        1,
+        "auto_mark_exhausted audit row present"
+    );
+    assert_eq!(
+        harness.depletion_rows().await,
+        0,
+        "M8: keenable exhaustion never writes depletion rows"
+    );
+
+    // The healthy sibling served the absorbed request and the NEXT request
+    // leases it directly (the 402 knob stays exhausted here).
+    let (status2, _) = harness
+        .post_keenable_search("keenable exhaust probe 2")
+        .await;
+    assert_eq!(status2, reqwest::StatusCode::OK, "next request succeeds");
+    let live_id = harness.key_id("ke-live").await;
+    let rows = harness.request_log_key_ids().await;
+    let last = rows.last().expect("at least one row");
+    assert_eq!(
+        last.0, live_id,
+        "request 2 ends on the healthy key (the 402 knob never recovers here)"
+    );
+    assert_eq!(last.1, 200);
+}
+
+/// Keenable recovery leg (todo 20): an exhausted keenable key seeded from a
+/// PRIOR month window flips back to active through the live acquire path
+/// (`RecoveryPolicy::UtcMonth` — the brave month-window mirror), never on a
+/// natural-day boundary.
+#[tokio::test]
+async fn keenable_exhausted_key_recovers_at_the_utc_month_boundary() {
+    let harness = spawn_harness("health-keenable-month", &[KEENABLE_CFG_MONTH]).await;
+
+    let pool = harness.pool().await;
+    sqlx::query(
+        "UPDATE api_keys SET status = 'exhausted', status_changed_at = ? \
+         WHERE api_key = 'ke-month'",
+    )
+    .bind(chrono::Utc::now().timestamp() - 70 * 86_400)
+    .execute(&pool)
+    .await
+    .expect("seed exhausted keenable key from a prior month window");
+    pool.close().await;
+
+    let (status, body) = harness
+        .post_keenable_search("keenable month flip probe")
+        .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "month-window-passed key leased: {}",
+        body
+    );
+    assert_eq!(
+        harness.key_status("ke-month").await,
+        "active",
+        "keenable UtcMonth flip (the T9 policy, pinned E2E)"
+    );
+}
+
+/// Zhihu exhaustion + NaturalDay recovery leg (todo 20): the live
+/// `/api/v1/quota` sync-usage adapter reads `RemainingQuota=0` and marks the
+/// pooled secret exhausted with a NaturalDay renewal anchor in the FUTURE.
+/// A live sibling key keeps tier-1 leasing off the exhausted secret, so the
+/// NaturalDay sweep (which every acquire runs) is the only mechanism that
+/// can flip it: the before-boundary leg proves the sweep does NOT flip a key
+/// whose anchor is still ahead (status stays `exhausted`, zero
+/// `auto_restore_active` rows, while the sibling serves the native
+/// envelope), and the after-boundary leg (clock fields rewound past the
+/// anchor) proves the flip: `active` + one `auto_restore_active` audit row
+/// carrying the natural-day reason.
+#[tokio::test]
+async fn zhihu_natural_day_exhaustion_stays_gated_before_boundary_and_flips_after() {
+    let harness = spawn_harness("health-zhihu-natural-day", &[ZHIHU_CFG_NATURAL_DAY]).await;
+    let key_id = harness.key_id("tok-quota-zero").await;
+
+    // LIVE exhaustion through the real sync-usage adapter: the free quota
+    // endpoint reports RemainingQuota=0 for both APIs.
+    let response = Client::new()
+        .post(format!("{}/api/keys/{key_id}/sync-usage", harness.base_url))
+        .send()
+        .await
+        .expect("manual sync-usage request");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: Value = response.json().await.expect("sync-usage body");
+    assert_eq!(body["provider"], json!("zhihu"));
+    assert_eq!(body["source"], json!("live"));
+    assert_eq!(body["quota_remaining"], json!(0));
+
+    assert_eq!(
+        harness.key_status("tok-quota-zero").await,
+        "exhausted",
+        "the live adapter marked the spent natural-day quota exhausted"
+    );
+    let pool = harness.pool().await;
+    let (status, renews_at): (String, Option<i64>) =
+        sqlx::query_as("SELECT status, quota_renews_at FROM api_keys WHERE id = ?")
+            .bind(&key_id)
+            .fetch_one(&pool)
+            .await
+            .expect("zhihu key row");
+    assert_eq!(status, "exhausted");
+    let renews_at = renews_at.expect("NaturalDay renewal anchor stored");
+    assert!(
+        renews_at > chrono::Utc::now().timestamp(),
+        "the anchor is the NEXT Asia/Shanghai midnight (in the future)"
+    );
+    // Pin the anchor one hour out: the before-boundary leg below must hold
+    // regardless of how close the real Shanghai midnight is.
+    sqlx::query("UPDATE api_keys SET quota_renews_at = ? WHERE id = ?")
+        .bind(chrono::Utc::now().timestamp() + 3_600)
+        .bind(&key_id)
+        .execute(&pool)
+        .await
+        .expect("pin the future anchor");
+    pool.close().await;
+
+    // BEFORE the boundary: the acquire path runs the NaturalDay sweep on
+    // every zhihu request, and it must NOT flip a key whose anchor is still
+    // ahead. The live sibling keeps tier-1 leasing off the exhausted key (a
+    // success on it would restore it), so the sweep is the ONLY mechanism
+    // that could flip it here — and the status must stay `exhausted` with
+    // zero restore audit rows while the sibling serves the envelope.
+    let (status, body) = harness.get_zhihu_search("zhihu boundary probe").await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "the live sibling still serves the envelope: {body}"
+    );
+    assert_eq!(body["Code"], json!(0));
+    assert_eq!(
+        harness.key_status("tok-quota-zero").await,
+        "exhausted",
+        "one hour before the boundary the NaturalDay sweep does not flip the key"
+    );
+    assert_eq!(
+        harness
+            .maintenance_count("tok-quota-zero", "auto_restore_active")
+            .await,
+        0,
+        "no restore audit row before the boundary"
+    );
+
+    // AFTER the boundary (clock fields rewound past the anchor): the sweep
+    // flips the key to active on the live acquire path.
+    let pool = harness.pool().await;
+    let now = chrono::Utc::now().timestamp();
+    sqlx::query("UPDATE api_keys SET status_changed_at = ?, quota_renews_at = ? WHERE id = ?")
+        .bind(now - 7_200)
+        .bind(now - 3_600)
+        .bind(&key_id)
+        .execute(&pool)
+        .await
+        .expect("rewind the clock fields past the natural-day boundary");
+    pool.close().await;
+
+    let (status, body) = harness.get_zhihu_search("zhihu boundary probe 2").await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "the natural-day flip re-leases the key: {body}"
+    );
+    assert_eq!(
+        body["Code"],
+        json!(0),
+        "native envelope served after the flip"
+    );
+    assert_eq!(
+        harness.key_status("tok-quota-zero").await,
+        "active",
+        "NaturalDay flip (Zhihu policy, pinned E2E)"
+    );
+    assert_eq!(
+        harness
+            .maintenance_count("tok-quota-zero", "auto_restore_active")
+            .await,
+        1,
+        "the NaturalDay flip writes its auto_restore_active audit row"
+    );
+    let pool = harness.pool().await;
+    let reason_code: Option<String> = sqlx::query_scalar(
+        "SELECT m.reason_code FROM api_key_maintenance_records m \
+         JOIN api_keys k ON k.id = m.key_id \
+         WHERE k.api_key = 'tok-quota-zero' AND m.operation_code = 'auto_restore_active' \
+         ORDER BY m.created_at DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("natural-day audit row");
+    assert_eq!(
+        reason_code.as_deref(),
+        Some("natural_day_recovery"),
+        "the audit row carries the natural-day reason"
+    );
+    assert_eq!(
+        harness.depletion_rows().await,
+        0,
+        "M8: zhihu exhaustion never writes depletion rows"
     );
     pool.close().await;
 }

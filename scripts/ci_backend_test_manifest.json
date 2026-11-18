@@ -179,7 +179,9 @@
         "tavily_proxy::proxy_provider_facade_serpapi::serpapi_facade_translation_tests::",
         "tavily_proxy::proxy_provider_facade_serpapi_mcp::serpapi_mcp_passthrough_tests::",
         "tavily_proxy::proxy_provider_facade_exa::exa_facade_translation_tests::",
-        "tavily_proxy::proxy_provider_facade_brave::brave_facade_translation_tests::"
+        "tavily_proxy::proxy_provider_facade_brave::brave_facade_translation_tests::",
+        "tavily_proxy::proxy_provider_facade_keenable::keenable_facade_translation_tests::",
+        "tavily_proxy::proxy_provider_facade_zhihu::zhihu_query_guard_tests::"
       ]
     },
     {
@@ -887,6 +889,7 @@
         "server::tests::provider_admin_api_keys::",
         "server::tests::provider_privacy_redaction::",
         "server::tests::provider_facade_routing::",
+        "server::tests::provider_facade_routing_keenable_zhihu::",
         "server::tests::provider_facade_routing_registry::",
         "server::tests::provider_read_surface::",
         "server::tests::provider_quota_sync_dispatch::",

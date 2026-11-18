@@ -23,6 +23,8 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
 };
 
+#[path = "common/keenable_zhihu_matrix_contract.rs"]
+mod keenable_zhihu_matrix;
 #[path = "common/support_binaries.rs"]
 mod support_binaries;
 #[path = "common/zhihu_facade_harness.rs"]
@@ -3361,9 +3363,9 @@ mod keenable {
     }
 
     /// 429 rate_limit_error passes through verbatim with its Retry-After
-    /// header, arms the shared HTTP backoff scope (the parsed 1s Retry-After
-    /// climbs to the shared 30s ladder floor), the key stays active, and
-    /// nothing bills.
+    /// header, arms the shared HTTP backoff scope (the todo-11 keenable lane
+    /// clamps the 1s Retry-After up to its 5s second-scale floor), the key
+    /// stays active, and nothing bills.
     #[tokio::test]
     async fn keenable_429_arms_the_shared_backoff_without_billing() {
         let harness = spawn_harness("facades-keenable-429", &["key-rate"], &["ke-x"]).await;
@@ -3403,8 +3405,9 @@ mod keenable {
         .expect("backoff row");
         assert_eq!(
             backoff.get::<i64, _>("retry_after_secs"),
-            30,
-            "the generic lane clamps the 1s Retry-After to the 30s ladder floor"
+            5,
+            "the todo-11 keenable lane clamps the 1s Retry-After to the 5s floor \
+             (keenable_and_zhihu_rate_limited_backoff_is_second_scale_5_to_300)"
         );
         pool.close().await;
 
