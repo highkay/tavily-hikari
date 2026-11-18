@@ -1,19 +1,37 @@
 /**
- * Browser demo provider surface (plan todo 25): REST route dispatch, the three
- * provider MCP endpoints (`/serpapi/mcp`, `/exa/mcp`, `/brave/mcp`), the
- * provider request-kind catalog, mixed-provider demo logs, and mixed-provider
- * demo keys.
+ * Browser demo provider surface (plan todo 25): REST route dispatch, the five
+ * provider MCP endpoints (`/serpapi/mcp`, `/exa/mcp`, `/brave/mcp`,
+ * `/keenable/mcp`, `/zhihu/mcp`), the provider request-kind catalog,
+ * mixed-provider demo logs, and mixed-provider demo keys.
  *
  * Fixture ground truth: `src/bin/mock_serpapi.rs`, `src/bin/mock_exa.rs`,
- * `src/bin/mock_brave.rs`; MCP catalogs mirror `src/server/provider_mcp_*`.
+ * `src/bin/mock_brave.rs`, `src/bin/mock_keenable.rs`, and
+ * `src/bin/mock_zhihu.rs`; MCP catalogs mirror `src/server/provider_mcp_*`.
  * Everything here is answered locally in the browser — demo mode never calls a
- * network. The interception whitelist in `demo.ts` adds the three provider MCP
+ * network. The interception whitelist in `demo.ts` adds the five provider MCP
  * paths explicitly (M22) while unknown `/api/*` paths keep the pre-existing
  * demo fall-through shape.
  */
 import { demoExaAnswerFixture, demoExaContentsFixture, demoExaMcpToolFixture, demoExaSearchFixture, EXA_MCP_TOOLS, EXA_STREAM_REJECT_MESSAGE, isDemoExaStreamTruthy } from './demoExa'
 import { BRAVE_MCP_TOOLS, BRAVE_RATE_LIMIT_HEADERS, demoBraveLlmContextFixture, demoBraveMcpToolFixture, demoBraveNewsFixture, demoBraveWebFixture } from './demoBrave'
 import { demoSerpapiMcpToolResult, demoSerpapiMcpTools, demoSerpapiSearchFixture } from './demoSerpapi'
+import {
+  KEENABLE_MCP_TOOLS,
+  demoKeenableFetchFixture,
+  demoKeenableInsufficientCreditsFixture,
+  demoKeenableInvalidKeyFixture,
+  demoKeenableMissingParameterFixture,
+  demoKeenableRateLimitHeaders,
+  demoKeenableRateLimitedFixture,
+  demoKeenableSearchFixture,
+} from './demoKeenable'
+import {
+  ZHIHU_MCP_TOOLS,
+  demoZhihuErrorFixture,
+  demoZhihuGlobalSearchFixture,
+  demoZhihuQuotaFixture,
+  demoZhihuSearchFixture,
+} from './demoZhihu'
 import { normalizePayloadProvider, parseProviderId, PROVIDER_IDS, type ProviderId, type SummaryProviderCount } from './providers'
 import type { SummaryQuotaCharge } from './runtime'
 
@@ -57,7 +75,7 @@ async function readDemoJsonBody(init?: RequestInit): Promise<JsonObject> {
 
 /** Exact provider MCP ingress paths (M22: explicit additions, not prefixes). */
 export function isProviderMcpPath(path: string): boolean {
-  return path === '/serpapi/mcp' || path === '/exa/mcp' || path === '/brave/mcp'
+  return path === '/serpapi/mcp' || path === '/exa/mcp' || path === '/brave/mcp' || path === '/keenable/mcp' || path === '/zhihu/mcp'
 }
 
 /**
@@ -69,6 +87,7 @@ export async function handleProviderDemoRoute(
   path: string,
   method: string,
   init?: RequestInit,
+  search = '',
 ): Promise<Response | null> {
   if (path === '/api/serpapi/search' && (method === 'GET' || method === 'POST')) {
     return demoJsonResponse(demoSerpapiSearchFixture())
@@ -91,19 +110,85 @@ export async function handleProviderDemoRoute(
   if (method === 'GET' && path === '/api/brave/res/v1/llm/context') {
     return demoJsonResponse(demoBraveLlmContextFixture())
   }
+  if (path === '/api/keenable/v1/search' && method === 'POST') {
+    const failure = demoKeenableFailure(init)
+    if (failure) return failure
+    const body = await readDemoJsonBody(init)
+    const query = typeof body.query === 'string' ? body.query.trim() : ''
+    if (!query) return demoJsonResponse(demoKeenableMissingParameterFixture('query'), 400)
+    const mode = typeof body.mode === 'string' ? body.mode : 'pro'
+    return demoJsonResponse(demoKeenableSearchFixture(query, mode), 200, demoKeenableRateLimitHeaders())
+  }
+  if (path === '/api/keenable/v1/fetch' && method === 'GET') {
+    const failure = demoKeenableFailure(init)
+    if (failure) return failure
+    const url = new URLSearchParams(search).get('url')?.trim() ?? ''
+    if (!url) return demoJsonResponse(demoKeenableMissingParameterFixture('url'), 400)
+    return demoJsonResponse(demoKeenableFetchFixture(url), 200, demoKeenableRateLimitHeaders())
+  }
+  if (path === '/api/zhihu/api/v1/quota' && method === 'GET') {
+    const failure = demoZhihuFailure(init)
+    if (failure) return failure
+    const params = new URLSearchParams(search)
+    const requested = params.get('APIIDs')?.split(',').map((id) => id.trim()).filter(Boolean)
+    if (requested?.some((id) => id !== 'zhihu_search' && id !== 'global_search')) {
+      return demoJsonResponse({ ...demoZhihuErrorFixture(10001), Message: 'APIIDs参数格式错误或包含未知API ID' })
+    }
+    const token = demoBearerToken(init)
+    const plan = token === 'tok-quota-zero' ? 'exhausted' : token === 'tok-quota-tight' ? 'tight' : 'standard'
+    const quota = demoZhihuQuotaFixture(plan)
+    if (requested) quota.Data = quota.Data.filter((entry) => requested.includes(entry.APIID))
+    return demoJsonResponse(quota)
+  }
+  if (method === 'GET' && (path === '/api/zhihu/api/v1/content/zhihu_search' || path === '/api/zhihu/api/v1/content/global_search')) {
+    const failure = demoZhihuFailure(init)
+    if (failure) return failure
+    const query = new URLSearchParams(search).get('Query')?.trim() ?? ''
+    if (!query) return demoJsonResponse(demoZhihuErrorFixture(10001))
+    const fixture = path.endsWith('/zhihu_search') ? demoZhihuSearchFixture(query) : demoZhihuGlobalSearchFixture(query)
+    return demoJsonResponse(fixture)
+  }
   if (isProviderMcpPath(path)) return handleProviderMcpDemo(path, init)
+  return null
+}
+
+function demoBearerToken(init?: RequestInit): string {
+  return new Headers(init?.headers).get('authorization')?.replace(/^Bearer\s+/, '') ?? ''
+}
+
+function demoKeenableFailure(init?: RequestInit): Response | null {
+  const headers = new Headers(init?.headers)
+  const key = headers.get('x-api-key') ?? demoBearerToken(init)
+  if (key === 'key-exhausted') return demoJsonResponse(demoKeenableInsufficientCreditsFixture(), 402)
+  if (key === 'key-rate') {
+    return demoJsonResponse(demoKeenableRateLimitedFixture(), 429, { 'Retry-After': '1' })
+  }
+  if (key === 'key-auth') return demoJsonResponse(demoKeenableInvalidKeyFixture(), 401)
+  return null
+}
+
+function demoZhihuFailure(init?: RequestInit): Response | null {
+  const token = demoBearerToken(init)
+  if (token === 'tok-auth') return demoJsonResponse(demoZhihuErrorFixture(20001))
+  if (token === 'tok-rate') return demoJsonResponse(demoZhihuErrorFixture(30001))
+  if (token === 'tok-internal') return demoJsonResponse(demoZhihuErrorFixture(90001))
+  if (token === 'tok-badparam') return demoJsonResponse(demoZhihuErrorFixture(10001))
   return null
 }
 
 function providerMcpTools(path: string): DemoMcpToolDefinition[] {
   if (path === '/serpapi/mcp') return demoSerpapiMcpTools()
   if (path === '/exa/mcp') return EXA_MCP_TOOLS
+  if (path === '/keenable/mcp') return KEENABLE_MCP_TOOLS
+  if (path === '/zhihu/mcp') return ZHIHU_MCP_TOOLS
   return BRAVE_MCP_TOOLS
 }
 
 function providerMcpServerName(path: string): string {
   if (path === '/serpapi/mcp') return 'serpapi-hikari'
   if (path === '/exa/mcp') return 'exa-search-hikari'
+  if (path === '/keenable/mcp') return 'keenable-hikari'
+  if (path === '/zhihu/mcp') return 'zhihu-hikari'
   return 'brave-search-hikari'
 }
 
@@ -122,14 +207,39 @@ function demoMcpResponse(payload: JsonObject, status = 200): Response {
  * Local-facade tool result envelope (mirrors
  * `local_mcp_facade.rs build_local_mcp_tool_result_body`): the fixture rides as
  * text content and as `structuredContent` with the upstream status projected.
- * The SerpApi passthrough keeps its own mock shape instead.
+ * The SerpApi and Keenable passthroughs keep their own mock shapes instead.
  */
-function demoLocalFacadeToolResult(fixture: JsonObject): JsonObject {
+function demoLocalFacadeToolResult(fixture: object): JsonObject {
   const text = JSON.stringify(fixture)
   return {
     content: [{ type: 'text', text }],
     structuredContent: { ...fixture, status: 200 },
   }
+}
+
+function demoKeenableMcpToolResult(name: string, args: JsonObject): JsonObject {
+  if (name === 'search_web_pages') {
+    const query = typeof args.query === 'string' ? args.query.trim() : ''
+    if (!query) throw new Error('search_web_pages requires a non-empty query')
+    const mode = typeof args.mode === 'string' ? args.mode : 'pro'
+    const fixture = demoKeenableSearchFixture(query, mode)
+    return {
+      content: [{ type: 'text', text: JSON.stringify(fixture) }],
+      structuredContent: fixture,
+      _meta: { 'keenable/usage': fixture.usage },
+    }
+  }
+  if (name === 'fetch_page_content') {
+    const url = typeof args.url === 'string' ? args.url.trim() : ''
+    if (!url) throw new Error('fetch_page_content requires a non-empty url')
+    const fixture = demoKeenableFetchFixture(url)
+    return {
+      content: [{ type: 'text', text: JSON.stringify(fixture) }],
+      structuredContent: fixture,
+      _meta: { 'keenable/usage': fixture.usage },
+    }
+  }
+  throw new Error(`unknown tool ${name}`)
 }
 
 async function handleProviderMcpDemo(path: string, init?: RequestInit): Promise<Response> {
@@ -154,10 +264,28 @@ async function handleProviderMcpDemo(path: string, init?: RequestInit): Promise<
     return demoMcpResponse({ jsonrpc: '2.0', id, result: { tools: providerMcpTools(path) } })
   }
   if (method === 'tools/call') {
-    const params = (body.params ?? {}) as { name?: unknown }
+    const params = (body.params ?? {}) as { name?: unknown; arguments?: unknown }
     const toolName = typeof params.name === 'string' ? params.name : ''
     if (path === '/serpapi/mcp') {
       return demoMcpResponse({ jsonrpc: '2.0', id, result: demoSerpapiMcpToolResult() })
+    }
+    const args = typeof params.arguments === 'object' && params.arguments ? params.arguments as JsonObject : {}
+    if (path === '/keenable/mcp') {
+      try {
+        return demoMcpResponse({ jsonrpc: '2.0', id, result: demoKeenableMcpToolResult(toolName, args) })
+      } catch (error) {
+        return demoMcpResponse({ jsonrpc: '2.0', id: null, error: { code: -32602, message: error instanceof Error ? error.message : 'Invalid tool arguments' } })
+      }
+    }
+    if (path === '/zhihu/mcp') {
+      const query = typeof args.query === 'string' ? args.query : 'mock query'
+      const fixture = toolName === 'zhihu_search'
+        ? demoZhihuSearchFixture(query)
+        : toolName === 'zhihu_global_search'
+          ? demoZhihuGlobalSearchFixture(query)
+          : null
+      if (!fixture) return demoMcpResponse({ jsonrpc: '2.0', id, error: { code: -32602, message: `Unknown tool: ${toolName}` } })
+      return demoMcpResponse({ jsonrpc: '2.0', id, result: demoLocalFacadeToolResult(fixture) })
     }
     const fixture = path === '/exa/mcp' ? demoExaMcpToolFixture(toolName) : demoBraveMcpToolFixture(toolName)
     if (!fixture) {

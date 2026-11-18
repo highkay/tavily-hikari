@@ -1975,7 +1975,7 @@ async function handleDemoRoute(url: URL, method: string, init?: RequestInit): Pr
   const path = url.pathname
   if (path === '/health') return jsonResponse({ ok: true, mode: 'demo' })
   if (path === '/mcp') return handleMcpDemo(init)
-  const providerRoute = await handleProviderDemoRoute(path, method, init)
+  const providerRoute = await handleProviderDemoRoute(path, method, init, url.search)
   if (providerRoute) return providerRoute
 
   if (path === '/api/version') return jsonResponse(demoState.version)
