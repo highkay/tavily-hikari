@@ -66,5 +66,7 @@ export interface AdminProvidersTranslations {
   serpapi: SerpApiProviderCopy
   exa: ProviderCopy
   brave: ProviderCopy
+  keenable: ProviderCopy
+  zhihu: ProviderCopy
   shared: AdminProviderSharedCopy
 }

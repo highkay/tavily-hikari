@@ -136,7 +136,7 @@ function firstNativeKeyToken(line: string): string | null {
 }
 
 /**
- * Provider dispatch, exhaustive over `ProviderId`: a fifth provider is a compile
+ * Provider dispatch, exhaustive over `ProviderId`: a new provider is a compile
  * error here until its parse rule is chosen.
  */
 function findApiKeyInLine(line: string, provider: ProviderId): string | null {
@@ -146,6 +146,8 @@ function findApiKeyInLine(line: string, provider: ProviderId): string | null {
     case 'serpapi':
     case 'exa':
     case 'brave':
+    case 'keenable':
+    case 'zhihu':
       return firstNativeKeyToken(line)
   }
 }

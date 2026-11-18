@@ -104,12 +104,12 @@ function sortedKeys(value: object): string[] {
 
 describe('provider id union parsing', () => {
   it('parses every known provider id to itself', () => {
-    // Given the four wire keys emitted by src/providers/id.rs
+    // Given the six wire keys emitted by src/providers/id.rs
     // When/Then each parses to the identical typed id
-    for (const id of ['tavily', 'serpapi', 'exa', 'brave']) {
+    for (const id of ['tavily', 'serpapi', 'exa', 'brave', 'keenable', 'zhihu']) {
       expect(parseProviderId(id)).toBe(id)
     }
-    expect(PROVIDER_IDS).toEqual(['tavily', 'serpapi', 'exa', 'brave'])
+    expect(PROVIDER_IDS).toEqual(['tavily', 'serpapi', 'exa', 'brave', 'keenable', 'zhihu'])
   })
 
   it('falls back to the typed legacy provider for unknown strings without throwing', () => {
@@ -143,7 +143,7 @@ describe('provider id union parsing', () => {
 })
 
 describe('provider meta maps', () => {
-  it('covers exactly the four providers with complete metadata', () => {
+  it('covers exactly the six providers with complete metadata', () => {
     // Given the exported meta map
     // Then it holds one entry per provider id and nothing else
     expect(sortedKeys(PROVIDER_META)).toEqual([...PROVIDER_IDS].sort())
@@ -168,6 +168,8 @@ describe('provider meta maps', () => {
     expect(PROVIDER_META.serpapi.label).toBe('SerpApi')
     expect(PROVIDER_META.exa.label).toBe('Exa')
     expect(PROVIDER_META.brave.label).toBe('Brave')
+    expect(PROVIDER_META.keenable.label).toBe('Keenable')
+    expect(PROVIDER_META.zhihu.label).toBe('Zhihu')
   })
 
   it('re-exports the provider surface through the api barrel', () => {
@@ -179,7 +181,7 @@ describe('provider meta maps', () => {
 })
 
 describe('provider capability predicates', () => {
-  it('supports validation on all four providers with probe copy', () => {
+  it('supports validation on all six providers with probe copy', () => {
     // Given M13 zero-cost probes exist for every provider
     // Then supportsValidate is true across the matrix
     for (const id of PROVIDER_IDS) {
@@ -191,6 +193,10 @@ describe('provider capability predicates', () => {
     expect(PROVIDER_META.serpapi.validateProbeLabel).toContain('/account')
     expect(PROVIDER_META.exa.validateProbeLabel).toContain('/contents')
     expect(PROVIDER_META.brave.validateProbeLabel).toContain('/res/v1/web/search')
+    expect(PROVIDER_META.keenable.validateProbeLabel).toBe(
+      'POST /v1/search without query (400 vs 401)',
+    )
+    expect(PROVIDER_META.zhihu.validateProbeLabel).toBe('GET /api/v1/quota (free, uncounted)')
     // Unknown providers fall through to the legacy tavily branch (backend parity)
     expect(supportsValidate('openai')).toBe(true)
   })
@@ -201,9 +207,13 @@ describe('provider capability predicates', () => {
     expect(supportsSyncUsage('serpapi')).toBe(true)
     expect(supportsSyncUsage('brave')).toBe(true)
     expect(supportsSyncUsage('exa')).toBe(false)
+    expect(supportsSyncUsage('keenable')).toBe(true)
+    expect(supportsSyncUsage('zhihu')).toBe(true)
     expect(syncUsageMode('tavily')).toBe('live')
     expect(syncUsageMode('serpapi')).toBe('live')
     expect(syncUsageMode('brave')).toBe('passive')
+    expect(syncUsageMode('keenable')).toBe('passive')
+    expect(syncUsageMode('zhihu')).toBe('live')
     expect(syncUsageMode('exa')).toBe('unsupported')
     expect(syncUsageMode('openai')).toBe('live')
   })
@@ -214,6 +224,8 @@ describe('provider capability predicates', () => {
     expect(quotaDisplayKind('serpapi')).toBe('searches_with_renewal')
     expect(quotaDisplayKind('brave')).toBe('harvested_remaining')
     expect(quotaDisplayKind('exa')).toBe('local_counting')
+    expect(quotaDisplayKind('keenable')).toBe('harvested_remaining')
+    expect(quotaDisplayKind('zhihu')).toBe('searches_with_renewal')
     expect(quotaDisplayKind('openai')).toBe('credits')
   })
 
@@ -253,7 +265,21 @@ describe('mixed-provider payload normalization (QA happy path)', () => {
       quota_remaining: 900,
     }
     const exa: ApiKeyStats = { ...legacyApiKeyStats('key-exa'), provider: 'exa' }
-    const rows = [legacy, serpapi, brave, exa]
+    const keenable: ApiKeyStats = {
+      ...legacyApiKeyStats('key-keenable'),
+      provider: 'keenable',
+      quota_limit: null,
+      quota_remaining: 99_999,
+      quota_source: 'passive',
+    }
+    const zhihu: ApiKeyStats = {
+      ...legacyApiKeyStats('key-zhihu'),
+      provider: 'zhihu',
+      quota_limit: 5000,
+      quota_remaining: 4876,
+      quota_renews_at: 1_792_944_000,
+    }
+    const rows = [legacy, serpapi, brave, exa, keenable, zhihu]
 
     // Then every row resolves to a typed provider id and label
     expect(rows.map((row) => normalizePayloadProvider(row))).toEqual([
@@ -261,12 +287,16 @@ describe('mixed-provider payload normalization (QA happy path)', () => {
       'serpapi',
       'brave',
       'exa',
+      'keenable',
+      'zhihu',
     ])
     expect(rows.map((row) => providerLabel(row.provider))).toEqual([
       'Tavily',
       'SerpApi',
       'Brave',
       'Exa',
+      'Keenable',
+      'Zhihu',
     ])
     // And the additive-only contract holds: the legacy row keeps exactly the
     // pre-todo-21 wire keys while the provider rows add only the new ones.
@@ -276,7 +306,11 @@ describe('mixed-provider payload normalization (QA happy path)', () => {
     )
     expect(quotaDisplayKind(serpapi.provider)).toBe('searches_with_renewal')
     expect(quotaDisplayKind(brave.provider)).toBe('harvested_remaining')
+    expect(quotaDisplayKind(keenable.provider)).toBe('harvested_remaining')
+    expect(quotaDisplayKind(zhihu.provider)).toBe('searches_with_renewal')
     expect(supportsSyncUsage(exa.provider)).toBe(false)
+    expect(keenable.quota_limit).toBeNull()
+    expect(zhihu.quota_renews_at).toBe(1_792_944_000)
   })
 
   it('keeps the additive provider dimension optional on logs and summaries', () => {
@@ -469,5 +503,96 @@ describe('validate and sync-usage DTO mirrors', () => {
     expect(parseSerpApiValidateDetail('provider probe failed with 422: {}')).toBeNull()
     expect(parseSerpApiValidateDetail(null)).toBeNull()
     expect(parseSerpApiValidateDetail(undefined)).toBeNull()
+  })
+})
+
+describe('keenable and zhihu provider metadata (plan todo 15)', () => {
+  it('returns the passive Keenable meta (QA happy path)', () => {
+    // Given the Keenable capability contract: zero-cost missing-query probe,
+    // passive credit harvest, no calendar limit (quota_limit stays NULL).
+    const meta = providerMeta('keenable')
+    expect(meta).toBe(PROVIDER_META.keenable)
+    expect(meta).toMatchObject({
+      id: 'keenable',
+      label: 'Keenable',
+      i18nKey: 'admin.providers.keenable',
+      supportsValidate: true,
+      validateProbeLabel: 'POST /v1/search without query (400 vs 401)',
+      validateProbeI18nKey: 'admin.providers.keenable.validateProbe',
+      supportsSyncUsage: true,
+      syncUsageMode: 'passive',
+      quotaDisplayKind: 'harvested_remaining',
+      quotaNoteI18nKey: 'admin.providers.keenable.quotaNote',
+    })
+    expect(providerLabel('keenable')).toBe('Keenable')
+  })
+
+  it('returns the live daily-quota Zhihu meta', () => {
+    // Given the Zhihu capability contract: free /api/v1/quota probe and a
+    // live natural-day quota snapshot rendered with its renewal date.
+    const meta = providerMeta('zhihu')
+    expect(meta).toBe(PROVIDER_META.zhihu)
+    expect(meta).toMatchObject({
+      id: 'zhihu',
+      label: 'Zhihu',
+      i18nKey: 'admin.providers.zhihu',
+      supportsValidate: true,
+      validateProbeLabel: 'GET /api/v1/quota (free, uncounted)',
+      validateProbeI18nKey: 'admin.providers.zhihu.validateProbe',
+      supportsSyncUsage: true,
+      syncUsageMode: 'live',
+      quotaDisplayKind: 'searches_with_renewal',
+      quotaNoteI18nKey: 'admin.providers.zhihu.quotaNote',
+    })
+    expect(providerLabel('zhihu')).toBe('Zhihu')
+  })
+
+  it('returns the Tavily meta for an unknown id and never throws (QA failure path)', () => {
+    for (const value of ['openai', 'unknown-provider', 'TAVILY', '', null, undefined, 42, {}, []]) {
+      expect(() => providerMeta(value)).not.toThrow()
+      expect(providerMeta(value)).toBe(PROVIDER_META.tavily)
+    }
+  })
+
+  it('mirrors both providers through the additive DTO fields', () => {
+    // Given the wire snapshots from admin_auth.rs: Keenable echoes the last
+    // harvested balance (passive), Zhihu returns the live daily quota.
+    const keenableSnapshot: ProviderQuotaSyncSnapshot = {
+      source: 'passive',
+      provider: 'keenable',
+      quota_limit: null,
+      quota_remaining: 99_999,
+      quota_renews_at: null,
+      quota_synced_at: 1_700_000_004,
+    }
+    const zhihuSnapshot: ProviderQuotaSyncSnapshot = {
+      source: 'live',
+      provider: 'zhihu',
+      quota_limit: 5000,
+      quota_remaining: 4876,
+      quota_renews_at: 1_792_944_000,
+      quota_synced_at: 1_700_000_005,
+    }
+    expect(quotaDisplayKind(keenableSnapshot.provider)).toBe('harvested_remaining')
+    expect(quotaDisplayKind(zhihuSnapshot.provider)).toBe('searches_with_renewal')
+
+    // And the key, validation, and request-log DTO mirrors accept both ids.
+    const key: ApiKeyStats = {
+      ...legacyApiKeyStats('key-zhihu'),
+      provider: 'zhihu',
+      quota_limit: 5000,
+      quota_remaining: 4876,
+      quota_source: 'live',
+    }
+    expect(key.provider).toBe('zhihu')
+    const validation: ValidateKeyResult = {
+      api_key: 'mock-keenable-key',
+      status: 'ok',
+      provider: 'keenable',
+      reason: 'VALIDATION',
+    }
+    expect(validation.provider).toBe('keenable')
+    const log: RequestLog = { ...requestLog(3), provider: 'keenable' }
+    expect(normalizePayloadProvider(log)).toBe('keenable')
   })
 })

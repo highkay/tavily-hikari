@@ -15,7 +15,7 @@ const SERPAPI_DETAIL =
 
 describe('provider copy resolution (plan todo 22)', () => {
   it('resolves the probe method for every provider in en and zh', () => {
-    for (const provider of ['tavily', 'serpapi', 'exa', 'brave'] as const) {
+    for (const provider of ['tavily', 'serpapi', 'exa', 'brave', 'keenable', 'zhihu'] as const) {
       expect(providerProbeCopy(EN.admin.providers, provider)).toBe(EN.admin.providers[provider].validateProbe)
       expect(providerProbeCopy(ZH.admin.providers, provider)).toBe(ZH.admin.providers[provider].validateProbe)
       expect(providerProbeCopy(ZH.admin.providers, provider)).not.toBe(providerProbeCopy(EN.admin.providers, provider))
@@ -26,6 +26,10 @@ describe('provider copy resolution (plan todo 22)', () => {
     expect(providerQuotaCopy(EN.admin.providers, 'serpapi')).toContain('/account')
     expect(providerQuotaCopy(ZH.admin.providers, 'brave')).toContain('被动快照')
     expect(providerQuotaCopy(EN.admin.providers, 'exa')).toContain('no upstream balance API')
+    expect(providerQuotaCopy(EN.admin.providers, 'keenable')).toContain('harvested')
+    expect(providerQuotaCopy(ZH.admin.providers, 'zhihu')).toContain('零点')
+    expect(providerProbeCopy(ZH.admin.providers, 'keenable')).toContain('missing_parameter')
+    expect(providerProbeCopy(EN.admin.providers, 'zhihu')).toContain('/api/v1/quota')
   })
 })
 

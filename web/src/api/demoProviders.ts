@@ -178,7 +178,7 @@ interface DemoRequestKindOption {
 }
 
 /**
- * The 16 committed provider request kinds (plan todo 23 / M9, mirrored from
+ * The 24 committed provider request kinds (mirrored from
  * `tokenLogRequestKinds.ts` canonical labels and billing groups) so the demo
  * request-kind catalog stays consistent with the shipped filter vocabulary.
  */
@@ -199,6 +199,14 @@ const DEMO_PROVIDER_REQUEST_KINDS: DemoRequestKindOption[] = [
   { key: 'mcp:exa/web_search', label: 'MCP | exa/web_search', protocol_group: 'mcp', billing_group: 'billable', count: 4 },
   { key: 'mcp:exa/web_fetch', label: 'MCP | exa/web_fetch', protocol_group: 'mcp', billing_group: 'billable', count: 2 },
   { key: 'mcp:exa/answer', label: 'MCP | exa/answer', protocol_group: 'mcp', billing_group: 'billable', count: 2 },
+  { key: 'api:keenable/search', label: 'API | keenable/search', protocol_group: 'api', billing_group: 'billable', count: 9 },
+  { key: 'api:keenable/fetch', label: 'API | keenable/fetch', protocol_group: 'api', billing_group: 'billable', count: 4 },
+  { key: 'api:zhihu/zhihu_search', label: 'API | zhihu/zhihu_search', protocol_group: 'api', billing_group: 'billable', count: 7 },
+  { key: 'api:zhihu/global_search', label: 'API | zhihu/global_search', protocol_group: 'api', billing_group: 'billable', count: 5 },
+  { key: 'mcp:keenable/search_web_pages', label: 'MCP | keenable/search_web_pages', protocol_group: 'mcp', billing_group: 'billable', count: 5 },
+  { key: 'mcp:keenable/fetch_page_content', label: 'MCP | keenable/fetch_page_content', protocol_group: 'mcp', billing_group: 'billable', count: 2 },
+  { key: 'mcp:zhihu/zhihu_search', label: 'MCP | zhihu/zhihu_search', protocol_group: 'mcp', billing_group: 'billable', count: 3 },
+  { key: 'mcp:zhihu/global_search', label: 'MCP | zhihu/global_search', protocol_group: 'mcp', billing_group: 'billable', count: 2 },
 ]
 
 /** Fresh provider request-kind options for the demo catalog. */
@@ -209,7 +217,7 @@ export function createDemoProviderRequestKindOptions(): DemoRequestKindOption[] 
 /** One demo log seed per committed provider kind (mixed providers/statuses). */
 interface DemoProviderLogSeed {
   kind: string
-  provider: 'serpapi' | 'exa' | 'brave'
+  provider: 'serpapi' | 'exa' | 'brave' | 'keenable' | 'zhihu'
   method: string
   path: string
   query: string | null
@@ -233,12 +241,22 @@ const DEMO_PROVIDER_LOG_SEEDS: DemoProviderLogSeed[] = [
   { kind: 'mcp:exa/web_search', provider: 'exa', method: 'POST', path: '/exa/mcp', query: null, status: 200 },
   { kind: 'mcp:exa/web_fetch', provider: 'exa', method: 'POST', path: '/exa/mcp', query: null, status: 200 },
   { kind: 'mcp:exa/answer', provider: 'exa', method: 'POST', path: '/exa/mcp', query: null, status: 200 },
+  { kind: 'api:keenable/search', provider: 'keenable', method: 'POST', path: '/api/keenable/v1/search', query: null, status: 200 },
+  { kind: 'api:keenable/fetch', provider: 'keenable', method: 'GET', path: '/api/keenable/v1/fetch', query: 'url=https%3A%2F%2Fexample.com%2F1', status: 200 },
+  { kind: 'api:zhihu/zhihu_search', provider: 'zhihu', method: 'GET', path: '/api/zhihu/api/v1/content/zhihu_search', query: 'Query=demo+mode&Count=10', status: 200 },
+  { kind: 'api:zhihu/global_search', provider: 'zhihu', method: 'GET', path: '/api/zhihu/api/v1/content/global_search', query: 'Query=demo+mode&Count=20&SearchDB=all', status: 200 },
+  { kind: 'mcp:keenable/search_web_pages', provider: 'keenable', method: 'POST', path: '/keenable/mcp', query: null, status: 200 },
+  { kind: 'mcp:keenable/fetch_page_content', provider: 'keenable', method: 'POST', path: '/keenable/mcp', query: null, status: 200 },
+  { kind: 'mcp:zhihu/zhihu_search', provider: 'zhihu', method: 'POST', path: '/zhihu/mcp', query: null, status: 200 },
+  { kind: 'mcp:zhihu/global_search', provider: 'zhihu', method: 'POST', path: '/zhihu/mcp', query: null, status: 200 },
 ]
 
 const DEMO_PROVIDER_KEY_IDS: Record<DemoProviderLogSeed['provider'], string> = {
   serpapi: 'Sp06',
   exa: 'Ex07',
   brave: 'Bv08',
+  keenable: 'Kn09',
+  zhihu: 'Zh10',
 }
 
 /**
@@ -337,6 +355,8 @@ export function createDemoProviderLogs(): DemoProviderLog[] {
 export function createDemoProviderKeys(): Array<Record<string, unknown>> {
   const now = Math.floor(Date.now() / 1000)
   const renewalAt = now + 86400 * 13
+  // Next Asia/Shanghai midnight (UTC+8), matching Zhihu's natural-day reset.
+  const zhihuRenewalAt = Math.floor((now + 8 * 3600) / 86400) * 86400 - 8 * 3600 + 86400
   return [
     {
       id: DEMO_PROVIDER_KEY_IDS.serpapi,
@@ -399,6 +419,49 @@ export function createDemoProviderKeys(): Array<Record<string, unknown>> {
       success_count: 780,
       error_count: 32,
       quota_exhausted_count: 11,
+      quarantine: null,
+      transient_backoff: null,
+    },
+    {
+      id: DEMO_PROVIDER_KEY_IDS.keenable,
+      provider: 'keenable',
+      status: 'active',
+      group: 'keenable',
+      registration_ip: '203.0.113.70',
+      registration_region: 'US',
+      status_changed_at: now - 3600 * 3,
+      last_used_at: now - 180,
+      deleted_at: null,
+      quota_limit: null,
+      quota_remaining: 98420,
+      quota_source: 'passive',
+      quota_synced_at: now - 240,
+      total_requests: 322,
+      success_count: 318,
+      error_count: 4,
+      quota_exhausted_count: 0,
+      quarantine: null,
+      transient_backoff: null,
+    },
+    {
+      id: DEMO_PROVIDER_KEY_IDS.zhihu,
+      provider: 'zhihu',
+      status: 'active',
+      group: 'zhihu',
+      registration_ip: '198.51.100.51',
+      registration_region: 'CN',
+      status_changed_at: now - 3600 * 2,
+      last_used_at: now - 320,
+      deleted_at: null,
+      quota_limit: 5000,
+      quota_remaining: 4876,
+      quota_renews_at: zhihuRenewalAt,
+      quota_source: 'live',
+      quota_synced_at: now - 480,
+      total_requests: 246,
+      success_count: 241,
+      error_count: 5,
+      quota_exhausted_count: 0,
       quarantine: null,
       transient_backoff: null,
     },

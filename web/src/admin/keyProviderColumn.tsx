@@ -23,6 +23,8 @@ const PROVIDER_BADGE_VARIANTS: Record<ProviderId, 'neutral' | 'info' | 'secondar
   serpapi: 'info',
   exa: 'secondary',
   brave: 'warning',
+  keenable: 'info',
+  zhihu: 'secondary',
 }
 
 function providerDataId(value: unknown): ProviderId | 'unknown' {

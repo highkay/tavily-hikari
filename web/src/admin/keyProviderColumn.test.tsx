@@ -89,6 +89,8 @@ describe('KeyProviderFilter (plan todo 22)', () => {
       'serpapi',
       'exa',
       'brave',
+      'keenable',
+      'zhihu',
     ])
     expect(select.options[0]?.textContent).toBe('All providers')
 
@@ -115,6 +117,8 @@ describe('KeyProviderSelect (plan todo 22)', () => {
       'serpapi',
       'exa',
       'brave',
+      'keenable',
+      'zhihu',
     ])
     expect(container.textContent).toContain('One provider applies to the whole batch.')
   })

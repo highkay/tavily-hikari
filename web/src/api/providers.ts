@@ -25,11 +25,18 @@
  * introduces no third language and edits no translation catalog.
  */
 
-/** Closed provider contract: the four lowercase wire keys of `ProviderId`. */
-export type ProviderId = 'tavily' | 'serpapi' | 'exa' | 'brave'
+/** Closed provider contract: the six lowercase wire keys of `ProviderId`. */
+export type ProviderId = 'tavily' | 'serpapi' | 'exa' | 'brave' | 'keenable' | 'zhihu'
 
 /** Stable iteration order for provider selects, badges, and filters. */
-export const PROVIDER_IDS: readonly ProviderId[] = ['tavily', 'serpapi', 'exa', 'brave']
+export const PROVIDER_IDS: readonly ProviderId[] = [
+  'tavily',
+  'serpapi',
+  'exa',
+  'brave',
+  'keenable',
+  'zhihu',
+]
 
 /**
  * Legacy rows and payloads without a provider field are Tavily. Mirrors the
@@ -147,6 +154,30 @@ export const PROVIDER_META: Readonly<Record<ProviderId, ProviderMeta>> = {
     quotaDisplayKind: 'harvested_remaining',
     quotaNoteI18nKey: 'admin.providers.brave.quotaNote',
   },
+  keenable: {
+    id: 'keenable',
+    label: 'Keenable',
+    i18nKey: 'admin.providers.keenable',
+    supportsValidate: true,
+    validateProbeLabel: 'POST /v1/search without query (400 vs 401)',
+    validateProbeI18nKey: 'admin.providers.keenable.validateProbe',
+    supportsSyncUsage: true,
+    syncUsageMode: 'passive',
+    quotaDisplayKind: 'harvested_remaining',
+    quotaNoteI18nKey: 'admin.providers.keenable.quotaNote',
+  },
+  zhihu: {
+    id: 'zhihu',
+    label: 'Zhihu',
+    i18nKey: 'admin.providers.zhihu',
+    supportsValidate: true,
+    validateProbeLabel: 'GET /api/v1/quota (free, uncounted)',
+    validateProbeI18nKey: 'admin.providers.zhihu.validateProbe',
+    supportsSyncUsage: true,
+    syncUsageMode: 'live',
+    quotaDisplayKind: 'searches_with_renewal',
+    quotaNoteI18nKey: 'admin.providers.zhihu.quotaNote',
+  },
 }
 
 /** Meta of the parsed provider; unknown ids fall through to the Tavily meta. */
@@ -165,12 +196,12 @@ export function providerLabel(value: unknown): string {
   return PROVIDER_META[LEGACY_PROVIDER_ID].label
 }
 
-/** All four providers validate; the probe method differs per provider (M13). */
+/** All six providers validate; the probe method differs per provider (M13). */
 export function supportsValidate(value: unknown): boolean {
   return providerMeta(value).supportsValidate
 }
 
-/** Tavily/SerpApi sync live, Brave returns its passive snapshot, Exa none. */
+/** Tavily/SerpApi/Zhihu sync live, Brave/Keenable echo passive snapshots, Exa none. */
 export function supportsSyncUsage(value: unknown): boolean {
   return providerMeta(value).supportsSyncUsage
 }

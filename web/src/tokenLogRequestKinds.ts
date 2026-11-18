@@ -58,9 +58,10 @@ const canonicalTokenLogRequestKindOptions: TokenLogRequestKindOption[] = [
   { key: 'api:search', label: 'API | search', protocol_group: 'api', billing_group: 'billable' },
   { key: 'api:unknown-path', label: 'API | unknown path', protocol_group: 'api', billing_group: 'non_billable' },
   { key: 'api:usage', label: 'API | usage', protocol_group: 'api', billing_group: 'non_billable' },
-  // Plan todo 23 / M9: the 16 committed provider kinds (src/analysis.rs
-  // PROVIDER_REQUEST_KINDS :895-912). Facade operations are billable; labels
-  // are language-neutral and identical to the backend canonical labels.
+  // The committed provider kinds (src/analysis.rs PROVIDER_REQUEST_KINDS).
+  // Facade operations are billable; labels are language-neutral and identical
+  // to the backend canonical labels. keenable-integration todo 14 added the
+  // eight Keenable/Zhihu kinds (24 provider kinds total).
   { key: 'api:serpapi/search', label: 'API | serpapi/search', protocol_group: 'api', billing_group: 'billable' },
   { key: 'api:exa/search', label: 'API | exa/search', protocol_group: 'api', billing_group: 'billable' },
   { key: 'api:exa/contents', label: 'API | exa/contents', protocol_group: 'api', billing_group: 'billable' },
@@ -68,6 +69,10 @@ const canonicalTokenLogRequestKindOptions: TokenLogRequestKindOption[] = [
   { key: 'api:brave/web', label: 'API | brave/web', protocol_group: 'api', billing_group: 'billable' },
   { key: 'api:brave/news', label: 'API | brave/news', protocol_group: 'api', billing_group: 'billable' },
   { key: 'api:brave/llm-context', label: 'API | brave/llm-context', protocol_group: 'api', billing_group: 'billable' },
+  { key: 'api:keenable/search', label: 'API | keenable/search', protocol_group: 'api', billing_group: 'billable' },
+  { key: 'api:keenable/fetch', label: 'API | keenable/fetch', protocol_group: 'api', billing_group: 'billable' },
+  { key: 'api:zhihu/zhihu_search', label: 'API | zhihu/zhihu_search', protocol_group: 'api', billing_group: 'billable' },
+  { key: 'api:zhihu/global_search', label: 'API | zhihu/global_search', protocol_group: 'api', billing_group: 'billable' },
   { key: 'mcp:batch', label: 'MCP | batch', protocol_group: 'mcp', billing_group: 'billable' },
   { key: 'mcp:crawl', label: 'MCP | crawl', protocol_group: 'mcp', billing_group: 'billable' },
   { key: 'mcp:extract', label: 'MCP | extract', protocol_group: 'mcp', billing_group: 'billable' },
@@ -99,6 +104,10 @@ const canonicalTokenLogRequestKindOptions: TokenLogRequestKindOption[] = [
   { key: 'mcp:exa/web_search', label: 'MCP | exa/web_search', protocol_group: 'mcp', billing_group: 'billable' },
   { key: 'mcp:exa/web_fetch', label: 'MCP | exa/web_fetch', protocol_group: 'mcp', billing_group: 'billable' },
   { key: 'mcp:exa/answer', label: 'MCP | exa/answer', protocol_group: 'mcp', billing_group: 'billable' },
+  { key: 'mcp:keenable/search_web_pages', label: 'MCP | keenable/search_web_pages', protocol_group: 'mcp', billing_group: 'billable' },
+  { key: 'mcp:keenable/fetch_page_content', label: 'MCP | keenable/fetch_page_content', protocol_group: 'mcp', billing_group: 'billable' },
+  { key: 'mcp:zhihu/zhihu_search', label: 'MCP | zhihu/zhihu_search', protocol_group: 'mcp', billing_group: 'billable' },
+  { key: 'mcp:zhihu/global_search', label: 'MCP | zhihu/global_search', protocol_group: 'mcp', billing_group: 'billable' },
   {
     key: 'mcp:session-delete-unsupported',
     label: 'MCP | session delete unsupported',
