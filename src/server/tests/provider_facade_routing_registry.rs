@@ -2,16 +2,16 @@ use super::*;
     use super::core_support_and_parsing::*;
     use tavily_hikari::providers::ProviderId;
 
-    /// Keenable hosted passthrough (keenable-integration todo 8) + the typed
-    /// todo-2 Zhihu boundary (todo 10 pending): an authenticated MCP dispatch
-    /// on `/keenable/mcp` EXECUTES (upstream dial, typed 502 proxy-error
+    /// Keenable hosted passthrough (keenable-integration todo 8) + the Zhihu
+    /// LOCAL facade (todo 10): an authenticated MCP dispatch on
+    /// `/keenable/mcp` EXECUTES (upstream dial, typed 502 proxy-error
     /// boundary when the configured dead-port upstream refuses the connection
-    /// — never a 200, never a key mark) while `/zhihu/mcp` keeps the typed
-    /// `provider_mcp_pending` response — never a 200, never an upstream call,
-    /// never a key mark. The dispatch is called directly with the provider id
-    /// because todo 6 owns the route registration.
+    /// — never a 200, never a key mark) while `/zhihu/mcp` answers LOCALLY
+    /// (200, SSE-wrapped, session-less, the SPEC serverInfo) with zero
+    /// upstream calls and zero key marks. The dispatch is called directly
+    /// with the provider id because todo 6 owns the route registration.
     #[tokio::test]
-    async fn keenable_mcp_executes_while_zhihu_dispatch_keeps_typed_pending_boundary() {
+    async fn keenable_mcp_executes_and_zhihu_mcp_serves_its_local_facade() {
         let db_path = temp_db_path("provider-mcp-pending-boundary");
         let db_str = db_path.to_string_lossy().to_string();
         let providers = tavily_hikari::ProviderBootstrap {
@@ -85,9 +85,6 @@ use super::*;
             // passthrough surfaces as its typed proxy-error boundary
             // (Err(502)) - never a 200, never a silent success.
             (ProviderId::Keenable, "/keenable/mcp", true),
-            // Zhihu keeps the typed todo-2 provider_mcp_pending boundary
-            // until todo 10 lands (501 + typed body, zero upstream calls).
-            (ProviderId::Zhihu, "/zhihu/mcp", false),
         ] {
             let request = Request::builder()
                 .method(Method::POST)
@@ -140,11 +137,58 @@ use super::*;
             }
         }
 
-        // Never a key mark: the Zhihu seed row stays byte-identical (its
-        // boundary touches nothing) and the Keenable row keeps its `active`
-        // status after the dead-port transport failure (a transport error
-        // never marks the key; `last_used_at` legitimately advances because
-        // the executor logs the attempt).
+        // Zhihu local facade (todo 10): initialize answers LOCALLY — 200,
+        // SSE-wrapped, session-less, the SPEC serverInfo — with zero upstream
+        // calls and zero key marks.
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/zhihu/mcp")
+            .header(CONTENT_TYPE, "application/json")
+            .header("authorization", format!("Bearer {}", access_token.token))
+            .body(Body::from(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "clientInfo": { "name": "zhihu-local-facade", "version": "0" }
+                    }
+                })
+                .to_string(),
+            ))
+            .expect("build zhihu mcp request");
+        let response = provider_facade::provider_mcp_facade(
+            state.clone(),
+            request,
+            ProviderId::Zhihu,
+        )
+        .await
+        .expect("zhihu local facade response");
+        assert_eq!(response.status(), StatusCode::OK, "zhihu initialize 200");
+        let body = axum::body::to_bytes(response.into_body(), BODY_LIMIT)
+            .await
+            .expect("zhihu initialize body");
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(text.contains("data:"), "SSE-wrapped: {text}");
+        let payload: Value = serde_json::from_str(
+            text.lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .expect("SSE data line"),
+        )
+        .expect("zhihu initialize payload");
+        assert_eq!(
+            payload["result"]["serverInfo"]["name"].as_str(),
+            Some("zhihu-search-hikari"),
+            "zhihu initialize serverInfo: {payload}"
+        );
+
+        // Never a key mark: the Zhihu seed row stays byte-identical (the
+        // local initialize touches nothing) and the Keenable row keeps its
+        // `active` status after the dead-port transport failure (a transport
+        // error never marks the key; `last_used_at` legitimately advances
+        // because the executor logs the attempt).
         async fn key_row_snapshot(
             pool: &sqlx::SqlitePool,
             key_row: &str,

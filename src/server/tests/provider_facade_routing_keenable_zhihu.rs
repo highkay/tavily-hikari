@@ -3,10 +3,11 @@
 //! the config surface. Since todo 7 the Keenable REST routes EXECUTE through
 //! the facade record path and since todo 8 the Keenable MCP ingress EXECUTES
 //! through the hosted passthrough, so the full-server cases pin their live
-//! stub-upstream behavior (verbatim passthrough + settled credits);
-//! both Zhihu surfaces keep the typed todo-2 boundaries until todos 9-10
-//! land (typed 500/501, ZERO upstream calls) — never a silent success and
-//! never an accidental dial of a production endpoint.
+//! stub-upstream behavior (verbatim passthrough + settled credits); since
+//! todo 10 the Zhihu MCP ingress serves its LOCAL facade (session-less,
+//! SSE-wrapped, the two SPEC catalog tools) and the Zhihu REST routes EXECUTE
+//! through their todo-9 envelope-aware record path — never a silent success
+//! and never an accidental dial of a production endpoint.
 
 use super::core_support_and_parsing::{connect_sqlite_test_pool, temp_db_path};
 use super::*;
@@ -477,11 +478,11 @@ async fn zhihu_and_keenable_mcp_subpaths_404_text_plain_never_spa_redirect() {
 /// integration todo 8 wired the hosted passthrough): the request dials the
 /// configured `KEENABLE_MCP_UPSTREAM` stub at its `/gw/mcp` target and the
 /// stub body returns verbatim with provider/gateway/operation-stamped request
-/// logs — never a silent success. The Zhihu ingress keeps the typed todo-2
-/// `provider_mcp_pending` boundary until todo 10 lands — never a 200, never
-/// an upstream call.
+/// logs — never a silent success. The Zhihu ingress (todo 10) serves its
+/// LOCAL facade: tools/list answers locally (200, SSE-wrapped) with EXACTLY
+/// the two SPEC catalog tools and ZERO upstream calls of its own.
 #[tokio::test]
-async fn keenable_mcp_executes_while_zhihu_keeps_the_typed_pending_boundary() {
+async fn keenable_mcp_executes_and_zhihu_mcp_serves_its_local_facade() {
     let harness = spawn_keenable_zhihu_harness("keenable-zhihu-mcp-execute").await;
     let client = Client::new();
 
@@ -504,7 +505,9 @@ async fn keenable_mcp_executes_while_zhihu_keeps_the_typed_pending_boundary() {
         "the stub body passes through verbatim (no transformation)"
     );
 
-    // Zhihu: still the typed todo-2 boundary (todo 10 replaces it).
+    // Zhihu local facade (todo 10): tools/list answers LOCALLY (200,
+    // SSE-wrapped, session-less) with EXACTLY the two SPEC catalog tools —
+    // zero upstream calls of its own.
     let zhihu = client
         .post(format!("http://{}/zhihu/mcp", harness.addr))
         .header("authorization", format!("Bearer {}", harness.token))
@@ -515,12 +518,33 @@ async fn keenable_mcp_executes_while_zhihu_keeps_the_typed_pending_boundary() {
         .send()
         .await
         .expect("zhihu mcp request");
-    assert_eq!(zhihu.status(), StatusCode::NOT_IMPLEMENTED);
-    let body: Value = zhihu.json().await.expect("json body");
-    assert_eq!(body.get("error").and_then(Value::as_str), Some("provider_mcp_pending"));
+    assert_eq!(zhihu.status(), StatusCode::OK, "zhihu local facade tools/list");
+    assert_eq!(
+        zhihu
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream"),
+        "zhihu local facade wraps responses in SSE"
+    );
+    let body = zhihu.text().await.expect("zhihu tools/list body");
+    assert!(body.contains("data:"), "SSE data frame: {body}");
+    let payload: Value = serde_json::from_str(
+        body.lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("SSE data line"),
+    )
+    .expect("tools/list jsonrpc payload");
+    let tools: Vec<String> = payload["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(tools, ["zhihu_search", "zhihu_global_search"]);
 
     // Exactly ONE upstream call: the executing Keenable tools/list dialed the
-    // stub at its /gw/mcp target; the Zhihu boundary never dials anything.
+    // stub at its /gw/mcp target; the zhihu local catalog never dials anything.
     {
         let attempts = harness.upstream_attempts.lock().expect("attempts lock");
         assert_eq!(&*attempts, &["/gw/mcp".to_string()], "upstream attempts");

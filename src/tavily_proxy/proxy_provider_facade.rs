@@ -108,6 +108,19 @@ mod proxy_provider_facade_brave_mcp;
 // rebalance keeps its own byte-stable executors and never reaches here.
 mod proxy_provider_facade_exa_mcp;
 
+// Zhihu LOCAL MCP facade execution layer (keenable-integration plan todo 10):
+// `/zhihu/mcp` tools/call translated into a pooled-key Zhihu REST GET (Bearer
+// + fresh server-side X-Request-Timestamp + 20s budget) re-using the committed
+// todo-9 Zhihu record path (envelope classification → reconcile: 20001 →
+// quarantine, 30001 → shared HTTP backoff, 90001 → transient, 10001/unknown →
+// client error; provider='zhihu' request_logs keyed on /zhihu/mcp + the
+// tools/call body → mcp:zhihu/{zhihu_search,global_search}). Billing stays
+// bin-side: 1 credit ONLY when the translated result's envelope carries
+// `Code == 0`. The executor is a pub TavilyProxy method; the module stays
+// private (methods resolve on the type). Tavily rebalance keeps its own
+// byte-stable executors and never reaches here.
+mod proxy_provider_facade_zhihu_mcp;
+
 /// Client-facing description of one provider REST facade call (the M1
 /// "ProviderId + resolved upstream base on the request path" seam: the
 /// provider selects its parsed base inside the executor, so no state field

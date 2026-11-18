@@ -147,6 +147,7 @@ fn build_local_mcp_tool_result_body(
     response_id: Option<&Value>,
     upstream_status: StatusCode,
     upstream_body: &[u8],
+    tool_error: bool,
 ) -> Vec<u8> {
     let raw_text = String::from_utf8_lossy(upstream_body).into_owned();
     let mut structured_content = match serde_json::from_slice::<Value>(upstream_body) {
@@ -155,7 +156,10 @@ fn build_local_mcp_tool_result_body(
         Err(_) => json!({ "raw_body": raw_text }),
     };
 
-    let mut is_error = !upstream_status.is_success();
+    // `tool_error` is the provider-projected native error bit (the Zhihu
+    // arm sets it for a non-zero envelope `Code` at HTTP 200); the transport
+    // status and any native isError flag keep their existing meaning.
+    let mut is_error = tool_error || !upstream_status.is_success();
     if let Value::Object(ref mut map) = structured_content {
         map.entry("status".to_string())
             .or_insert(Value::from(i64::from(upstream_status.as_u16())));
@@ -244,28 +248,58 @@ async fn build_and_log_local_facade_response(
 
 /// Build a typed local MCP tool-error result (isError envelope) + log it. Used
 /// for unknown-tool, invalid-arguments, and no-available-keys cases — all local
-/// (zero upstream calls, zero billing).
+/// (zero upstream calls, zero billing). The Zhihu catalog contract pins the
+/// unknown-tool arm at HTTP 400 (SPEC ingress rules); every other arm and the
+/// brave/exa surfaces keep the 200-with-isError precedent.
 async fn local_tool_error_response(
     ctx: &LocalMcpDispatchCtx<'_>,
     message_body: &[u8],
     response_id: Option<&Value>,
     message: &str,
     failure_kind: Option<&str>,
+    status: StatusCode,
 ) -> Result<ProxyResponse, StatusCode> {
     let body = build_rebalance_mcp_tool_error_result_body(response_id, message);
-    build_and_log_local_facade_response(ctx, message_body, StatusCode::OK, &body, failure_kind)
-        .await
+    build_and_log_local_facade_response(ctx, message_body, status, &body, failure_kind).await
+}
+
+/// Unknown-tool transport status per provider (todo-10 seam): the Zhihu
+/// catalog contract pins an unknown tool at HTTP 400 (SPEC ingress rules);
+/// brave/exa keep the 200-with-isError precedent.
+fn local_mcp_unknown_tool_status(provider: tavily_hikari::providers::ProviderId) -> StatusCode {
+    match provider {
+        tavily_hikari::providers::ProviderId::Zhihu => StatusCode::BAD_REQUEST,
+        _ => StatusCode::OK,
+    }
+}
+
+/// Observable outcome of one translated tools/call execution: the settle
+/// inputs plus the provider-projected bits the shared envelope builder and
+/// the billing gate consume.
+struct LocalMcpUpstreamOutcome {
+    /// `success` / `quota_exhausted` / `error` (shared OUTCOME_* vocabulary).
+    result_status: Option<&'static str>,
+    failure_kind: Option<&'static str>,
+    /// Credit-settle gate: true only when the call settles its credit tier.
+    /// Brave/Exa: the outcome status is success. Zhihu: the native envelope's
+    /// `Code == 0` (a malformed HTTP-200 body classifies `Ok` but must bill
+    /// zero; a `Code=0` envelope always settles).
+    business_success: bool,
+    /// Provider-projected native error bit forcing the MCP tool-result
+    /// `isError` (Zhihu: a non-zero `Code` at HTTP 200).
+    tool_error: bool,
 }
 
 /// Dispatch the provider lib executor for one translated tools/call and project
-/// the outcome. The provider match is the small seam todo-16 reserved and
-/// todo-17 extended with the Exa (POST) arms.
+/// the outcome. The provider match is the small seam todo-16 reserved, todo-17
+/// extended with the Exa (POST) arms, and keenable-integration todo 10 extends
+/// with the Zhihu (GET) arms.
 async fn execute_local_mcp_upstream(
     ctx: &LocalMcpDispatchCtx<'_>,
     tool: &LocalMcpToolDefinition,
     message_body: &[u8],
     upstream: LocalMcpUpstreamRequest,
-) -> Result<(ProxyResponse, Option<&'static str>, Option<&'static str>), ProxyError> {
+) -> Result<(ProxyResponse, LocalMcpUpstreamOutcome), ProxyError> {
     let audit_request = ProviderRestFacadeRequest {
         provider: ctx.facade.provider,
         method: ctx.method.clone(),
@@ -295,6 +329,12 @@ async fn execute_local_mcp_upstream(
                 .proxy_provider_mcp_exa_facade_call(audit_request, body)
                 .await?
         }
+        (tavily_hikari::providers::ProviderId::Zhihu, LocalMcpUpstreamRequest::Get { query }) => {
+            ctx.state
+                .proxy
+                .proxy_provider_mcp_zhihu_facade_call(audit_request, query)
+                .await?
+        }
         (provider, _) => {
             return Err(ProxyError::Other(format!(
                 "{provider} local MCP facade executor is not wired yet"
@@ -305,11 +345,35 @@ async fn execute_local_mcp_upstream(
     let outcome = match ctx.facade.provider {
         tavily_hikari::providers::ProviderId::Brave => {
             let outcome = brave_facade_outcome(resp.status, &resp.body);
-            (outcome.result_status, outcome.failure_kind)
+            (
+                Some(outcome.result_status),
+                outcome.failure_kind,
+                outcome.result_status == "success",
+                false,
+            )
         }
         tavily_hikari::providers::ProviderId::Exa => {
             let outcome = exa_facade_outcome(resp.status, &resp.body);
-            (outcome.result_status, outcome.failure_kind)
+            (
+                Some(outcome.result_status),
+                outcome.failure_kind,
+                outcome.result_status == "success",
+                false,
+            )
+        }
+        // Zhihu (todo 10): the envelope-aware projection owns both
+        // provider-specific bits — `business_success` is the exact `Code == 0`
+        // predicate (never the classifier's Ok fallback), and a non-zero
+        // `Code` rides as the MCP tool error even though the transport status
+        // is 200.
+        tavily_hikari::providers::ProviderId::Zhihu => {
+            let outcome = zhihu_facade_outcome(resp.status, &resp.body);
+            (
+                Some(outcome.result_status),
+                outcome.failure_kind,
+                outcome.business_success,
+                !outcome.business_success,
+            )
         }
         provider => {
             return Err(ProxyError::Other(format!(
@@ -317,7 +381,16 @@ async fn execute_local_mcp_upstream(
             )));
         }
     };
-    Ok((resp, Some(outcome.0), outcome.1))
+    let (result_status, failure_kind, business_success, tool_error) = outcome;
+    Ok((
+        resp,
+        LocalMcpUpstreamOutcome {
+            result_status,
+            failure_kind,
+            business_success,
+            tool_error,
+        },
+    ))
 }
 
 /// Handle one JSON-RPC message. Returns the client-facing (SSE-wrapped) response
@@ -449,6 +522,7 @@ async fn handle_local_mcp_tool_call(
             response_id,
             "Invalid tools/call params",
             Some("invalid_tool_params"),
+            StatusCode::OK,
         )
         .await?;
         return Ok((resp, None));
@@ -465,6 +539,7 @@ async fn handle_local_mcp_tool_call(
             response_id,
             &message,
             Some("unknown_tool"),
+            local_mcp_unknown_tool_status(facade.provider),
         )
         .await?;
         return Ok((resp, None));
@@ -478,6 +553,7 @@ async fn handle_local_mcp_tool_call(
                 response_id,
                 &message,
                 Some("invalid_tool_arguments"),
+                StatusCode::OK,
             )
             .await?;
             return Ok((resp, None));
@@ -492,6 +568,7 @@ async fn handle_local_mcp_tool_call(
                 response_id,
                 &message,
                 Some("invalid_tool_arguments"),
+                StatusCode::OK,
             )
             .await?;
             return Ok((resp, None));
@@ -499,8 +576,13 @@ async fn handle_local_mcp_tool_call(
     };
 
     match execute_local_mcp_upstream(ctx, tool, message_body, upstream).await {
-        Ok((resp, result_status, failure_kind)) => {
-            let envelope = build_local_mcp_tool_result_body(response_id, resp.status, &resp.body);
+        Ok((resp, outcome)) => {
+            let envelope = build_local_mcp_tool_result_body(
+                response_id,
+                resp.status,
+                &resp.body,
+                outcome.tool_error,
+            );
             let mut sse_resp =
                 proxy_response_with_mcp_body(StatusCode::OK, envelope, resp.request_log_id);
             sse_resp.api_key_id = resp.api_key_id;
@@ -510,15 +592,16 @@ async fn handle_local_mcp_tool_call(
             sse_resp.binding_effect_summary = resp.binding_effect_summary;
             sse_resp.selection_effect_code = resp.selection_effect_code;
             sse_resp.selection_effect_summary = resp.selection_effect_summary;
-            let success = result_status == Some("success");
             let business = LocalMcpBusinessCall {
-                observed_credits: if success {
+                // Credit gate: the provider-projected business_success bit
+                // (Zhihu: the envelope's exact `Code == 0` predicate).
+                observed_credits: if outcome.business_success {
                     local_mcp_tool_credits(facade.provider, tool)
                 } else {
                     0
                 },
-                result_status: result_status.unwrap_or("error"),
-                failure_kind,
+                result_status: outcome.result_status.unwrap_or("error"),
+                failure_kind: outcome.failure_kind,
             };
             Ok((sse_resp, Some(business)))
         }
@@ -533,6 +616,7 @@ async fn handle_local_mcp_tool_call(
                 response_id,
                 &message,
                 Some("upstream_unavailable"),
+                StatusCode::OK,
             )
             .await?;
             Ok((resp, None))

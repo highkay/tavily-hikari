@@ -39,23 +39,31 @@ mod provider_mcp_serpapi;
 // same session-id translation + key-migration ladder, and the passive
 // `_meta["keenable/usage"].credits_remaining` harvest. Replaces the typed
 // todo-2 `provider_mcp_pending` boundary for the keenable surface only; the
-// Zhihu local facade keeps that boundary until todo 10.
+// Zhihu surface is the todo-10 LOCAL facade (`provider_mcp_zhihu.rs`).
 #[path = "provider_mcp_keenable.rs"]
 mod provider_mcp_keenable;
 
 // Provider-parameterized LOCAL MCP facade framework (plan todo 16; M19) + the
-// Brave and Exa facades built on it. The framework generalizes the rebalance
-// local-facade plumbing (envelope/batch/SSE/dispatch/billing) into
+// Brave, Exa, and Zhihu facades built on it. The framework generalizes the
+// rebalance local-facade plumbing (envelope/batch/SSE/dispatch/billing) into
 // `LocalMcpFacade` without touching the Tavily golden path;
-// `provider_mcp_brave` (todo 16) and `provider_mcp_exa` (todo 17) supply the
-// per-provider catalog DATA + tools/call→REST translations and replace the
-// typed `provider_mcp_pending` boundary for both surfaces.
+// `provider_mcp_brave` (todo 16), `provider_mcp_exa` (todo 17), and
+// `provider_mcp_zhihu` (keenable-integration todo 10) supply the per-provider
+// catalog DATA + tools/call→REST translations and replace the typed
+// `provider_mcp_pending` boundary for those surfaces.
 #[path = "local_mcp_facade.rs"]
 mod local_mcp_facade;
 #[path = "provider_mcp_brave.rs"]
 mod provider_mcp_brave;
 #[path = "provider_mcp_exa.rs"]
 mod provider_mcp_exa;
+// keenable-integration todo 10: the Zhihu local facade on the same framework
+// (the official Zhihu MCP is SSE-only, so a Hikari-local facade is the
+// supported path). Replaces the typed `provider_mcp_pending` boundary for
+// the zhihu surface only; Keenable keeps that boundary until todo 8 lands
+// its hosted passthrough.
+#[path = "provider_mcp_zhihu.rs"]
+mod provider_mcp_zhihu;
 
 /// Client-facing surface deciding which native client key slots are accepted
 /// (plan todo 11): the Exa MCP surface additionally honors the `exaApiKey`
@@ -223,8 +231,7 @@ const PROVIDER_MCP_INGRESS_ROUTES: &[(ProviderId, &str)] = &[
     (ProviderId::Brave, "/brave/mcp"),
     // keenable-integration todo 6: the ingress registrations. The Keenable
     // ingress dispatches through the hosted passthrough (todo 8) and the
-    // Zhihu ingress keeps the typed todo-2 `provider_mcp_pending` dispatch
-    // until todo 10 lands.
+    // Zhihu ingress dispatches to its todo-10 local facade.
     (ProviderId::Keenable, "/keenable/mcp"),
     (ProviderId::Zhihu, "/zhihu/mcp"),
 ];
@@ -946,22 +953,16 @@ pub(super) async fn provider_mcp_facade(
         }
     }
 
-    // Typed todo-2 boundary: the Zhihu local facade (todo 10) replaces its
-    // arm behind the same seam. Until then the surface answers with the
-    // typed pending boundary below — never a 200, never an upstream call,
-    // never a key mark.
-    if provider == ProviderId::Zhihu {
-        eprintln!(
-            "provider MCP dispatch pending for {provider} ({path})",
-            provider = provider
-        );
-        return provider_mcp_execution_pending_response(provider);
-    }
+    // Every registered provider ingress dispatches below — Keenable through
+    // the hosted passthrough (keenable-integration todo 8), Zhihu through its
+    // todo-10 local facade — so the typed pending fallback at the tail only
+    // guards unexpected provider ids.
 
     // SerpApi hosted passthrough (todo 15), the Keenable hosted passthrough
-    // (keenable-integration todo 8), the Brave LOCAL facade (todo 16), and
-    // the Exa LOCAL facade (todo 17) each replaced the typed boundary behind
-    // the same seam. All four build the SHARED facade context (the serpapi
+    // (keenable-integration todo 8), the Brave LOCAL facade (todo 16), the
+    // Exa LOCAL facade (todo 17), and the Zhihu LOCAL facade
+    // (keenable-integration todo 10) each replaced the typed boundary behind
+    // the same seam. All five build the SHARED facade context (the serpapi
     // module owns it as the first consumer of the seam).
     if provider == ProviderId::Keenable {
         return provider_mcp_keenable::provider_mcp_keenable_passthrough(
@@ -1027,16 +1028,35 @@ pub(super) async fn provider_mcp_facade(
         )
         .await;
     }
+    // Zhihu LOCAL facade (keenable-integration todo 10) on the shared
+    // todo-16 framework, behind the same seam.
+    if provider == ProviderId::Zhihu {
+        return provider_mcp_zhihu::provider_mcp_zhihu_local_facade(
+            state,
+            provider_mcp_serpapi::ProviderMcpFacadeContext {
+                provider,
+                method: &method,
+                path: &path,
+                request_kind: &request_kind,
+                body: &body_bytes,
+                auth: &auth,
+                original_headers: &parts.headers,
+                remote_addr,
+            },
+        )
+        .await;
+    }
 
     provider_mcp_execution_pending_response(provider)
 }
 
 /// Typed Hikari boundary response for provider MCP surfaces without a wired
-/// execution body. The registered hosted passthrough ingresses (SerpApi todo
-/// 15, Keenable keenable-integration todo 8) and the local facades (Brave
-/// todo 16, Exa todo 17) dispatch above; Zhihu's local facade (todo 10) keeps
-/// this boundary; Tavily keeps its pinned `/mcp` handler and never routes
-/// here — this fallback stays as the typed shape for any unexpected provider
+/// execution body. Every registered ingress dispatches above — the hosted
+/// passthroughs (SerpApi todo 15, Keenable keenable-integration todo 8) and
+/// the local facades (Brave todo 16, Exa todo 17, Zhihu todo 10) — and Tavily
+/// keeps its pinned `/mcp` handler and never routes here; this fallback stays
+/// as the typed shape for any unexpected provider id (never a
+/// provider-shaped error, never an upstream call).
 /// id (never a provider-shaped error, never an upstream call).
 fn provider_mcp_execution_pending_response(
     provider: ProviderId,

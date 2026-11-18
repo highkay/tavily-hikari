@@ -2765,3 +2765,27 @@ async fn exa_unknown_tool_and_deprecated_shims_are_typed_errors() {
     );
     assert!(harness.charged_ledger_rows().await.is_empty());
 }
+
+// ===========================================================================
+// Zhihu LOCAL MCP facade (`/zhihu/mcp`) — keenable-integration plan todo 10.
+//
+// The official Zhihu MCP is SSE-only, so this surface is a Hikari-LOCAL facade:
+// initialize/tools-list/ping/notifications answer LOCALLY (session-less,
+// SSE-wrapped, server_name `zhihu-search-hikari`, EXACTLY the two SPEC catalog
+// tools) and tools/call translates into a pooled-key Zhihu REST GET (Bearer
+// Access Secret + fresh server-side X-Request-Timestamp). Billing settles
+// 1 credit ONLY when the translated envelope carries `Code == 0`; a non-zero
+// `Code` (always HTTP 200) surfaces as an MCP tool error at zero credits with
+// no key recovery from the MCP layer. Ingress rules: a GET opening an event
+// stream → 405, an unknown tool → 400, a Tavily session id → 404
+// session_unavailable, and the Access Secret never appears in a result or log.
+//
+// The section lives in fragments under tests/common (the serpapi harness
+// precedent) so the suite stays inside its rust_source_line_budgets ceiling.
+// Real server binary + real mock_zhihu binary + direct sqlite assertions (the
+// proven brave/exa-section pattern). Every upstream is a stub — production
+// endpoints are never contacted.
+// ===========================================================================
+
+include!("common/provider_mcp_e2e_zhihu_harness.rs");
+include!("common/provider_mcp_e2e_zhihu_cases.rs");
