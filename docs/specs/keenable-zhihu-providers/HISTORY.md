@@ -20,6 +20,12 @@
   and the web API/admin/guide layers landed one commit per todo on `main`.
 - 2026-11-19 (this todo): docs, skills packages, env samples, and the operator terms note;
   `docs: document keenable and zhihu providers`.
+- 2026-11-19 (release): hardening matrix + manifest (todo 20), frontend battery (todo 21), and
+  the F4-spawned `X-RateLimit-*` passive harvest (todo 22, meta KV `keenable_rate_limit_v1`)
+  landed; F1-F4 final gates all APPROVE; `main` pushed at `1d769ea1`, image
+  `0.0.0-fork.20261119.1d769ea` deployed to the fnOS host with one Keenable key and one Zhihu
+  secret loaded from `KEENABLE_API_KEYS`/`ZHIHU_API_KEYS`; both providers verified with a live
+  smoke search each.
 
 ## Key Reasons / Replacements
 
